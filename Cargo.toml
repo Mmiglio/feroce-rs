@@ -1,0 +1,3 @@
+[workspace]
+members = ["feroce", "feroce-cli"]
+resolver = "2"
