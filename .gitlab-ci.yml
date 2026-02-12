@@ -1,0 +1,42 @@
+image: rust:1.93
+
+stages:
+  - check
+  - build
+  - test
+
+cache:
+  key: cargo-cache
+  paths:
+    - .cargo/registry/
+    - target/
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+
+# code format
+fmt:
+  stage: check
+  before_script:
+    - rustup component add rustfmt
+  script:
+    - cargo fmt --check
+
+# logic (unused variables, warnings, etc)
+clippy:
+  stage: check
+  allow_failure: true
+  before_script:
+    - rustup component add clippy
+  script:
+    - cargo clippy -- -D warnings
+
+build:
+  stage: build
+  script:
+    - cargo build
+
+test:
+  stage: test
+  script:
+    - cargo test
