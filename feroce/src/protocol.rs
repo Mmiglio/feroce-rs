@@ -117,6 +117,29 @@ pub struct QpMessage {
     pub freq: u32,
 }
 
+impl Default for QpMessage {
+    fn default() -> Self {
+        QpMessage {
+            flags: QpFlags::from_byte(0),
+            loc_qpn: 0,
+            loc_psn: 0,
+            loc_rkey: 0,
+            loc_base_addr: 0,
+            loc_ip: 0,
+            rem_qpn: 0,
+            rem_psn: 0,
+            rem_rkey: 0,
+            rem_base_addr: 0,
+            rem_ip: 0,
+            udp_port: 0,
+            tx_meta_flags: 0,
+            dma_len: 0,
+            n_transfers: 0,
+            freq: 0,
+        }
+    }
+}
+
 impl QpMessage {
     pub fn pack(&self) -> [u8; QP_MESSAGE_SIZE] {
         let mut buf = [0u8; QP_MESSAGE_SIZE];
@@ -262,6 +285,36 @@ impl QpMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QpConnectionInfo {
+    pub qp_num: u32,
+    pub psn: u32,
+    pub rkey: u32,
+    pub addr: u64,
+    pub gid: [u8; 16],
+}
+
+// IPv4 <-> GID conversion in RoCEv2
+// GID is a 16-byte IPv6 address, and the IPv4 is mapped as
+// Bytes 0-9:   all zeros
+// Bytes 10-11: 0xFF, 0xFF
+// Bytes 12-15: the IPv4 address (e.g., 192.168.0.1)
+// Ex: 192.168.0.1 -> [0,0,0,0, 0,0,0,0, 0,0,0xff,0xff, 0xc0,0xa8,0x00,0x01].
+pub fn gid_from_ipv4(ip_addr: u32) -> [u8; 16] {
+    let mut gid = [0u8; 16];
+
+    gid[10] = 0xff;
+    gid[11] = 0xff;
+
+    gid[12..16].copy_from_slice(&ip_addr.to_be_bytes());
+
+    gid
+}
+
+pub fn ipv4_from_gid(gid: &[u8; 16]) -> u32 {
+    u32::from_be_bytes(gid[12..16].try_into().unwrap())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -363,20 +416,7 @@ mod test {
         let msg = QpMessage {
             flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
             loc_qpn: 0x01,
-            loc_psn: 0,
-            loc_rkey: 0,
-            loc_base_addr: 0,
-            loc_ip: 0,
-            rem_qpn: 0,
-            rem_psn: 0,
-            rem_rkey: 0,
-            rem_base_addr: 0,
-            rem_ip: 0,
-            udp_port: 0,
-            tx_meta_flags: 0,
-            dma_len: 0,
-            n_transfers: 0,
-            freq: 0,
+            ..Default::default()
         };
 
         let bytes = msg.pack();
@@ -388,5 +428,35 @@ mod test {
         assert_eq!(bytes[2], 0x00);
         assert_eq!(bytes[3], 0x00);
         assert_eq!(bytes[4], 0x00);
+    }
+
+    #[test]
+    fn qp_connection_info_default() {
+        let info = QpConnectionInfo::default();
+        assert_eq!(info.qp_num, 0);
+        // check gid structure?
+        assert_eq!(info.gid, [0u8; 16]);
+    }
+
+    #[test]
+    fn ipv4_to_gid() {
+        let ip = 0xC0A80001;
+        let gid = gid_from_ipv4(ip);
+
+        assert_eq!(gid[0..10], [0u8; 10]);
+        assert_eq!(gid[10..12], [0xff, 0xff]);
+        assert_eq!(gid[12..16], [192, 168, 0, 1]);
+    }
+
+    #[test]
+    fn gid_to_ipv4() {
+        let mut gid = [0u8; 16];
+        gid[10] = 0xff;
+        gid[11] = 0xff;
+        gid[12] = 192;
+        gid[13] = 168;
+        gid[14] = 0;
+        gid[15] = 1;
+        assert_eq!(ipv4_from_gid(&gid), 0xC0A80001);
     }
 }
