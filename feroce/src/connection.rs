@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 
-use crate::protocol::{QP_MESSAGE_SIZE, QpConnectionInfo, QpMessage, RequestType, gid_from_ipv4};
+use crate::protocol::{
+    AckType, QP_MESSAGE_SIZE, QpConnectionInfo, QpFlags, QpMessage, RequestType, gid_from_ipv4,
+    ipv4_from_gid,
+};
 
 #[derive(Debug)]
 pub enum ConnectionError {
@@ -42,7 +45,7 @@ pub enum CmEvent {
     /// New connection request arrived.
     /// Application should create a QP and call set_local_info
     NewConnection {
-        peer_ip: std::net::IpAddr,
+        peer_ip: IpAddr,
         remote_qpn: u32,
         remote_info: QpConnectionInfo,
     },
@@ -50,7 +53,7 @@ pub enum CmEvent {
 
 pub struct ConnectionManager {
     socket: UdpSocket,
-    pending: HashMap<(std::net::IpAddr, u32), PendingQp>,
+    pending: HashMap<(IpAddr, u32), PendingQp>,
     qps: HashMap<u32, QpState>,
 }
 
@@ -126,12 +129,52 @@ impl ConnectionManager {
         }
     }
 
+    /// Complete the handshake
+    /// Set info of local QP and send reply back to sender
     pub fn set_local_info(
         &mut self,
-        peer_ip: std::net::IpAddr,
+        peer_ip: IpAddr,
         remote_qpn: u32,
         local_info: &QpConnectionInfo,
     ) -> Result<(), ConnectionError> {
+        // remove the request from pending
+        let pending_conn = self.pending.remove(&(peer_ip, remote_qpn)).ok_or_else(|| {
+            ConnectionError::Generic(format!(
+                "Connection request ({}, {}) not found in pending",
+                peer_ip, remote_qpn
+            ))
+        })?;
+
+        let reply_qp_msg = QpMessage {
+            flags: QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
+            loc_qpn: local_info.qp_num,
+            loc_psn: local_info.psn,
+            loc_rkey: local_info.rkey,
+            loc_base_addr: local_info.addr,
+            loc_ip: ipv4_from_gid(&local_info.gid),
+            rem_qpn: pending_conn.remote_info.qp_num,
+            rem_psn: pending_conn.remote_info.psn,
+            rem_rkey: pending_conn.remote_info.rkey,
+            rem_base_addr: pending_conn.remote_info.addr,
+            rem_ip: ipv4_from_gid(&pending_conn.remote_info.gid),
+            udp_port: self.socket.local_addr()?.port(),
+            ..Default::default()
+        };
+
+        self.socket.send_to(
+            &reply_qp_msg.pack(),
+            SocketAddr::new(pending_conn.remote_addr.ip(), pending_conn.reply_port),
+        )?;
+
+        // store it in the active QPs
+        self.qps.insert(
+            local_info.qp_num,
+            QpState::Connected {
+                local_info: local_info.clone(),
+                remote_info: pending_conn.remote_info.clone(),
+            },
+        );
+
         Ok(())
     }
 }
@@ -139,6 +182,9 @@ impl ConnectionManager {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::protocol::*;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn connection_manager_binds_to_port() {
@@ -150,12 +196,27 @@ mod test {
         drop(cm);
     }
 
+    /// helper function to simulate a sender
+    fn send_open_qp(cm_port: u16, qpn: u32, psn: u32) -> UdpSocket {
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let msg = QpMessage {
+            flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
+            loc_qpn: qpn,
+            loc_psn: psn,
+            loc_rkey: 0xDEAD,
+            loc_base_addr: 0xDEADBEEF,
+            loc_ip: 0x7F000001,
+            udp_port: sender_socket.local_addr().unwrap().port(),
+            ..Default::default()
+        };
+        sender_socket
+            .send_to(&msg.pack(), format!("127.0.0.1:{}", cm_port))
+            .unwrap();
+        sender_socket
+    }
+
     #[test]
     fn process_next_handles_open_qp() {
-        use crate::protocol::*;
-        use std::thread;
-        use std::time::Duration;
-
         let cm_port = 0x4321 as u16;
 
         let cm_handle = thread::spawn(move || {
@@ -166,21 +227,7 @@ mod test {
         thread::sleep(Duration::from_millis(50));
 
         // simulate the sender
-        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let msg = QpMessage {
-            flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
-            loc_qpn: 42,
-            loc_psn: 1234,
-            loc_rkey: 0xDEAD,
-            loc_base_addr: 0xDEADBEEF,
-            loc_ip: 0x7F000001,
-            ..Default::default()
-        };
-
-        sender
-            .send_to(&msg.pack(), format!("127.0.0.1:{}", cm_port))
-            .unwrap();
-
+        let sender = send_open_qp(cm_port, 42, 1234);
         let event = cm_handle.join().unwrap();
 
         match event {
@@ -197,5 +244,125 @@ mod test {
                 assert_eq!(remote_info.addr, 0xDEADBEEF);
             }
         };
+    }
+
+    #[test]
+    fn handshake_open_qp() {
+        let cm_port = 0x4322 as u16;
+
+        // receiver thread
+        let cm_handle = thread::spawn(move || {
+            let mut cm = ConnectionManager::new(cm_port).unwrap();
+            let event = cm.process_next().unwrap();
+
+            match event {
+                CmEvent::NewConnection {
+                    peer_ip,
+                    remote_qpn,
+                    remote_info,
+                } => {
+                    // simulate open new QP
+                    let local_info = QpConnectionInfo {
+                        qp_num: 256,
+                        psn: 0,
+                        rkey: 0xABCD,
+                        addr: 0x1234ABCD,
+                        gid: gid_from_ipv4(0x7F000001),
+                    };
+
+                    cm.set_local_info(peer_ip, remote_qpn, &local_info).unwrap();
+                }
+            }
+
+            cm
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let sender_socket = send_open_qp(cm_port, 42, 1234);
+
+        let mut buf = [0u8; QP_MESSAGE_SIZE];
+        let (msg_size, src_addr) = sender_socket.recv_from(&mut buf).unwrap();
+
+        let qp_msg = QpMessage::unpack(&buf).unwrap();
+
+        let cm = cm_handle.join().unwrap();
+
+        // the sender should have received an ACK
+        assert_eq!(qp_msg.flags.request_type().unwrap(), RequestType::OpenQp);
+        assert_eq!(qp_msg.flags.ack_type().unwrap(), AckType::Ack);
+        assert_eq!(qp_msg.flags.ack_valid(), true);
+
+        assert_eq!(qp_msg.loc_qpn, 256);
+        assert_eq!(qp_msg.loc_psn, 0);
+        assert_eq!(qp_msg.loc_rkey, 0xABCD);
+        assert_eq!(qp_msg.loc_base_addr, 0x1234ABCD);
+        assert_eq!(qp_msg.loc_ip, 0x7F000001);
+
+        assert_eq!(qp_msg.rem_qpn, 42);
+        assert_eq!(qp_msg.rem_psn, 1234);
+        assert_eq!(qp_msg.rem_rkey, 0xDEAD);
+        assert_eq!(qp_msg.rem_base_addr, 0xDEADBEEF);
+        assert_eq!(qp_msg.rem_ip, 0x7F000001);
+
+        let qp_state = cm.qps.get(&256);
+        assert!(qp_state.is_some());
+
+        if let Some(QpState::Connected {
+            local_info,
+            remote_info,
+        }) = qp_state
+        {
+            assert_eq!(local_info.qp_num, 256);
+            assert_eq!(local_info.psn, 0);
+            assert_eq!(local_info.rkey, 0xABCD);
+            assert_eq!(local_info.addr, 0x1234ABCD);
+
+            assert_eq!(remote_info.qp_num, 42);
+            assert_eq!(remote_info.psn, 1234);
+            assert_eq!(remote_info.rkey, 0xDEAD);
+            assert_eq!(remote_info.addr, 0xDEADBEEF);
+        } else {
+            panic!("expected QpState::Connected")
+        }
+    }
+
+    #[test]
+    fn invalid_set_local_info() {
+        let cm_port = 0x4323 as u16;
+
+        let mut cm = ConnectionManager::new(cm_port).unwrap();
+
+        let local_info = QpConnectionInfo {
+            qp_num: 256,
+            psn: 0,
+            rkey: 0xABCD,
+            addr: 0x1234ABCD,
+            gid: gid_from_ipv4(0x7F000001),
+        };
+
+        let res = cm.set_local_info("127.0.0.1".parse().unwrap(), 42, &local_info);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn invalid_qp_message() {
+        let cm_port = 0x4324 as u16;
+
+        let cm_handle = thread::spawn(move || {
+            let mut cm = ConnectionManager::new(cm_port).unwrap();
+            cm.process_next()
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let buf = [0u8; QP_MESSAGE_SIZE + 1]; //send a larger message
+
+        sender_socket
+            .send_to(&buf, format!("127.0.0.1:{}", cm_port))
+            .unwrap();
+
+        let res = cm_handle.join().unwrap();
+        assert!(matches!(res, Err(ConnectionError::Protocol(_))));
     }
 }
