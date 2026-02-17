@@ -149,52 +149,52 @@ impl QpMessage {
         pos += 1;
 
         // Local QP param
-        buf[pos..pos + 4].copy_from_slice(&self.loc_qpn.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.loc_qpn.to_be_bytes());
         pos += 4;
 
-        buf[pos..pos + 4].copy_from_slice(&self.loc_psn.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.loc_psn.to_be_bytes());
         pos += 4;
 
-        buf[pos..pos + 4].copy_from_slice(&self.loc_rkey.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.loc_rkey.to_be_bytes());
         pos += 4;
 
-        buf[pos..pos + 8].copy_from_slice(&self.loc_base_addr.to_le_bytes());
+        buf[pos..pos + 8].copy_from_slice(&self.loc_base_addr.to_be_bytes());
         pos += 8;
 
-        buf[pos..pos + 4].copy_from_slice(&self.loc_ip.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.loc_ip.to_be_bytes());
         pos += 4;
 
         // remote QP param
-        buf[pos..pos + 4].copy_from_slice(&self.rem_qpn.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.rem_qpn.to_be_bytes());
         pos += 4;
 
-        buf[pos..pos + 4].copy_from_slice(&self.rem_psn.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.rem_psn.to_be_bytes());
         pos += 4;
 
-        buf[pos..pos + 4].copy_from_slice(&self.rem_rkey.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.rem_rkey.to_be_bytes());
         pos += 4;
 
-        buf[pos..pos + 8].copy_from_slice(&self.rem_base_addr.to_le_bytes());
+        buf[pos..pos + 8].copy_from_slice(&self.rem_base_addr.to_be_bytes());
         pos += 8;
 
-        buf[pos..pos + 4].copy_from_slice(&self.rem_ip.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.rem_ip.to_be_bytes());
         pos += 4;
 
         // target udp port
-        buf[pos..pos + 2].copy_from_slice(&self.udp_port.to_le_bytes());
+        buf[pos..pos + 2].copy_from_slice(&self.udp_port.to_be_bytes());
         pos += 2;
 
         // TX meta (to be removed)
-        buf[pos..pos + 1].copy_from_slice(&self.tx_meta_flags.to_le_bytes());
+        buf[pos..pos + 1].copy_from_slice(&self.tx_meta_flags.to_be_bytes());
         pos += 1;
 
-        buf[pos..pos + 4].copy_from_slice(&self.dma_len.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.dma_len.to_be_bytes());
         pos += 4;
 
-        buf[pos..pos + 4].copy_from_slice(&self.n_transfers.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.n_transfers.to_be_bytes());
         pos += 4;
 
-        buf[pos..pos + 4].copy_from_slice(&self.freq.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&self.freq.to_be_bytes());
         pos += 4;
 
         assert_eq!(pos, QP_MESSAGE_SIZE);
@@ -217,52 +217,52 @@ impl QpMessage {
         pos += 1;
 
         // Local QP param
-        let loc_qpn = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let loc_qpn = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let loc_psn = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let loc_psn = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let loc_rkey = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let loc_rkey = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let loc_base_addr = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+        let loc_base_addr = u64::from_be_bytes(buf[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let loc_ip = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let loc_ip = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
         // remote QP param
-        let rem_qpn = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let rem_qpn = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let rem_psn = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let rem_psn = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let rem_rkey = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let rem_rkey = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let rem_base_addr = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+        let rem_base_addr = u64::from_be_bytes(buf[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let rem_ip = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let rem_ip = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
         // target udp port
-        let udp_port = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+        let udp_port = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
         pos += 2;
 
         // TX meta (to be removed)
         let tx_meta_flags = buf[pos];
         pos += 1;
 
-        let dma_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let dma_len = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let n_transfers = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let n_transfers = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
 
-        let freq = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let freq = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
 
         Ok(QpMessage {
             flags,
@@ -294,7 +294,7 @@ pub struct QpConnectionInfo {
     pub gid: [u8; 16],
 }
 
-// IPv4 <-> GID conversion in RoCEv2
+// IPv4 <-> GID conversion in rocev2
 // GID is a 16-byte IPv6 address, and the IPv4 is mapped as
 // Bytes 0-9:   all zeros
 // Bytes 10-11: 0xFF, 0xFF
@@ -423,11 +423,12 @@ mod test {
 
         // flags at offset 0
         assert_eq!(bytes[0], 0x03);
-        // loc_qpn at offset 1, little-endian
-        assert_eq!(bytes[1], 0x01);
+        // loc_qpn at offset 1
+        assert_eq!(bytes[1], 0x00);
         assert_eq!(bytes[2], 0x00);
         assert_eq!(bytes[3], 0x00);
-        assert_eq!(bytes[4], 0x00);
+        assert_eq!(bytes[4], 0x01);
+        // rest is zero
     }
 
     #[test]
