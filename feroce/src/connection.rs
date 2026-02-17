@@ -19,9 +19,22 @@ pub enum ConnectionError {
     Generic(String),
 }
 
+impl std::error::Error for ConnectionError {}
+
 impl From<io::Error> for ConnectionError {
     fn from(err: io::Error) -> Self {
         ConnectionError::Io(err)
+    }
+}
+
+impl std::fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionError::Io(e) => write!(f, "IO error: {}", e),
+            ConnectionError::Protocol(msg) => write!(f, "Protocol error: {}", msg),
+            ConnectionError::Timeout => write!(f, "Timeout"),
+            ConnectionError::Generic(msg) => write!(f, "{}", msg),
+        }
     }
 }
 
@@ -84,47 +97,92 @@ impl ConnectionManager {
     }
 
     pub fn process_next(&mut self) -> Result<CmEvent, ConnectionError> {
-        let (qp_msg, peer_addr) = self.recv_message()?;
+        loop {
+            let (qp_msg, peer_addr) = self.recv_message()?;
 
-        let request_type = qp_msg.flags.request_type().map_err(|val| {
-            ConnectionError::Protocol(format!("Received unknown request value {}", val))
-        })?;
+            let request_type = qp_msg.flags.request_type().map_err(|val| {
+                ConnectionError::Protocol(format!("Received unknown request value {}", val))
+            })?;
 
-        match request_type {
-            RequestType::OpenQp => {
-                let remote_info = QpConnectionInfo {
-                    qp_num: qp_msg.loc_qpn,
-                    psn: qp_msg.loc_psn,
-                    rkey: qp_msg.loc_rkey,
-                    addr: qp_msg.loc_base_addr,
-                    gid: gid_from_ipv4(qp_msg.loc_ip),
-                };
-
-                let pending_qp = PendingQp {
-                    remote_info,
-                    remote_addr: peer_addr,
-                    reply_port: qp_msg.udp_port,
-                };
-
-                if self
-                    .pending
-                    .insert((peer_addr.ip(), qp_msg.loc_qpn), pending_qp)
-                    .is_some()
-                {
-                    println!(
-                        "Warning: duplicated connection request: peer addr: {}, qpn: {}",
-                        peer_addr.ip(),
-                        qp_msg.loc_qpn
-                    );
+            match request_type {
+                RequestType::OpenQp => {
+                    if let Some(event) = self.handle_open_qp(&qp_msg, &peer_addr)? {
+                        // New connection, propagate it
+                        return Ok(event);
+                    } else {
+                        // QP already exists, do nothing
+                        continue;
+                    }
                 }
-
-                Ok(CmEvent::NewConnection {
-                    peer_ip: peer_addr.ip(),
-                    remote_qpn: qp_msg.loc_qpn,
-                    remote_info,
-                })
+                _ => {
+                    return Err(ConnectionError::Protocol("Invalid request".to_string()));
+                }
             }
-            _ => Err(ConnectionError::Protocol("Invalid request".to_string())),
+        }
+    }
+
+    fn handle_open_qp(
+        &mut self,
+        qp_msg: &QpMessage,
+        peer_addr: &SocketAddr,
+    ) -> Result<Option<CmEvent>, ConnectionError> {
+        let remote_info = QpConnectionInfo {
+            qp_num: qp_msg.loc_qpn,
+            psn: qp_msg.loc_psn,
+            rkey: qp_msg.loc_rkey,
+            addr: qp_msg.loc_base_addr,
+            gid: gid_from_ipv4(qp_msg.loc_ip),
+        };
+
+        // search if the QP exists already
+        let res_qp_state = self.qps.values().find(|qp| match qp {
+            QpState::Connected { remote_info, .. } => {
+                remote_info.qp_num == qp_msg.loc_qpn
+                    && ipv4_from_gid(&remote_info.gid) == qp_msg.loc_ip
+            }
+        });
+
+        if let Some(QpState::Connected {
+            local_info,
+            remote_info,
+        }) = res_qp_state
+        {
+            // we already have this QP! just send again the ack message
+            self.send_reply(
+                &local_info,
+                &remote_info,
+                QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
+                SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
+            )?;
+
+            Ok(None)
+        } else {
+            // new QP connection request
+
+            let pending_qp = PendingQp {
+                remote_info,
+                remote_addr: *peer_addr,
+                reply_port: qp_msg.udp_port,
+            };
+
+            // insert it in the pending requests
+            if self
+                .pending
+                .insert((peer_addr.ip(), qp_msg.loc_qpn), pending_qp)
+                .is_some()
+            {
+                println!(
+                    "Warning: duplicated connection request: peer addr: {}, qpn: {}",
+                    peer_addr.ip(),
+                    qp_msg.loc_qpn
+                );
+            }
+
+            Ok(Some(CmEvent::NewConnection {
+                peer_ip: peer_addr.ip(),
+                remote_qpn: qp_msg.loc_qpn,
+                remote_info,
+            }))
         }
     }
 
@@ -144,24 +202,11 @@ impl ConnectionManager {
             ))
         })?;
 
-        let reply_qp_msg = QpMessage {
-            flags: QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
-            loc_qpn: local_info.qp_num,
-            loc_psn: local_info.psn,
-            loc_rkey: local_info.rkey,
-            loc_base_addr: local_info.addr,
-            loc_ip: ipv4_from_gid(&local_info.gid),
-            rem_qpn: pending_conn.remote_info.qp_num,
-            rem_psn: pending_conn.remote_info.psn,
-            rem_rkey: pending_conn.remote_info.rkey,
-            rem_base_addr: pending_conn.remote_info.addr,
-            rem_ip: ipv4_from_gid(&pending_conn.remote_info.gid),
-            udp_port: self.socket.local_addr()?.port(),
-            ..Default::default()
-        };
-
-        self.socket.send_to(
-            &reply_qp_msg.pack(),
+        // send ACK with local QP info
+        self.send_reply(
+            &local_info,
+            &pending_conn.remote_info,
+            QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
             SocketAddr::new(pending_conn.remote_addr.ip(), pending_conn.reply_port),
         )?;
 
@@ -173,6 +218,34 @@ impl ConnectionManager {
                 remote_info: pending_conn.remote_info,
             },
         );
+
+        Ok(())
+    }
+
+    fn send_reply(
+        &self,
+        local_info: &QpConnectionInfo,
+        remote_info: &QpConnectionInfo,
+        qp_flags: QpFlags,
+        dest: SocketAddr,
+    ) -> Result<(), ConnectionError> {
+        let reply_qp_msg = QpMessage {
+            flags: qp_flags,
+            loc_qpn: local_info.qp_num,
+            loc_psn: local_info.psn,
+            loc_rkey: local_info.rkey,
+            loc_base_addr: local_info.addr,
+            loc_ip: ipv4_from_gid(&local_info.gid),
+            rem_qpn: remote_info.qp_num,
+            rem_psn: remote_info.psn,
+            rem_rkey: remote_info.rkey,
+            rem_base_addr: remote_info.addr,
+            rem_ip: ipv4_from_gid(&remote_info.gid),
+            udp_port: self.socket.local_addr()?.port(),
+            ..Default::default()
+        };
+
+        self.socket.send_to(&reply_qp_msg.pack(), dest)?;
 
         Ok(())
     }
@@ -500,6 +573,94 @@ mod test {
             assert_eq!(send_local, recv_remote);
         } else {
             panic!("Expected QPs to be connected!")
+        }
+    }
+
+    #[test]
+    fn duplicate_open_qp_resends_ack() {
+        // Simulate loss of ACK and requesting to open new QP again
+        let cm_port = 0x4327 as u16;
+
+        let cm_handle = thread::spawn(move || {
+            let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
+
+            // first (real connection)
+            let event1 = cm.process_next().unwrap();
+            match event1 {
+                CmEvent::NewConnection {
+                    peer_ip,
+                    remote_qpn,
+                    ..
+                } => {
+                    let local_info = QpConnectionInfo {
+                        qp_num: 256,
+                        psn: 0,
+                        rkey: 0xABCD,
+                        addr: 0x1234ABCD,
+                        gid: gid_from_ipv4(0x7F000001),
+                    };
+                    cm.set_local_info(peer_ip, remote_qpn, &local_info).unwrap();
+                }
+            }
+
+            // second should skip duplicate, return new connection
+            let event2 = cm.process_next().unwrap();
+            (cm, event2)
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender_port = sender.local_addr().unwrap().port();
+        let mut buf = [0u8; QP_MESSAGE_SIZE];
+
+        let msg1 = QpMessage {
+            flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
+            loc_qpn: 42,
+            loc_psn: 1234,
+            loc_rkey: 0xDEAD,
+            loc_base_addr: 0xDEADBEEF,
+            loc_ip: 0x7F000001,
+            udp_port: sender_port,
+            ..Default::default()
+        };
+        sender
+            .send_to(&msg1.pack(), format!("127.0.0.1:{}", cm_port))
+            .unwrap();
+
+        sender.recv_from(&mut buf).unwrap();
+        let ack1 = QpMessage::unpack(&buf).unwrap();
+        assert_eq!(ack1.flags.ack_type().unwrap(), AckType::Ack);
+
+        sender
+            .send_to(&msg1.pack(), format!("127.0.0.1:{}", cm_port))
+            .unwrap();
+
+        sender.recv_from(&mut buf).unwrap();
+        let ack2 = QpMessage::unpack(&buf).unwrap();
+        assert_eq!(ack2.flags.ack_type().unwrap(), AckType::Ack);
+
+        assert_eq!(ack1, ack2);
+
+        let msg2 = QpMessage {
+            flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
+            loc_qpn: 99,
+            loc_psn: 5678,
+            loc_rkey: 0xBEEF,
+            loc_base_addr: 0xCAFEBABE,
+            loc_ip: 0x7F000001,
+            udp_port: sender_port,
+            ..Default::default()
+        };
+        sender
+            .send_to(&msg2.pack(), format!("127.0.0.1:{}", cm_port))
+            .unwrap();
+
+        let (cm, event2) = cm_handle.join().unwrap();
+        match event2 {
+            CmEvent::NewConnection { remote_qpn, .. } => {
+                assert_eq!(remote_qpn, 99);
+            }
         }
     }
 }

@@ -294,7 +294,19 @@ pub struct QpConnectionInfo {
     pub gid: [u8; 16],
 }
 
-// IPv4 <-> GID conversion in rocev2
+impl std::fmt::Display for QpConnectionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ip = ipv4_from_gid(&self.gid);
+        let bytes = ip.to_be_bytes();
+        write!(
+            f,
+            "QPN={}, PSN={}, rkey=0x{:X}, addr=0x{:X},  gid=::ffff:{}.{}.{}.{}",
+            self.qp_num, self.psn, self.rkey, self.addr, bytes[0], bytes[1], bytes[2], bytes[3]
+        )
+    }
+}
+
+// IPv4 to GID conversion in rocev2
 // GID is a 16-byte IPv6 address, and the IPv4 is mapped as
 // Bytes 0-9:   all zeros
 // Bytes 10-11: 0xFF, 0xFF
