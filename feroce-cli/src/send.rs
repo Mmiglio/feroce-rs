@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use feroce::{
     connection::ConnectionManager,
-    protocol::{QpConnectionInfo, gid_from_ipv4},
+    protocol::{QpConnectionInfo, gid_from_ipv4, ipv4_to_u32},
 };
 
 pub fn run(
@@ -18,7 +18,7 @@ pub fn run(
         psn: 0,
         rkey: 0xDEAD,
         addr: 0xDEADBEEF,
-        gid: gid_from_ipv4(0x7F000001),
+        gid: gid_from_ipv4(ipv4_to_u32(bind_addr).expect("IPv6 not supported")),
     };
 
     let remote_info = cm.connect(SocketAddr::new(remote_addr, remote_port), &local_info)?;

@@ -149,8 +149,8 @@ impl ConnectionManager {
         {
             // we already have this QP! just send again the ack message
             self.send_reply(
-                &local_info,
-                &remote_info,
+                local_info,
+                remote_info,
                 QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
                 SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
             )?;
@@ -204,7 +204,7 @@ impl ConnectionManager {
 
         // send ACK with local QP info
         self.send_reply(
-            &local_info,
+            local_info,
             &pending_conn.remote_info,
             QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
             SocketAddr::new(pending_conn.remote_addr.ip(), pending_conn.reply_port),
@@ -291,7 +291,7 @@ impl ConnectionManager {
                 local_info.qp_num,
                 QpState::Connected {
                     local_info: *local_info,
-                    remote_info: remote_info,
+                    remote_info,
                 },
             );
 

@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RequestType {
@@ -325,6 +327,13 @@ pub fn gid_from_ipv4(ip_addr: u32) -> [u8; 16] {
 
 pub fn ipv4_from_gid(gid: &[u8; 16]) -> u32 {
     u32::from_be_bytes(gid[12..16].try_into().unwrap())
+}
+
+pub fn ipv4_to_u32(ip: IpAddr) -> Option<u32> {
+    match ip {
+        IpAddr::V4(ip_v4) => Some(ip_v4.into()),
+        IpAddr::V6(_) => None,
+    }
 }
 
 #[cfg(test)]

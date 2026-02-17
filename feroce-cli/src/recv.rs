@@ -1,6 +1,6 @@
 use feroce::{
     connection::{CmEvent, ConnectionManager},
-    protocol::{QpConnectionInfo, gid_from_ipv4},
+    protocol::{QpConnectionInfo, gid_from_ipv4, ipv4_to_u32},
 };
 use std::net::IpAddr;
 
@@ -22,7 +22,7 @@ pub fn run(bind_addr: IpAddr, cm_port: u16) -> Result<(), Box<dyn std::error::Er
                 psn: 1234,
                 rkey: 0xABCD,
                 addr: 0x1234ABCD,
-                gid: gid_from_ipv4(0x7F000001),
+                gid: gid_from_ipv4(ipv4_to_u32(bind_addr).expect("IPv6 not supported")),
             };
 
             // set local info and send ACK
