@@ -1,4 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use feroce::{
     connection::ConnectionManager,
@@ -21,7 +24,12 @@ pub fn run(
         gid: gid_from_ipv4(ipv4_to_u32(bind_addr).expect("IPv6 not supported")),
     };
 
-    let remote_info = cm.connect(SocketAddr::new(remote_addr, remote_port), &local_info)?;
+    let remote_info = cm.connect(
+        SocketAddr::new(remote_addr, remote_port),
+        &local_info,
+        Duration::from_secs(2),
+        2,
+    )?;
 
     println!("Local QP: {}", local_info);
     println!("Remote QP: {}", remote_info);

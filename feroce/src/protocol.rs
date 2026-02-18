@@ -302,7 +302,7 @@ impl std::fmt::Display for QpConnectionInfo {
         let bytes = ip.to_be_bytes();
         write!(
             f,
-            "QPN={}, PSN={}, rkey=0x{:X}, addr=0x{:X},  gid=::ffff:{}.{}.{}.{}",
+            "QPN={}, PSN={}, rkey=0x{:X}, addr=0x{:X}, gid=::ffff:{}.{}.{}.{}",
             self.qp_num, self.psn, self.rkey, self.addr, bytes[0], bytes[1], bytes[2], bytes[3]
         )
     }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::time::Duration;
 
 use crate::protocol::{
     AckType, QP_MESSAGE_SIZE, QpConnectionInfo, QpFlags, QpMessage, RequestType, gid_from_ipv4,
@@ -80,9 +81,16 @@ impl ConnectionManager {
         })
     }
 
-    fn recv_message(&self) -> Result<(QpMessage, std::net::SocketAddr), ConnectionError> {
+    fn recv_message(&self) -> Result<(QpMessage, SocketAddr), ConnectionError> {
         let mut buf = [0u8; QP_MESSAGE_SIZE];
-        let (msg_size, src_addr) = self.socket.recv_from(&mut buf)?;
+        // Blocking receive, check if we reach a timeout (if set)
+        let (msg_size, src_addr) = self.socket.recv_from(&mut buf).map_err(|e| {
+            if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
+                ConnectionError::Timeout
+            } else {
+                ConnectionError::Io(e)
+            }
+        })?;
 
         if msg_size != QP_MESSAGE_SIZE {
             return Err(ConnectionError::Protocol(format!(
@@ -255,6 +263,8 @@ impl ConnectionManager {
         &mut self,
         remote_addr: SocketAddr,
         local_info: &QpConnectionInfo,
+        request_timeout: Duration,
+        max_retries: u8,
     ) -> Result<QpConnectionInfo, ConnectionError> {
         let open_qp_message = QpMessage {
             flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false), // this is the request
@@ -267,38 +277,66 @@ impl ConnectionManager {
             ..Default::default()
         };
 
-        self.socket.send_to(&open_qp_message.pack(), remote_addr)?;
+        // Try up to max_retries times to open a QP, with a timeout
+        let original_socket_timeout = self.socket.read_timeout()?;
+        self.socket.set_read_timeout(Some(request_timeout))?;
 
-        // wait for the ack reply
-        // Note: we should somehow filter for the correct message.. what about the others?
-        let (reply_qp_message, _peer_addr) = self.recv_message()?;
+        let mut retry_left = max_retries;
+        while retry_left > 0 {
+            self.socket.send_to(&open_qp_message.pack(), remote_addr)?;
 
-        if (reply_qp_message.flags.request_type() == Ok(RequestType::OpenQp))
-            && (reply_qp_message.flags.ack_type() == Ok(AckType::Ack))
-            && (reply_qp_message.flags.ack_valid())
-            && (reply_qp_message.rem_qpn == local_info.qp_num)
-            && (reply_qp_message.rem_ip == ipv4_from_gid(&local_info.gid))
-        {
-            let remote_info = QpConnectionInfo {
-                qp_num: reply_qp_message.loc_qpn,
-                psn: reply_qp_message.loc_psn,
-                rkey: reply_qp_message.loc_rkey,
-                addr: reply_qp_message.loc_base_addr,
-                gid: gid_from_ipv4(reply_qp_message.loc_ip),
+            // wait for the ack reply
+            // Note: we should somehow filter for the correct message.. what about the others?
+            let (reply_qp_message, _peer_addr) = match self.recv_message() {
+                Ok((qp_msg, addr)) => (qp_msg, addr),
+                Err(err) => match err {
+                    ConnectionError::Timeout => {
+                        // receiver hit the timeout, decrease the retry counter and try again
+                        retry_left -= 1;
+                        println!("Timeout while waiting for ACK, {} retries left", retry_left);
+                        continue;
+                    }
+                    _ => {
+                        // Actual error, return it
+                        return Err(err);
+                    }
+                },
             };
 
-            self.qps.insert(
-                local_info.qp_num,
-                QpState::Connected {
-                    local_info: *local_info,
-                    remote_info,
-                },
-            );
+            if (reply_qp_message.flags.request_type() == Ok(RequestType::OpenQp))
+                && (reply_qp_message.flags.ack_type() == Ok(AckType::Ack))
+                && (reply_qp_message.flags.ack_valid())
+                && (reply_qp_message.rem_qpn == local_info.qp_num)
+                && (reply_qp_message.rem_ip == ipv4_from_gid(&local_info.gid))
+            {
+                let remote_info = QpConnectionInfo {
+                    qp_num: reply_qp_message.loc_qpn,
+                    psn: reply_qp_message.loc_psn,
+                    rkey: reply_qp_message.loc_rkey,
+                    addr: reply_qp_message.loc_base_addr,
+                    gid: gid_from_ipv4(reply_qp_message.loc_ip),
+                };
 
-            Ok(remote_info)
-        } else {
-            Err(ConnectionError::Protocol("Invalid ACK message".to_string()))
+                self.qps.insert(
+                    local_info.qp_num,
+                    QpState::Connected {
+                        local_info: *local_info,
+                        remote_info,
+                    },
+                );
+
+                self.socket.set_read_timeout(original_socket_timeout)?;
+                return Ok(remote_info);
+            } else {
+                //Err(ConnectionError::Protocol("Invalid ACK message".to_string()))
+                // invalid message received, just keep waiting and don't waste a retry
+                continue;
+            }
         }
+
+        // exhausted retries, return a timeout error
+        self.socket.set_read_timeout(original_socket_timeout)?;
+        Err(ConnectionError::Timeout)
     }
 }
 
@@ -350,7 +388,7 @@ mod test {
         thread::sleep(Duration::from_millis(50));
 
         // simulate the sender
-        let sender = send_open_qp(cm_port, 42, 1234);
+        let _sender = send_open_qp(cm_port, 42, 1234);
         let event = cm_handle.join().unwrap();
 
         match event {
@@ -382,7 +420,7 @@ mod test {
                 CmEvent::NewConnection {
                     peer_ip,
                     remote_qpn,
-                    remote_info,
+                    remote_info: _,
                 } => {
                     // simulate open new QP
                     let local_info = QpConnectionInfo {
@@ -404,7 +442,7 @@ mod test {
         let sender_socket = send_open_qp(cm_port, 42, 1234);
 
         let mut buf = [0u8; QP_MESSAGE_SIZE];
-        let (msg_size, src_addr) = sender_socket.recv_from(&mut buf).unwrap();
+        let (_msg_size, _src_addr) = sender_socket.recv_from(&mut buf).unwrap();
 
         let qp_msg = QpMessage::unpack(&buf).unwrap();
 
@@ -504,7 +542,7 @@ mod test {
                 CmEvent::NewConnection {
                     peer_ip,
                     remote_qpn,
-                    remote_info,
+                    remote_info: _,
                 } => {
                     // simulate open new QP
                     let local_info = QpConnectionInfo {
@@ -537,10 +575,12 @@ mod test {
                 gid: gid_from_ipv4(0x7F000001),
             };
 
-            let remote_info = cm
+            let _remote_info = cm
                 .connect(
                     SocketAddr::new("127.0.0.1".parse().unwrap(), receiver_cm_port),
                     &local_info,
+                    Duration::from_millis(500),
+                    2,
                 )
                 .unwrap();
 
@@ -656,7 +696,7 @@ mod test {
             .send_to(&msg2.pack(), format!("127.0.0.1:{}", cm_port))
             .unwrap();
 
-        let (cm, event2) = cm_handle.join().unwrap();
+        let (_cm, event2) = cm_handle.join().unwrap();
         match event2 {
             CmEvent::NewConnection { remote_qpn, .. } => {
                 assert_eq!(remote_qpn, 99);
