@@ -1,10 +1,14 @@
 #[repr(C)]
-pub enum ibv_device {}
+pub struct ibv_device {
+    _opaque: [u8; 0],
+}
 
 #[repr(C)]
-pub enum ibv_context {}
+pub struct ibv_context {
+    _opaque: [u8; 0],
+}
 
-extern "C" {
+unsafe extern "C" {
     pub fn ibv_get_device_list(num_devices: *mut i32) -> *mut *mut ibv_device;
     pub fn ibv_free_device_list(list: *mut *mut ibv_device);
     pub fn ibv_get_device_name(device: *mut ibv_device) -> *const std::os::raw::c_char;

@@ -40,3 +40,10 @@ test:
   stage: test
   script:
     - cargo test
+
+test-rdma:
+  stage: test
+  tags:
+    - roce
+  script:
+    - cargo test --features rdma-test
