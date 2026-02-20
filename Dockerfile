@@ -4,4 +4,5 @@ RUN apt-get update && apt-get install -y \
       libibverbs-dev \
       rdma-core \
       infiniband-diags \
+      ibverbs-utils \
       && rm -rf /var/lib/apt/lists/*
