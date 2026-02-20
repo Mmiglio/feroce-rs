@@ -65,7 +65,9 @@ pub struct ibv_qp_init_attr {
 
 #[repr(i32)]
 #[allow(non_camel_case_types, dead_code)]
+#[derive(Default)]
 pub enum ibv_qp_state {
+    #[default]
     IBV_QPS_RESET,
     IBV_QPS_INIT,
     IBV_QPS_RTR,
@@ -74,12 +76,6 @@ pub enum ibv_qp_state {
     IBV_QPS_SQE,
     IBV_QPS_ERR,
     IBV_QPS_UNKNOWN,
-}
-
-impl Default for ibv_qp_state {
-    fn default() -> Self {
-        ibv_qp_state::IBV_QPS_RESET
-    }
 }
 
 #[allow(non_camel_case_types)]
@@ -118,32 +114,23 @@ pub struct ibv_gid {
 
 #[repr(i32)]
 #[allow(non_camel_case_types)]
+#[derive(Default)]
 pub enum ibv_mtu {
+    #[default]
     IBV_MTU_256 = 1,
     IBV_MTU_512 = 2,
     IBV_MTU_1024 = 3,
     IBV_MTU_2048 = 4,
     IBV_MTU_4096 = 5,
 }
-
-impl Default for ibv_mtu {
-    fn default() -> Self {
-        ibv_mtu::IBV_MTU_256
-    }
-}
-
 #[repr(i32)]
 #[allow(non_camel_case_types, dead_code)]
+#[derive(Default)]
 pub enum ibv_mig_state {
+    #[default]
     IBV_MIG_MIGRATED,
     IBV_MIG_REARM,
     IBV_MIG_ARMED,
-}
-
-impl Default for ibv_mig_state {
-    fn default() -> Self {
-        ibv_mig_state::IBV_MIG_MIGRATED
-    }
 }
 
 #[repr(C)]
@@ -199,6 +186,73 @@ pub struct ibv_qp_attr {
     pub rate_limit: u32,
 }
 
+#[repr(i32)]
+#[allow(non_camel_case_types, dead_code)]
+#[derive(Default)]
+pub enum ibv_port_state {
+    #[default]
+    IBV_PORT_NOP = 0,
+    IBV_PORT_DOWN = 1,
+    IBV_PORT_INIT = 2,
+    IBV_PORT_ARMED = 3,
+    IBV_PORT_ACTIVE = 4,
+    IBV_PORT_ACTIVE_DEFER = 5,
+}
+
+#[allow(non_camel_case_types)]
+pub struct ibv_link_layer;
+#[allow(dead_code)]
+impl ibv_link_layer {
+    pub const IBV_LINK_LAYER_UNSPECIFIED: u8 = 0;
+    pub const IBV_LINK_LAYER_INFINIBAND: u8 = 1;
+    pub const IBV_LINK_LAYER_ETHERNET: u8 = 2;
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct ibv_port_attr {
+    pub state: ibv_port_state,
+    pub max_mtu: ibv_mtu,
+    pub active_mtu: ibv_mtu,
+    pub gid_tbl_len: i32,
+    pub port_cap_flags: u32,
+    pub max_msg_sz: u32,
+    pub bad_pkey_cntr: u32,
+    pub qkey_viol_cntr: u32,
+    pub pkey_tbl_len: u16,
+    pub lid: u16,
+    pub sm_lid: u16,
+    pub lmc: u8,
+    pub max_vl_num: u8,
+    pub sm_sl: u8,
+    pub subnet_timeout: u8,
+    pub init_type_reply: u8,
+    pub active_width: u8,
+    pub active_speed: u8,
+    pub phys_state: u8,
+    pub link_layer: u8,
+    pub flags: u8,
+    pub port_cap_flags2: u16,
+    pub active_speed_ex: u32,
+}
+
+#[repr(u32)]
+#[allow(non_camel_case_types, dead_code)]
+pub enum ibv_gid_type {
+    IBV_GID_TYPE_IB,
+    IBV_GID_TYPE_ROCE_V1,
+    IBV_GID_TYPE_ROCE_V2,
+}
+
+#[repr(C)]
+pub struct ibv_gid_entry {
+    pub gid: ibv_gid,
+    pub gid_index: u32,
+    pub port_num: u32,
+    pub gid_type: u32,
+    pub ndev_ifindex: u32,
+}
+
 unsafe extern "C" {
     pub fn ibv_get_device_list(num_devices: *mut i32) -> *mut *mut ibv_device;
     pub fn ibv_free_device_list(list: *mut *mut ibv_device);
@@ -224,4 +278,16 @@ unsafe extern "C" {
         index: i32,
         gid: *mut ibv_gid,
     ) -> i32;
+    pub fn ibv_query_port(
+        context: *mut ibv_context,
+        port_num: u8,
+        port_attr: *mut ibv_port_attr,
+    ) -> i32;
+    pub fn _ibv_query_gid_table(
+        context: *mut ibv_context,
+        entries: *mut ibv_gid_entry,
+        max_entries: usize,
+        flags: u32,
+        entry_size: usize,
+    ) -> isize;
 }

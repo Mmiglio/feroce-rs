@@ -117,6 +117,66 @@ impl Device {
             Ok(gid)
         }
     }
+
+    pub fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr, String> {
+        let mut attr = ffi::ibv_port_attr::default();
+
+        let ret = unsafe { ffi::ibv_query_port(self.context, port_num, &mut attr) };
+
+        if ret != 0 {
+            Err(format!("failed to query port {}: {}", port_num, ret))
+        } else {
+            Ok(attr)
+        }
+    }
+
+    pub fn query_gid_table(&self) -> Result<Vec<ffi::ibv_gid_entry>, String> {
+        let max_entries = 64;
+        let mut entries = Vec::with_capacity(max_entries);
+        let ret = unsafe {
+            ffi::_ibv_query_gid_table(
+                self.context,
+                entries.as_mut_ptr(),
+                max_entries,
+                0,
+                std::mem::size_of::<ffi::ibv_gid_entry>(),
+            )
+        };
+
+        if ret < 0 {
+            Err(format!("failed to query GID table: {}", ret))
+        } else {
+            unsafe {
+                entries.set_len(ret as usize);
+                Ok(entries)
+            }
+        }
+    }
+
+    pub fn is_rocev2_active(
+        &self,
+        port_num: u8,
+        gid_index: i32,
+    ) -> Result<Option<ffi::ibv_mtu>, String> {
+        let port_attr = self.query_port(port_num)?;
+        let gid_entries = self.query_gid_table()?;
+
+        for entry in &gid_entries {
+            if entry.port_num == port_num as u32
+                && entry.gid_index == gid_index as u32
+                && entry.gid_type == ffi::ibv_gid_type::IBV_GID_TYPE_ROCE_V2 as u32
+                && entry.gid.raw.iter().any(|&b| b != 0)
+                && entry.gid.raw[10] == 0xff // look for ipv4-mapped GIDs
+                && entry.gid.raw[11] == 0xff
+                && port_attr.link_layer == ffi::ibv_link_layer::IBV_LINK_LAYER_ETHERNET
+                && matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE)
+            {
+                return Ok(Some(port_attr.active_mtu));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 impl Drop for Device {
@@ -187,13 +247,16 @@ impl QueuePair {
                 max_recv_sge: max_sge,
                 max_inline_data: 0,
             },
-            qp_type: qp_type,
+            qp_type,
             sq_sig_all: 0,
         };
 
         let qp = unsafe { ffi::ibv_create_qp(pd.raw(), &mut init_attr) };
         if qp.is_null() {
-            Err("failed to create QP".to_string())
+            Err(format!(
+                "failed to create QP: errno {}",
+                std::io::Error::last_os_error()
+            ))
         } else {
             Ok(QueuePair {
                 qp,
@@ -242,7 +305,7 @@ impl QueuePair {
             min_rnr_timer: 12,
             ah_attr: ffi::ibv_ah_attr {
                 is_global: 1,
-                port_num: port_num,
+                port_num,
                 grh: ffi::ibv_global_route {
                     sgid_index: gid_index,
                     hop_limit: 1,
@@ -279,7 +342,7 @@ impl QueuePair {
             timeout: 14,
             retry_cnt: 7,
             rnr_retry: 7,
-            sq_psn: sq_psn,
+            sq_psn,
             max_rd_atomic: 1,
             ..Default::default()
         };
@@ -313,6 +376,30 @@ mod test {
     use super::*;
     use crate::rdma;
 
+    // Find one available roce device, returns the device, port number, gid_index and mtu.
+    fn find_roce_device() -> Option<(Device, u8, i32, ffi::ibv_mtu)> {
+        let devices = DeviceList::new().ok()?;
+        for i in 0..devices.len() {
+            let name = devices.device_name(i)?;
+            let device = Device::open(name).ok()?;
+            let entries = device.query_gid_table().ok()?;
+            for entry in &entries {
+                if entry.gid_type == ffi::ibv_gid_type::IBV_GID_TYPE_ROCE_V2 as u32
+                    && entry.gid.raw.iter().any(|&b| b != 0)
+                    && entry.gid.raw[10] == 0xff
+                    && entry.gid.raw[11] == 0xff
+                {
+                    let port = entry.port_num as u8;
+                    let port_attr = device.query_port(port).ok()?;
+                    if matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE) {
+                        return Some((device, port, entry.gid_index as i32, port_attr.active_mtu));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn list_devices() {
         let devices = DeviceList::new().expect("no RDMA devices found");
@@ -343,9 +430,8 @@ mod test {
 
     #[test]
     fn create_qp() {
-        let devices = DeviceList::new().expect("no RDMA devices found");
-        let name = devices.device_name(0).expect("no devices");
-        let device = Device::open(name).expect("failed to open device");
+        let (device, port, gid_index, path_mtu) =
+            find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = device.alloc_pd().expect("failed to allocate PD");
         let cq = device.create_cq(128).expect("failed to create CQ");
@@ -356,9 +442,8 @@ mod test {
 
     #[test]
     fn qp_state_transitions_rts() {
-        let devices = DeviceList::new().expect("no RDMA devices found");
-        let name = devices.device_name(0).expect("no devices");
-        let device = Device::open(name).expect("failed to open device");
+        let (device, port, gid_index, path_mtu) =
+            find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = device.alloc_pd().expect("failed to allocate PD");
         let cq = device.create_cq(128).expect("failed to create CQ");
@@ -366,7 +451,9 @@ mod test {
         let qp = QueuePair::create_qp(pd, cq, 16, 8, rdma::ibv_qp_type::IBV_QPT_RC)
             .expect("failed to create qp");
 
-        let loc_gid = device.query_gid(1, 3).expect("failed to query fid");
+        let loc_gid = device
+            .query_gid(port, gid_index)
+            .expect("failed to query fid");
         let qp_num = qp.qp_num();
 
         let fake_remote_info = QpConnectionInfo {
@@ -377,8 +464,9 @@ mod test {
             gid: loc_gid.raw, // gid_from_ipv4(Ipv4Addr::new(10, 0, 1, 120).into()),
         };
 
-        qp.modify_to_init(1).expect("failed to modify qp to INIT");
-        qp.modify_to_rtr(&fake_remote_info, 3, 1, rdma::ffi::ibv_mtu::IBV_MTU_1024)
+        qp.modify_to_init(port)
+            .expect("failed to modify qp to INIT");
+        qp.modify_to_rtr(&fake_remote_info, gid_index as u8, port, path_mtu)
             .expect("failed to modify qp to RTR");
         qp.modify_to_rts(4321).expect("failed to modify qp to RTS");
     }
