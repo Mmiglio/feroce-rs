@@ -46,8 +46,7 @@ test-rdma:
   tags:
     - roce
   before_script:
-      - ibv_devinfo
+      - ibv_devinfo -v
       - rdma link show
-      - cat /sys/class/infiniband/*/ports/*/gid_attrs/types/* 2>/dev/null | head -20 || true
   script:
     - cargo test --features rdma-test -- --nocapture
