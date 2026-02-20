@@ -392,6 +392,10 @@ mod test {
                     let port = entry.port_num as u8;
                     let port_attr = device.query_port(port).ok()?;
                     if matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE) {
+                        println!(
+                            "Discovery: device={}, port={}, gid_index={}, mtu={:?}",
+                            name, port, entry.gid_index, port_attr.active_mtu as u32
+                        );
                         return Some((device, port, entry.gid_index as i32, port_attr.active_mtu));
                     }
                 }
@@ -430,13 +434,13 @@ mod test {
 
     #[test]
     fn create_qp() {
-        let (device, port, gid_index, path_mtu) =
+        let (device, _port, _gid_index, _path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = device.alloc_pd().expect("failed to allocate PD");
         let cq = device.create_cq(128).expect("failed to create CQ");
 
-        let _qp = QueuePair::create_qp(pd, cq, 16, 8, rdma::ibv_qp_type::IBV_QPT_RC)
+        let _qp = QueuePair::create_qp(pd, cq, 16, 4, rdma::ibv_qp_type::IBV_QPT_RC)
             .expect("failed to create qp");
     }
 
@@ -448,7 +452,7 @@ mod test {
         let pd = device.alloc_pd().expect("failed to allocate PD");
         let cq = device.create_cq(128).expect("failed to create CQ");
 
-        let qp = QueuePair::create_qp(pd, cq, 16, 8, rdma::ibv_qp_type::IBV_QPT_RC)
+        let qp = QueuePair::create_qp(pd, cq, 16, 4, rdma::ibv_qp_type::IBV_QPT_RC)
             .expect("failed to create qp");
 
         let loc_gid = device

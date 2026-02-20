@@ -42,6 +42,7 @@ pub struct ibv_qp_cap {
 
 #[repr(i32)]
 #[allow(non_camel_case_types)]
+#[derive(Copy, Clone)]
 pub enum ibv_qp_type {
     IBV_QPT_RC = 2,
     IBV_QPT_UC = 3,
@@ -114,7 +115,7 @@ pub struct ibv_gid {
 
 #[repr(i32)]
 #[allow(non_camel_case_types)]
-#[derive(Default)]
+#[derive(Default, Copy, Clone)]
 pub enum ibv_mtu {
     #[default]
     IBV_MTU_256 = 1,
@@ -125,7 +126,7 @@ pub enum ibv_mtu {
 }
 #[repr(i32)]
 #[allow(non_camel_case_types, dead_code)]
-#[derive(Default)]
+#[derive(Default, Copy, Clone)]
 pub enum ibv_mig_state {
     #[default]
     IBV_MIG_MIGRATED,
@@ -188,7 +189,7 @@ pub struct ibv_qp_attr {
 
 #[repr(i32)]
 #[allow(non_camel_case_types, dead_code)]
-#[derive(Default)]
+#[derive(Default, Copy, Clone)]
 pub enum ibv_port_state {
     #[default]
     IBV_PORT_NOP = 0,
@@ -238,6 +239,7 @@ pub struct ibv_port_attr {
 
 #[repr(u32)]
 #[allow(non_camel_case_types, dead_code)]
+#[derive(Copy, Clone)]
 pub enum ibv_gid_type {
     IBV_GID_TYPE_IB,
     IBV_GID_TYPE_ROCE_V1,
