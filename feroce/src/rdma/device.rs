@@ -540,6 +540,8 @@ impl Drop for MemoryRegion {
 mod test {
     use super::*;
     use crate::rdma;
+    use std::thread;
+    use std::time::Duration;
 
     // Find one available roce device, returns the device, port number, gid_index and mtu.
     fn find_roce_device() -> Option<(Device, u8, i32, ffi::ibv_mtu)> {
@@ -779,13 +781,14 @@ mod test {
             ..Default::default()
         });
         let n = qp_send.cq().poll(&mut send_wc).unwrap();
+        thread::sleep(Duration::from_millis(50));
 
-        assert_eq!(n, 1);
-        assert_eq!(buf_recv, buf_send);
-        assert_eq!(recv_wc[0].byte_len, buf_size as u32);
         assert!(matches!(
             send_wc[0].status,
             ffi::ibv_wc_status::IBV_WC_SUCCESS
         ));
+        assert_eq!(n, 1);
+        assert_eq!(buf_recv, buf_send);
+        assert_eq!(recv_wc[0].byte_len, buf_size as u32);
     }
 }
