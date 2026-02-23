@@ -121,7 +121,7 @@ impl Device {
     pub fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr, String> {
         let mut attr = ffi::ibv_port_attr::default();
 
-        let ret = unsafe { ffi::ibv_query_port(self.context, port_num, &mut attr) };
+        let ret = unsafe { ffi::ibv_query_port_compact(self.context, port_num, &mut attr) };
 
         if ret != 0 {
             Err(format!("failed to query port {}: {}", port_num, ret))
@@ -168,7 +168,7 @@ impl Device {
                 && entry.gid.raw.iter().any(|&b| b != 0)
                 && entry.gid.raw[10] == 0xff // look for ipv4-mapped GIDs
                 && entry.gid.raw[11] == 0xff
-                && port_attr.link_layer == ffi::ibv_link_layer::IBV_LINK_LAYER_ETHERNET
+                && port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET as u8
                 && matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE)
             {
                 return Ok(Some(port_attr.active_mtu));
@@ -281,7 +281,7 @@ impl QueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
             | ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
 
-        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask) };
+        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
         if ret != 0 {
             Err(format!("Failed to modify QP to INIT: error {}", ret))
         } else {
@@ -327,7 +327,7 @@ impl QueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC
             | ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
 
-        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask) };
+        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
 
         if ret != 0 {
             Err(format!("Failed to modify QP to RTR: error {}", ret))
@@ -354,7 +354,7 @@ impl QueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN
             | ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
 
-        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask) };
+        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
 
         if ret != 0 {
             Err(format!("Failed to modify QP to RTS: error {}", ret))
