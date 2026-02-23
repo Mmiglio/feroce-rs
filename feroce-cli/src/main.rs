@@ -23,6 +23,11 @@ enum Commands {
         /// CM port
         #[arg(long, default_value_t = 0x4321)]
         cm_port: u16,
+        /// RDMA device name
+        #[arg(long)]
+        rdma_device: String,
+        #[arg(long)]
+        gid_index: i32,
     },
     /// FEROCE sender
     Send {
@@ -38,6 +43,11 @@ enum Commands {
         /// Remote CM port
         #[arg(long)]
         remote_port: u16,
+        /// RDMA device name
+        #[arg(long)]
+        rdma_device: String,
+        #[arg(long)]
+        gid_index: i32,
     },
 }
 
@@ -45,8 +55,13 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Recv { bind_addr, cm_port } => {
-            if let Err(e) = recv::run(bind_addr, cm_port) {
+        Commands::Recv {
+            bind_addr,
+            cm_port,
+            rdma_device,
+            gid_index,
+        } => {
+            if let Err(e) = recv::run(bind_addr, cm_port, rdma_device, gid_index) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -56,8 +71,17 @@ fn main() {
             cm_port,
             remote_addr,
             remote_port,
+            rdma_device,
+            gid_index,
         } => {
-            if let Err(e) = send::run(bind_addr, cm_port, remote_addr, remote_port) {
+            if let Err(e) = send::run(
+                bind_addr,
+                cm_port,
+                remote_addr,
+                remote_port,
+                rdma_device,
+                gid_index,
+            ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

@@ -29,6 +29,12 @@ pub struct ibv_wc {
     pub dlid_path_bits: u8,
 }
 
+impl Default for ibv_wc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 include!("ffi_generated.rs");
 
 pub unsafe fn ibv_query_port_compact(
