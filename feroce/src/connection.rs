@@ -49,6 +49,7 @@ struct PendingQp {
 
 enum QpState {
     Connected {
+        peer_addr: SocketAddr,
         local_info: QpConnectionInfo,
         remote_info: QpConnectionInfo,
     },
@@ -56,12 +57,19 @@ enum QpState {
 }
 
 pub enum CmEvent {
-    /// New connection request arrived.
-    /// Application should create a QP and call set_local_info
+    /// New connection request.
+    /// Application should create a QP and call set_local_info.
     NewConnection {
         peer_ip: IpAddr,
         remote_qpn: u32,
         remote_info: QpConnectionInfo,
+    },
+    /// Request to close QP.
+    /// Close local QP and send ack to peer.
+    CloseQp {
+        peer_ip: IpAddr,
+        local_qpn: u32,
+        remote_qpn: u32,
     },
 }
 
@@ -151,6 +159,7 @@ impl ConnectionManager {
         });
 
         if let Some(QpState::Connected {
+            peer_addr,
             local_info,
             remote_info,
         }) = res_qp_state
@@ -222,6 +231,7 @@ impl ConnectionManager {
         self.qps.insert(
             local_info.qp_num,
             QpState::Connected {
+                peer_addr: SocketAddr::new(peer_ip, pending_conn.reply_port),
                 local_info: *local_info,
                 remote_info: pending_conn.remote_info,
             },
@@ -320,6 +330,7 @@ impl ConnectionManager {
                 self.qps.insert(
                     local_info.qp_num,
                     QpState::Connected {
+                        peer_addr: remote_addr,
                         local_info: *local_info,
                         remote_info,
                     },
@@ -337,6 +348,29 @@ impl ConnectionManager {
         // exhausted retries, return a timeout error
         self.socket.set_read_timeout(original_socket_timeout)?;
         Err(ConnectionError::Timeout)
+    }
+}
+
+pub fn build_qp_message(
+    qp_flags: QpFlags,
+    local_info: &QpConnectionInfo,
+    remote_info: &QpConnectionInfo,
+    udp_port: u16,
+) -> QpMessage {
+    QpMessage {
+        flags: qp_flags,
+        loc_qpn: local_info.qp_num,
+        loc_psn: local_info.psn,
+        loc_rkey: local_info.rkey,
+        loc_base_addr: local_info.addr,
+        loc_ip: ipv4_from_gid(&local_info.gid),
+        rem_qpn: remote_info.qp_num,
+        rem_psn: remote_info.psn,
+        rem_rkey: remote_info.rkey,
+        rem_base_addr: remote_info.addr,
+        rem_ip: ipv4_from_gid(&remote_info.gid),
+        udp_port,
+        ..Default::default()
     }
 }
 
@@ -404,6 +438,9 @@ mod test {
                 assert_eq!(remote_info.rkey, 0xDEAD);
                 assert_eq!(remote_info.addr, 0xDEADBEEF);
             }
+            _ => {
+                panic!("unexpected request");
+            }
         };
     }
 
@@ -432,6 +469,9 @@ mod test {
                     };
 
                     cm.set_local_info(peer_ip, remote_qpn, &local_info).unwrap();
+                }
+                _ => {
+                    panic!("unexpected request");
                 }
             }
 
@@ -469,6 +509,7 @@ mod test {
         assert!(qp_state.is_some());
 
         if let Some(QpState::Connected {
+            peer_addr: _,
             local_info,
             remote_info,
         }) = qp_state
@@ -555,6 +596,9 @@ mod test {
 
                     cm.set_local_info(peer_ip, remote_qpn, &local_info).unwrap();
                 }
+                _ => {
+                    panic!("unexpected request");
+                }
             }
 
             cm
@@ -600,10 +644,12 @@ mod test {
 
         if let (
             Some(QpState::Connected {
+                peer_addr: _,
                 local_info: recv_local,
                 remote_info: recv_remote,
             }),
             Some(QpState::Connected {
+                peer_addr: _,
                 local_info: send_local,
                 remote_info: send_remote,
             }),
@@ -640,6 +686,9 @@ mod test {
                         gid: gid_from_ipv4(0x7F000001),
                     };
                     cm.set_local_info(peer_ip, remote_qpn, &local_info).unwrap();
+                }
+                _ => {
+                    panic!("unexpected request");
                 }
             }
 
@@ -700,6 +749,77 @@ mod test {
         match event2 {
             CmEvent::NewConnection { remote_qpn, .. } => {
                 assert_eq!(remote_qpn, 99);
+            }
+            _ => {
+                panic!("unexpected request");
+            }
+        }
+    }
+
+    #[test]
+    fn close_qp_removes_connected_qp() {
+        let receiver_cm_port = 0x4328 as u16;
+        let sender_cm_port = 0x4329 as u16;
+
+        let mut cm =
+            ConnectionManager::new("127.0.0.1".parse().unwrap(), receiver_cm_port).unwrap();
+
+        let receiver_info = QpConnectionInfo {
+            qp_num: 42,
+            psn: 1234,
+            rkey: 0xABCD,
+            addr: 0x1234ABCD,
+            gid: gid_from_ipv4(0x7F000001),
+        };
+        let sender_info = QpConnectionInfo {
+            qp_num: 256,
+            psn: 0,
+            rkey: 0xDEAD,
+            addr: 0xDEADBEEF,
+            gid: gid_from_ipv4(0x7F000001),
+        };
+
+        cm.qps.insert(
+            receiver_info.qp_num,
+            QpState::Connected {
+                peer_addr: SocketAddr::new("127.0.0.1".parse().unwrap(), sender_cm_port),
+                local_info: receiver_info,
+                remote_info: sender_info,
+            },
+        );
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // simulate a close QP message
+        let close_qp_msg = build_qp_message(
+            QpFlags::new(RequestType::CloseQp, AckType::Null, false),
+            &sender_info,
+            &receiver_info,
+            sender_cm_port,
+        );
+
+        sender_socket
+            .send_to(
+                &close_qp_msg.pack(),
+                format!("127.0.0.1:{}", receiver_cm_port),
+            )
+            .unwrap();
+
+        let event = cm.process_next().unwrap();
+        match event {
+            CmEvent::CloseQp {
+                peer_ip: _,
+                local_qpn,
+                remote_qpn,
+            } => {
+                // close the local QP, notify the cm when it is done
+
+                cm.ack_close_qp(local_qpn).expect("failed to close qp");
+
+                assert!(!cm.qps.contains_key(&local_qpn));
+                assert_eq!(remote_qpn, 256);
+            }
+            _ => {
+                panic!("unexpected request");
             }
         }
     }

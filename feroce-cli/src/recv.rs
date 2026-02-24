@@ -96,6 +96,7 @@ pub fn run(
             println!("Received message!\nSize: {}", recv_wc[0].byte_len);
             println!("\tFirst 8 bytes: {:02x?}", &buf[..8]);
         }
+        CmEvent::CloseQp { .. } => todo!(),
     }
 
     Ok(())
