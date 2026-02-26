@@ -1,5 +1,7 @@
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -8,9 +10,16 @@ use feroce::{
     protocol::QpConnectionInfo,
     rdma::{
         self,
-        device::{Device, MemoryRegion, QueuePair, SendOp},
+        device::{Device, MemoryRegion, QueuePair},
     },
 };
+
+#[allow(dead_code, unused)]
+struct QpContext {
+    qp: QueuePair,
+    mr: MemoryRegion,
+    buf: Vec<u8>,
+}
 
 pub fn run(
     bind_addr: IpAddr,
@@ -29,81 +38,107 @@ pub fn run(
             rdma_device, gid_index
         ))?;
 
+    let mut qps: HashMap<u32, QpContext> = HashMap::new();
     let mut cm = ConnectionManager::new(bind_addr, cm_port)?;
 
-    // create local QP
-    let pd = device.alloc_pd()?;
-    let cq = device.create_cq(16)?;
+    // create 8 QPs
+    for _i in 0..8 {
+        // create local QP
+        let pd = Arc::new(device.alloc_pd()?);
+        let cq = Arc::new(device.create_cq(16)?);
 
-    let qp = QueuePair::create_qp(pd, cq, 4, 1, rdma::ibv_qp_type::IBV_QPT_RC)?;
+        let qp = QueuePair::create_qp(
+            Arc::clone(&pd),
+            Arc::clone(&cq),
+            4,
+            1,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )?;
 
-    let mut buf = vec![0u8; 64];
-    let mr = MemoryRegion::register(
-        qp.pd(),
-        &mut buf,
-        rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
-    )?;
+        let mut buf = vec![0u8; 64];
+        let mr = MemoryRegion::register(
+            qp.pd(),
+            &mut buf,
+            rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
+        )?;
 
-    let loc_gid = device.query_gid(port_num, gid_index)?;
+        let loc_gid = device.query_gid(port_num, gid_index)?;
 
-    // register local infos
-    let local_info = QpConnectionInfo {
-        qp_num: qp.qp_num(),
-        psn: 0,
-        rkey: mr.rkey(),
-        addr: mr.addr(),
-        gid: loc_gid.raw, //gid_from_ipv4(ipv4_to_u32(bind_addr).ok_or("IPv6 not supported")?),
-    };
-    qp.modify_to_init(port_num)?;
+        // register local infos
+        let local_info = QpConnectionInfo {
+            qp_num: qp.qp_num(),
+            psn: 0,
+            rkey: mr.rkey(),
+            addr: mr.addr(),
+            gid: loc_gid.raw, //gid_from_ipv4(ipv4_to_u32(bind_addr).ok_or("IPv6 not supported")?),
+        };
+        qp.modify_to_init(port_num)?;
 
-    // connect the CM to gather remote info
-    let remote_info = cm.connect(
-        SocketAddr::new(remote_addr, remote_port),
-        &local_info,
-        Duration::from_secs(2),
-        2,
-    )?;
+        println!("Create local qp {}", qp.qp_num());
 
-    qp.modify_to_rtr(&remote_info, gid_index as u8, port_num, active_path_mtu)?;
-    qp.modify_to_rts(remote_info.psn)?;
+        // connect the CM to gather remote info
+        let remote_info = cm.connect(
+            SocketAddr::new(remote_addr, remote_port),
+            &local_info,
+            Duration::from_secs(2),
+            2,
+        )?;
 
-    // post the send WR
-    // post send wr
-    buf[0] = 0xff;
-    buf[1] = 0xde;
-    buf[2] = 0xad;
+        qp.modify_to_rtr(&remote_info, gid_index as u8, port_num, active_path_mtu)?;
+        qp.modify_to_rts(remote_info.psn)?;
 
-    let mut send_sg_list = Vec::<rdma::ibv_sge>::new();
-    send_sg_list.push(rdma::ibv_sge {
-        addr: buf.as_mut_ptr() as u64, // mr.addr(),
-        length: buf.len() as u32,
-        lkey: mr.lkey(),
-    });
+        qps.insert(qp.qp_num(), QpContext { qp, mr, buf });
 
-    qp.post_send(2, &mut send_sg_list, SendOp::Send, true)?;
-
-    // poll the completion queue and hope for the best
-    let mut send_wc = Vec::<rdma::ibv_wc>::new();
-    send_wc.push(rdma::ibv_wc {
-        ..Default::default()
-    });
-    loop {
-        let n = qp.cq().poll(&mut send_wc).unwrap();
-        if n > 0 {
-            break;
-        }
+        println!(
+            "Connected new qp! local {} - remote {}",
+            local_info.qp_num, remote_info.qp_num
+        );
     }
 
-    if send_wc[0].status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
-        return Err(format!("recv failed with status {:?}", send_wc[0].status).into());
+    //close the qps
+    for (qpn, qp_ctx) in qps.drain() {
+        qp_ctx.qp.modify_to_error()?;
+        cm.close_qp(qpn, Duration::from_secs(2), 2)?;
+        println!("Connected qp! local {} - remote {}", qpn, 1);
     }
-    println!("Sent message");
 
-    // close qp and move it to error, for a clean exit
-    cm.close_qp(qp.qp_num(), Duration::from_secs(2), 2)?;
+    // // post the send WR
+    // // post send wr
+    // buf[0] = 0xff;
+    // buf[1] = 0xde;
+    // buf[2] = 0xad;
 
-    qp.modify_to_error()?;
+    // let mut send_sg_list = Vec::<rdma::ibv_sge>::new();
+    // send_sg_list.push(rdma::ibv_sge {
+    //     addr: buf.as_mut_ptr() as u64, // mr.addr(),
+    //     length: buf.len() as u32,
+    //     lkey: mr.lkey(),
+    // });
+
+    // qp.post_send(2, &mut send_sg_list, SendOp::Send, true)?;
+
+    // // poll the completion queue and hope for the best
+    // let mut send_wc = Vec::<rdma::ibv_wc>::new();
+    // send_wc.push(rdma::ibv_wc {
+    //     ..Default::default()
+    // });
+    // loop {
+    //     let n = qp.cq().poll(&mut send_wc).unwrap();
+    //     if n > 0 {
+    //         break;
+    //     }
+    // }
+
+    // if send_wc[0].status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
+    //     return Err(format!("recv failed with status {:?}", send_wc[0].status).into());
+    // }
+    // println!("Sent message");
+
+    // // close qp and move it to error, for a clean exit
+    // cm.close_qp(qp.qp_num(), Duration::from_secs(2), 2)?;
+
+    // qp.modify_to_error()?;
 
     Ok(())
 }
