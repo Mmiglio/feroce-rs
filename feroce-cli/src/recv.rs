@@ -6,7 +6,14 @@ use feroce::{
         device::{Device, MemoryRegion, QueuePair},
     },
 };
-use std::{net::IpAddr, thread, time::Duration};
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
+
+#[allow(dead_code, unused)]
+struct QpContext {
+    qp: QueuePair,
+    mr: MemoryRegion,
+    buf: Vec<u8>,
+}
 
 pub fn run(
     bind_addr: IpAddr,
@@ -23,104 +30,78 @@ pub fn run(
             rdma_device, gid_index
         ))?;
 
+    let mut qps: HashMap<u32, QpContext> = HashMap::new();
+
     let mut cm = ConnectionManager::new(bind_addr, cm_port)?;
 
-    // process a single event connection event
-    let cm_event = cm.process_next()?;
-
-    // wait for connection
-    let (peer_ip, remote_qpn, remote_info) = match cm_event {
-        CmEvent::NewConnection {
-            peer_ip,
-            remote_qpn,
-            remote_info,
-        } => (peer_ip, remote_qpn, remote_info),
-        _ => {
-            return Err(Box::new(ConnectionError::Protocol(
-                "Invalid transition: expected connection, got closeQP".to_string(),
-            )));
-        }
-    };
-
-    let pd = device.alloc_pd()?;
-    let cq = device.create_cq(16)?;
-
-    let qp = QueuePair::create_qp(pd, cq, 4, 1, rdma::ibv_qp_type::IBV_QPT_RC)?;
-
-    let mut buf = vec![0u8; 64];
-    let mr = MemoryRegion::register(
-        qp.pd(),
-        &mut buf,
-        rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
-    )?;
-
-    let loc_gid = device.query_gid(port_num, gid_index)?;
-    // register local infos
-    let local_info = QpConnectionInfo {
-        qp_num: qp.qp_num(),
-        psn: 0,
-        rkey: mr.rkey(),
-        addr: mr.addr(),
-        gid: loc_gid.raw, //gid_from_ipv4(ipv4_to_u32(bind_addr).ok_or("IPv6 not supported")?),
-    };
-
-    // transition QPs
-    qp.modify_to_init(port_num)?;
-    qp.modify_to_rtr(&remote_info, gid_index as u8, port_num, active_path_mtu)?;
-    qp.modify_to_rts(remote_info.psn)?;
-
-    // post receive wr before sending ack to sender
-    let mut recv_sg_list = Vec::<rdma::ibv_sge>::new();
-    recv_sg_list.push(rdma::ibv_sge {
-        addr: mr.addr(),
-        length: buf.len() as u32,
-        lkey: mr.lkey(),
-    });
-    qp.post_recv(1, &mut recv_sg_list)?;
-
-    // set local info and send ACK
-    cm.set_local_info(peer_ip, remote_qpn, &local_info)?;
-
-    // println!("Local QP: {}", local_info);
-    // println!("Remote QP: {}", remote_info);
-
-    // start polling the CQ
-    let mut recv_wc = Vec::<rdma::ibv_wc>::new();
-    recv_wc.push(rdma::ibv_wc {
-        ..Default::default()
-    });
     loop {
-        let n = qp.cq().poll(&mut recv_wc).unwrap();
-        if n > 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(1)); // avoid burning CPU 
-    }
+        let cm_event = cm.process_next()?;
 
-    if recv_wc[0].status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
-        return Err(format!("recv failed with status {:?}", recv_wc[0].status).into());
-    }
-    println!("Received message!\nSize: {}", recv_wc[0].byte_len);
-    println!("\tFirst 8 bytes: {:02x?}", &buf[..8]);
+        match cm_event {
+            CmEvent::NewConnection {
+                peer_ip,
+                remote_qpn,
+                remote_info,
+            } => {
+                let pd = Arc::new(device.alloc_pd()?);
+                let cq = Arc::new(device.create_cq(16)?);
 
-    // wait for the close QP event
-    let cm_event_close = cm.process_next()?;
-    match cm_event_close {
-        CmEvent::NewConnection { .. } => {
-            return Err(Box::new(ConnectionError::Protocol(
-                "Invalid transition: expected closeQP, got new connection".to_string(),
-            )));
-        }
-        CmEvent::CloseQp {
-            peer_ip: _,
-            local_qpn,
-            remote_qpn: _,
-        } => {
-            qp.modify_to_error()?;
-            cm.ack_close_qp(local_qpn)?;
+                let qp = QueuePair::create_qp(
+                    Arc::clone(&pd),
+                    Arc::clone(&cq),
+                    4,
+                    1,
+                    rdma::ibv_qp_type::IBV_QPT_RC,
+                )?;
+
+                let mut buf = vec![0u8; 64];
+                let mr = MemoryRegion::register(
+                    qp.pd(),
+                    &mut buf,
+                    rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                        | rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
+                )?;
+
+                let loc_gid = device.query_gid(port_num, gid_index)?;
+                // register local infos
+                let local_info = QpConnectionInfo {
+                    qp_num: qp.qp_num(),
+                    psn: 0,
+                    rkey: mr.rkey(),
+                    addr: mr.addr(),
+                    gid: loc_gid.raw,
+                };
+
+                // transition QPs
+                qp.modify_to_init(port_num)?;
+                qp.modify_to_rtr(&remote_info, gid_index as u8, port_num, active_path_mtu)?;
+                qp.modify_to_rts(remote_info.psn)?;
+
+                qps.insert(qp.qp_num(), QpContext { qp, mr, buf });
+
+                cm.set_local_info(peer_ip, remote_qpn, &local_info)?;
+                println!(
+                    "Connected new qp! local {} - remote {}",
+                    local_info.qp_num, remote_qpn
+                );
+            }
+            CmEvent::CloseQp {
+                peer_ip: _,
+                local_qpn,
+                remote_qpn,
+            } => {
+                // get the qp from the list
+                let Some(qp_ctx) = qps.remove(&local_qpn) else {
+                    return Err(Box::new(ConnectionError::Protocol(
+                        "Error! the QP is not present in the list".to_string(),
+                    )));
+                };
+
+                qp_ctx.qp.modify_to_error()?;
+                cm.ack_close_qp(local_qpn)?;
+
+                println!("Closed qp! local {} - remote {}", local_qpn, remote_qpn);
+            }
         }
     }
-
-    Ok(())
 }

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::net::IpAddr;
 
 mod recv;
@@ -12,42 +12,39 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Args)]
+struct RdmaOpts {
+    /// IP address to bind the CM to
+    #[arg(long, default_value = "0.0.0.0")]
+    bind_addr: IpAddr,
+    /// CM port
+    #[arg(long, default_value = "0x4321", value_parser = parse_hex)]
+    cm_port: u16,
+    /// RDMA device name
+    #[arg(long)]
+    rdma_device: String,
+    #[arg(long)]
+    gid_index: i32,
+}
+
 #[derive(Subcommand)]
 #[command(version, about, long_about = None)]
 enum Commands {
     /// FEROCE receiver
     Recv {
-        /// IP address to bind the CM to
-        #[arg(long, default_value = "0.0.0.0")]
-        bind_addr: IpAddr,
-        /// CM port
-        #[arg(long, default_value = "0x4321", value_parser = parse_hex)]
-        cm_port: u16,
-        /// RDMA device name
-        #[arg(long)]
-        rdma_device: String,
-        #[arg(long)]
-        gid_index: i32,
+        #[command(flatten)]
+        rdma_opts: RdmaOpts,
     },
     /// FEROCE sender
     Send {
-        /// IP address to bind the CM to
-        #[arg(long, default_value = "127.0.0.1")]
-        bind_addr: IpAddr,
-        /// CM port
-        #[arg(long, default_value = "0x4321", value_parser = parse_hex)]
-        cm_port: u16,
+        #[command(flatten)]
+        rdma_opts: RdmaOpts,
         /// Remote CM address
         #[arg(long)]
         remote_addr: IpAddr,
         /// Remote CM port
         #[arg(long)]
         remote_port: u16,
-        /// RDMA device name
-        #[arg(long)]
-        rdma_device: String,
-        #[arg(long)]
-        gid_index: i32,
     },
 }
 
@@ -63,32 +60,29 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Recv {
-            bind_addr,
-            cm_port,
-            rdma_device,
-            gid_index,
-        } => {
-            if let Err(e) = recv::run(bind_addr, cm_port, rdma_device, gid_index) {
+        Commands::Recv { rdma_opts } => {
+            if let Err(e) = recv::run(
+                rdma_opts.bind_addr,
+                rdma_opts.cm_port,
+                rdma_opts.rdma_device,
+                rdma_opts.gid_index,
+            ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
         Commands::Send {
-            bind_addr,
-            cm_port,
+            rdma_opts,
             remote_addr,
             remote_port,
-            rdma_device,
-            gid_index,
         } => {
             if let Err(e) = send::run(
-                bind_addr,
-                cm_port,
+                rdma_opts.bind_addr,
+                rdma_opts.cm_port,
                 remote_addr,
                 remote_port,
-                rdma_device,
-                gid_index,
+                rdma_opts.rdma_device,
+                rdma_opts.gid_index,
             ) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);

@@ -1,6 +1,6 @@
-use crate::protocol::QpConnectionInfo;
-
 use super::ffi;
+use crate::protocol::QpConnectionInfo;
+use std::sync::Arc;
 
 pub struct DeviceList {
     list: *mut *mut ffi::ibv_device,
@@ -191,6 +191,9 @@ pub struct ProtectionDomain {
     pd: *mut ffi::ibv_pd,
 }
 
+unsafe impl Send for ProtectionDomain {}
+unsafe impl Sync for ProtectionDomain {}
+
 impl ProtectionDomain {
     pub fn raw(&self) -> *mut ffi::ibv_pd {
         self.pd
@@ -208,6 +211,9 @@ impl Drop for ProtectionDomain {
 pub struct CompletionQueue {
     cq: *mut ffi::ibv_cq,
 }
+
+unsafe impl Send for CompletionQueue {}
+unsafe impl Sync for CompletionQueue {}
 
 impl CompletionQueue {
     pub fn raw(&self) -> *mut ffi::ibv_cq {
@@ -250,14 +256,14 @@ pub enum SendOp {
 
 pub struct QueuePair {
     qp: *mut ffi::ibv_qp,
-    _pd: ProtectionDomain,
-    _cq: CompletionQueue,
+    _pd: Arc<ProtectionDomain>,
+    _cq: Arc<CompletionQueue>,
 }
 
 impl QueuePair {
     pub fn create_qp(
-        pd: ProtectionDomain,
-        cq: CompletionQueue,
+        pd: Arc<ProtectionDomain>,
+        cq: Arc<CompletionQueue>,
         max_wr: u32,
         max_sge: u32,
         qp_type: ffi::ibv_qp_type,
@@ -599,8 +605,8 @@ mod test {
         Vec<u8>,
     ) {
         // register receiver
-        let pd_recv = device.alloc_pd().expect("pd_recv");
-        let cq_recv = device.create_cq(16).expect("cq_recv");
+        let pd_recv = Arc::new(device.alloc_pd().expect("pd_recv"));
+        let cq_recv = Arc::new(device.create_cq(16).expect("cq_recv"));
         let mut buf_recv = vec![0u8; buf_size];
         let mr_recv = MemoryRegion::register(
             &pd_recv,
@@ -609,12 +615,18 @@ mod test {
                 | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
         )
         .expect("mr rcv");
-        let qp_recv = QueuePair::create_qp(pd_recv, cq_recv, 8, 1, rdma::ibv_qp_type::IBV_QPT_RC)
-            .expect("qp receiver");
+        let qp_recv = QueuePair::create_qp(
+            Arc::clone(&pd_recv),
+            Arc::clone(&cq_recv),
+            8,
+            1,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )
+        .expect("qp receiver");
 
         // register sender
-        let pd_send = device.alloc_pd().expect("pd_send");
-        let cq_send = device.create_cq(16).expect("cq_send");
+        let pd_send = Arc::new(device.alloc_pd().expect("pd_send"));
+        let cq_send = Arc::new(device.create_cq(16).expect("cq_send"));
         let mut buf_send = vec![0u8; buf_size];
         let mr_send = MemoryRegion::register(
             &pd_send,
@@ -623,8 +635,14 @@ mod test {
                 | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
         )
         .expect("mr rcv");
-        let qp_send = QueuePair::create_qp(pd_send, cq_send, 8, 1, rdma::ibv_qp_type::IBV_QPT_RC)
-            .expect("qp sender");
+        let qp_send = QueuePair::create_qp(
+            Arc::clone(&pd_send),
+            Arc::clone(&cq_send),
+            8,
+            1,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )
+        .expect("qp sender");
 
         // state transition of qps
         let loc_gid = device.query_gid(port, gid_index).expect("gid");
@@ -728,11 +746,17 @@ mod test {
         let (device, _port, _gid_index, _path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let pd = device.alloc_pd().expect("failed to allocate PD");
-        let cq = device.create_cq(128).expect("failed to create CQ");
+        let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
+        let cq = Arc::new(device.create_cq(128).expect("failed to create CQ"));
 
-        let _qp = QueuePair::create_qp(pd, cq, 16, 4, rdma::ibv_qp_type::IBV_QPT_RC)
-            .expect("failed to create qp");
+        let _qp = QueuePair::create_qp(
+            Arc::clone(&pd),
+            Arc::clone(&cq),
+            16,
+            4,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )
+        .expect("failed to create qp");
     }
 
     #[test]
@@ -740,11 +764,17 @@ mod test {
         let (device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let pd = device.alloc_pd().expect("failed to allocate PD");
-        let cq = device.create_cq(128).expect("failed to create CQ");
+        let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
+        let cq = Arc::new(device.create_cq(128).expect("failed to create CQ"));
 
-        let qp = QueuePair::create_qp(pd, cq, 16, 4, rdma::ibv_qp_type::IBV_QPT_RC)
-            .expect("failed to create qp");
+        let qp = QueuePair::create_qp(
+            Arc::clone(&pd),
+            Arc::clone(&cq),
+            16,
+            4,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )
+        .expect("failed to create qp");
 
         let loc_gid = device
             .query_gid(port, gid_index)
@@ -886,5 +916,37 @@ mod test {
             recv_wc[0].status,
             ffi::ibv_wc_status::IBV_WC_WR_FLUSH_ERR
         ));
+    }
+
+    #[test]
+    fn two_qps_share_pd_and_cq() {
+        let (device, port, _gid_index, _path_mtu) =
+            find_roce_device().expect("no active RoCE device found — skipping");
+
+        let pd = Arc::new(device.alloc_pd().expect("failed to alloc pd"));
+        let cq = Arc::new(device.create_cq(16).expect("failed to create cq"));
+
+        // create two qps sharing pd and cq
+        let qp1 = QueuePair::create_qp(
+            Arc::clone(&pd),
+            Arc::clone(&cq),
+            16,
+            1,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )
+        .expect("failed to create QP");
+        let qp2 = QueuePair::create_qp(
+            Arc::clone(&pd),
+            Arc::clone(&cq),
+            16,
+            1,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )
+        .expect("failed to create QP");
+
+        // drop one of the qps, the other should still be alive
+        drop(qp1);
+        qp2.modify_to_init(port)
+            .expect("failed to modify qp to init");
     }
 }
