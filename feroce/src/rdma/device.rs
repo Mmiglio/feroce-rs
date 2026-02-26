@@ -187,6 +187,32 @@ impl Drop for Device {
     }
 }
 
+pub struct CompletionChannel {
+    channel: *mut ffi::ibv_comp_channel,
+}
+
+impl CompletionChannel {
+    pub fn create(device: &Device) -> Result<Self, String> {
+        let ch = unsafe { ffi::ibv_create_comp_channel(device.context) };
+        if ch.is_null() {
+            Err(format!(
+                "failed to create completion channel: errno {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(CompletionChannel { channel: ch })
+        }
+    }
+}
+
+impl Drop for CompletionChannel {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::ibv_destroy_comp_channel(self.channel);
+        }
+    }
+}
+
 pub struct ProtectionDomain {
     pd: *mut ffi::ibv_pd,
 }
