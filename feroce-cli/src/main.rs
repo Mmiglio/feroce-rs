@@ -21,7 +21,7 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0")]
         bind_addr: IpAddr,
         /// CM port
-        #[arg(long, default_value_t = 0x4321)]
+        #[arg(long, default_value = "0x4321", value_parser = parse_hex)]
         cm_port: u16,
         /// RDMA device name
         #[arg(long)]
@@ -35,7 +35,7 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         bind_addr: IpAddr,
         /// CM port
-        #[arg(long, default_value_t = 0x4321)]
+        #[arg(long, default_value = "0x4321", value_parser = parse_hex)]
         cm_port: u16,
         /// Remote CM address
         #[arg(long)]
@@ -49,6 +49,14 @@ enum Commands {
         #[arg(long)]
         gid_index: i32,
     },
+}
+
+fn parse_hex(s: &str) -> Result<u16, String> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u16::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else {
+        s.parse::<u16>().map_err(|e| e.to_string())
+    }
 }
 
 fn main() {

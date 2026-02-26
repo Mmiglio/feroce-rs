@@ -100,7 +100,10 @@ pub fn run(
     }
     println!("Sent message");
 
-    // println!("Local QP: {}", local_info);
-    // println!("Remote QP: {}", remote_info);
+    // close qp and move it to error, for a clean exit
+    cm.close_qp(qp.qp_num(), Duration::from_secs(2), 2)?;
+
+    qp.modify_to_error()?;
+
     Ok(())
 }

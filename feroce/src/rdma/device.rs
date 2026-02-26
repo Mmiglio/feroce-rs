@@ -552,7 +552,7 @@ impl Drop for MemoryRegion {
 }
 
 #[cfg(test)]
-// #[cfg(feature = "rdma-test")]
+#[cfg(feature = "rdma-test")]
 mod test {
     use super::*;
     use crate::rdma;
