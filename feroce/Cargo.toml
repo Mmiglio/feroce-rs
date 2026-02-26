@@ -7,3 +7,7 @@ edition = "2024"
 rdma-test = []
 
 [dependencies]
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.72.1"

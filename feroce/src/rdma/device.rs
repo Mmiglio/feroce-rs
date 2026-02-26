@@ -121,7 +121,7 @@ impl Device {
     pub fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr, String> {
         let mut attr = ffi::ibv_port_attr::default();
 
-        let ret = unsafe { ffi::ibv_query_port(self.context, port_num, &mut attr) };
+        let ret = unsafe { ffi::ibv_query_port_compact(self.context, port_num, &mut attr) };
 
         if ret != 0 {
             Err(format!("failed to query port {}: {}", port_num, ret))
@@ -153,7 +153,7 @@ impl Device {
         }
     }
 
-    pub fn is_rocev2_active(
+    pub fn query_rocev2_mtu(
         &self,
         port_num: u8,
         gid_index: i32,
@@ -168,7 +168,7 @@ impl Device {
                 && entry.gid.raw.iter().any(|&b| b != 0)
                 && entry.gid.raw[10] == 0xff // look for ipv4-mapped GIDs
                 && entry.gid.raw[11] == 0xff
-                && port_attr.link_layer == ffi::ibv_link_layer::IBV_LINK_LAYER_ETHERNET
+                && port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET as u8
                 && matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE)
             {
                 return Ok(Some(port_attr.active_mtu));
@@ -213,12 +213,39 @@ impl CompletionQueue {
     pub fn raw(&self) -> *mut ffi::ibv_cq {
         self.cq
     }
+
+    pub fn poll(&self, completions: &mut [ffi::ibv_wc]) -> Result<i32, String> {
+        let ctx = unsafe { (*self.cq).context };
+        let poll_fn = unsafe { (*ctx).ops.poll_cq.unwrap() };
+        let num_completions =
+            unsafe { poll_fn(self.cq, completions.len() as i32, completions.as_mut_ptr()) };
+
+        if num_completions < 0 {
+            Err(format!("failed polling cq: {}", num_completions))
+        } else {
+            Ok(num_completions)
+        }
+    }
 }
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
         unsafe { ffi::ibv_destroy_cq(self.cq) };
     }
+}
+
+pub enum SendOp {
+    Send,
+    SendWithImm(u32),
+    Write {
+        remote_addr: u64,
+        rkey: u32,
+    },
+    WriteWithImm {
+        remote_addr: u64,
+        rkey: u32,
+        imm_data: u32,
+    },
 }
 
 pub struct QueuePair {
@@ -281,7 +308,7 @@ impl QueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
             | ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
 
-        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask) };
+        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
         if ret != 0 {
             Err(format!("Failed to modify QP to INIT: error {}", ret))
         } else {
@@ -327,7 +354,7 @@ impl QueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC
             | ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
 
-        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask) };
+        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
 
         if ret != 0 {
             Err(format!("Failed to modify QP to RTR: error {}", ret))
@@ -354,7 +381,7 @@ impl QueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN
             | ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
 
-        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask) };
+        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
 
         if ret != 0 {
             Err(format!("Failed to modify QP to RTS: error {}", ret))
@@ -362,11 +389,165 @@ impl QueuePair {
             Ok(())
         }
     }
+
+    pub fn modify_to_error(&self) -> Result<(), String> {
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_ERR,
+            ..Default::default()
+        };
+
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
+        let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
+
+        if ret != 0 {
+            Err(format!("Failed to modify QP to RTS: error {}", ret))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn post_recv(&self, wr_id: u64, sge_list: &mut [ffi::ibv_sge]) -> Result<(), String> {
+        let mut wr = ffi::ibv_recv_wr {
+            wr_id,
+            next: std::ptr::null_mut(),
+            sg_list: sge_list.as_mut_ptr(),
+            num_sge: sge_list.len() as i32,
+        };
+
+        let mut bad_wr: *mut ffi::ibv_recv_wr = std::ptr::null_mut();
+        let ctx = unsafe { (*self.qp).context };
+        let post_recv_fn = unsafe { (*ctx).ops.post_recv.unwrap() };
+        let ret = unsafe { post_recv_fn(self.qp, &mut wr, &mut bad_wr) };
+
+        if ret != 0 {
+            Err(format!("post_recv failed: {}", ret))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn post_send(
+        &self,
+        wr_id: u64,
+        sge_list: &mut [ffi::ibv_sge],
+        op: SendOp,
+        signaled: bool,
+    ) -> Result<(), String> {
+        let mut flags = 0u32;
+        if signaled {
+            flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+        }
+
+        let mut wr = ffi::ibv_send_wr {
+            wr_id,
+            next: std::ptr::null_mut(),
+            sg_list: sge_list.as_mut_ptr(),
+            num_sge: sge_list.len() as i32,
+            send_flags: flags,
+            ..Default::default()
+        };
+
+        match op {
+            SendOp::Send => {
+                wr.opcode = ffi::ibv_wr_opcode::IBV_WR_SEND;
+            }
+            SendOp::SendWithImm(imm) => {
+                wr.opcode = ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM;
+                wr.__bindgen_anon_1.imm_data = imm;
+            }
+            SendOp::Write { remote_addr, rkey } => {
+                wr.opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE;
+                wr.wr.rdma.remote_addr = remote_addr;
+                wr.wr.rdma.rkey = rkey;
+            }
+            SendOp::WriteWithImm {
+                remote_addr,
+                rkey,
+                imm_data,
+            } => {
+                wr.opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
+                wr.wr.rdma.remote_addr = remote_addr;
+                wr.wr.rdma.rkey = rkey;
+                wr.__bindgen_anon_1.imm_data = imm_data;
+            }
+        }
+
+        let mut bad_wr: *mut ffi::ibv_send_wr = std::ptr::null_mut();
+        let ctx = unsafe { (*self.qp).context };
+        let post_send_fn = unsafe { (*ctx).ops.post_send.unwrap() };
+        let ret = unsafe { post_send_fn(self.qp, &mut wr, &mut bad_wr) };
+
+        if ret != 0 {
+            Err(format!("post_send failed: {}", ret))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn cq(&self) -> &CompletionQueue {
+        &self._cq
+    }
+
+    pub fn pd(&self) -> &ProtectionDomain {
+        &self._pd
+    }
 }
 
 impl Drop for QueuePair {
     fn drop(&mut self) {
         unsafe { ffi::ibv_destroy_qp(self.qp) };
+    }
+}
+
+pub struct MemoryRegion {
+    mr: *mut ffi::ibv_mr,
+}
+
+impl MemoryRegion {
+    pub fn register(
+        pd: &ProtectionDomain,
+        buffer: &mut [u8],
+        access: ffi::ibv_access_flags,
+    ) -> Result<Self, String> {
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                pd.raw(),
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                buffer.len(),
+                access.0 as i32,
+            )
+        };
+
+        if mr.is_null() {
+            Err(format!(
+                "failed to register MR: errno {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(MemoryRegion { mr })
+        }
+    }
+
+    pub fn addr(&self) -> u64 {
+        unsafe { (*self.mr).addr as u64 }
+    }
+
+    pub fn length(&self) -> u32 {
+        unsafe { (*self.mr).length as u32 }
+    }
+
+    pub fn lkey(&self) -> u32 {
+        unsafe { (*self.mr).lkey }
+    }
+
+    pub fn rkey(&self) -> u32 {
+        unsafe { (*self.mr).rkey }
+    }
+}
+
+impl Drop for MemoryRegion {
+    fn drop(&mut self) {
+        unsafe { ffi::ibv_dereg_mr(self.mr) };
     }
 }
 
@@ -402,6 +583,116 @@ mod test {
             }
         }
         None
+    }
+    fn create_loopback_qp(
+        device: &Device,
+        port: u8,
+        gid_index: i32,
+        path_mtu: ffi::ibv_mtu,
+        buf_size: usize,
+    ) -> (
+        QueuePair,
+        MemoryRegion,
+        Vec<u8>,
+        QueuePair,
+        MemoryRegion,
+        Vec<u8>,
+    ) {
+        // register receiver
+        let pd_recv = device.alloc_pd().expect("pd_recv");
+        let cq_recv = device.create_cq(16).expect("cq_recv");
+        let mut buf_recv = vec![0u8; buf_size];
+        let mr_recv = MemoryRegion::register(
+            &pd_recv,
+            &mut buf_recv,
+            ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
+        )
+        .expect("mr rcv");
+        let qp_recv = QueuePair::create_qp(pd_recv, cq_recv, 8, 1, rdma::ibv_qp_type::IBV_QPT_RC)
+            .expect("qp receiver");
+
+        // register sender
+        let pd_send = device.alloc_pd().expect("pd_send");
+        let cq_send = device.create_cq(16).expect("cq_send");
+        let mut buf_send = vec![0u8; buf_size];
+        let mr_send = MemoryRegion::register(
+            &pd_send,
+            &mut buf_send,
+            ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
+        )
+        .expect("mr rcv");
+        let qp_send = QueuePair::create_qp(pd_send, cq_send, 8, 1, rdma::ibv_qp_type::IBV_QPT_RC)
+            .expect("qp sender");
+
+        // state transition of qps
+        let loc_gid = device.query_gid(port, gid_index).expect("gid");
+
+        qp_recv.modify_to_init(port).expect("recv init");
+        qp_recv
+            .modify_to_rtr(
+                &QpConnectionInfo {
+                    qp_num: qp_send.qp_num(), // point at the sender
+                    psn: 0,
+                    rkey: mr_recv.rkey(),
+                    addr: mr_recv.addr(),
+                    gid: loc_gid.raw,
+                },
+                gid_index as u8,
+                port,
+                path_mtu,
+            )
+            .expect("recv rtr");
+        qp_recv.modify_to_rts(0).expect("recv rts");
+
+        qp_send.modify_to_init(port).expect("send init");
+        qp_send
+            .modify_to_rtr(
+                &QpConnectionInfo {
+                    qp_num: qp_recv.qp_num(), // point at the receiver
+                    psn: 0,
+                    rkey: mr_send.rkey(),
+                    addr: mr_send.addr(),
+                    gid: loc_gid.raw,
+                },
+                gid_index as u8,
+                port,
+                path_mtu,
+            )
+            .expect("send rtr");
+        qp_send.modify_to_rts(0).expect("send rts");
+
+        (qp_send, mr_send, buf_send, qp_recv, mr_recv, buf_recv)
+    }
+
+    fn poll_cq_with_timeout(
+        cq: &CompletionQueue,
+        wc: &mut [ffi::ibv_wc],
+        timeout: std::time::Duration,
+    ) -> i32 {
+        let start = std::time::Instant::now();
+        let mut n = 0;
+        while start.elapsed() < timeout {
+            n = cq.poll(wc).unwrap();
+            if n > 0 {
+                break;
+            }
+        }
+        n
+    }
+
+    fn make_sge_list(n: usize, buf: &mut Vec<u8>, lkey: u32) -> Vec<ffi::ibv_sge> {
+        let sg_list = vec![
+            ffi::ibv_sge {
+                addr: buf.as_mut_ptr() as u64,
+                length: buf.len() as u32,
+                lkey,
+            };
+            n
+        ];
+
+        sg_list
     }
 
     #[test]
@@ -473,5 +764,127 @@ mod test {
         qp.modify_to_rtr(&fake_remote_info, gid_index as u8, port, path_mtu)
             .expect("failed to modify qp to RTR");
         qp.modify_to_rts(4321).expect("failed to modify qp to RTS");
+    }
+
+    #[test]
+    fn register_memory_region() {
+        let (device, _port, _gid_index, _path_mtu) =
+            find_roce_device().expect("no active RoCE device found — skipping");
+
+        let pd = device.alloc_pd().expect("failed to allocate PD");
+
+        let mut buf = vec![0u8; 128];
+
+        let mr = MemoryRegion::register(
+            &pd,
+            &mut buf,
+            ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
+        )
+        .expect("failed to register memory region");
+
+        assert_eq!(mr.length(), 128);
+        assert!(mr.lkey() != 0);
+        assert!(mr.rkey() != 0);
+    }
+
+    #[test]
+    fn loopback_send_recv() {
+        let buf_size = 64;
+
+        let (device, port, gid_index, path_mtu) =
+            find_roce_device().expect("no active RoCE device found — skipping");
+
+        let (qp_send, mr_send, mut buf_send, qp_recv, mr_recv, mut buf_recv) =
+            create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+
+        // post reveice wr
+        let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
+
+        qp_recv
+            .post_recv(1, &mut recv_sg_list)
+            .expect("failed to post recv wr");
+
+        // post send wr
+        buf_send[0] = 0xff;
+        buf_send[1] = 0xde;
+        buf_send[2] = 0xad;
+
+        let mut send_sg_list = make_sge_list(1, &mut buf_send, mr_send.lkey());
+
+        qp_send
+            .post_send(2, &mut send_sg_list, SendOp::Send, true)
+            .expect("faieled to post send wr");
+
+        // poll the completion queue and hope for the best
+        let mut recv_wc = Vec::<ffi::ibv_wc>::new();
+        recv_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+
+        let _n_wce_recv = poll_cq_with_timeout(
+            &qp_recv.cq(),
+            &mut recv_wc,
+            std::time::Duration::from_secs(2),
+        );
+
+        // found event in the recv_cq, check send.. it should be there as well
+        let mut send_wc = Vec::<ffi::ibv_wc>::new();
+        send_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+
+        let n_wce_send = poll_cq_with_timeout(
+            &qp_send.cq(),
+            &mut send_wc,
+            std::time::Duration::from_secs(2),
+        );
+
+        assert!(matches!(
+            send_wc[0].status,
+            ffi::ibv_wc_status::IBV_WC_SUCCESS
+        ));
+        assert_eq!(n_wce_send, 1);
+        assert_eq!(buf_recv, buf_send);
+        assert_eq!(recv_wc[0].byte_len, buf_size as u32);
+    }
+
+    #[test]
+    fn loopback_send_recv_error_transition() {
+        let buf_size = 64;
+
+        let (device, port, gid_index, path_mtu) =
+            find_roce_device().expect("no active RoCE device found — skipping");
+
+        let (_qp_send, _mr_send, _buf_send, qp_recv, mr_recv, mut buf_recv) =
+            create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+
+        // post reveice wr before transitioning to error
+        let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
+
+        qp_recv
+            .post_recv(1, &mut recv_sg_list)
+            .expect("failed to post recv wr");
+
+        // transition the QP to error state
+        qp_recv
+            .modify_to_error()
+            .expect("Failed to transition to error");
+
+        let mut recv_wc = Vec::<ffi::ibv_wc>::new();
+        recv_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+
+        let _n = poll_cq_with_timeout(
+            &qp_recv.cq(),
+            &mut recv_wc,
+            std::time::Duration::from_secs(2),
+        );
+
+        assert!(matches!(
+            recv_wc[0].status,
+            ffi::ibv_wc_status::IBV_WC_WR_FLUSH_ERR
+        ));
     }
 }
