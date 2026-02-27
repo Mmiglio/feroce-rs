@@ -107,6 +107,28 @@ impl Device {
         }
     }
 
+    pub fn create_cq_with_channel(
+        &self,
+        cqe: i32,
+        comp_channel: &CompletionChannel,
+    ) -> Result<CompletionQueue, String> {
+        let cq = unsafe {
+            ffi::ibv_create_cq(
+                self.context,
+                cqe,
+                std::ptr::null_mut(),
+                comp_channel.channel,
+                0,
+            )
+        };
+
+        if cq.is_null() {
+            Err("failed to create completion queue with channel".to_string())
+        } else {
+            Ok(CompletionQueue { cq })
+        }
+    }
+
     pub fn query_gid(&self, port_num: u8, gid_index: i32) -> Result<ffi::ibv_gid, String> {
         let mut gid = ffi::ibv_gid::default();
         let ret = unsafe { ffi::ibv_query_gid(self.context, port_num, gid_index, &mut gid) };
@@ -203,6 +225,20 @@ impl CompletionChannel {
             Ok(CompletionChannel { channel: ch })
         }
     }
+
+    pub fn get_cq_event(&self) -> Result<(), String> {
+        // Simplify design for now, assumes we are working with a single QP and we know which fired
+        let mut cq: *mut ffi::ibv_cq = std::ptr::null_mut();
+        let mut cq_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        let ret = unsafe { ffi::ibv_get_cq_event(self.channel, &mut cq, &mut cq_ctx) };
+
+        if ret != 0 {
+            Err("failed to get completion event".to_string())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for CompletionChannel {
@@ -257,6 +293,24 @@ impl CompletionQueue {
         } else {
             Ok(num_completions)
         }
+    }
+
+    pub fn req_notify_cq(&self, solicited: bool) -> Result<(), String> {
+        let ctx = unsafe { (*self.cq).context };
+        let req_notify_cq_fn = unsafe { (*ctx).ops.req_notify_cq.unwrap() };
+        let ret = unsafe { req_notify_cq_fn(self.cq, solicited as i32) };
+
+        if ret != 0 {
+            Err("failed to request completion notification for cq".to_string())
+        } else {
+            Ok(())
+        }
+    }
+    pub fn ack_cq_events(&self, nevents: u32) {
+        // this actually doesn't return any value
+        unsafe {
+            ffi::ibv_ack_cq_events(self.cq, nevents);
+        };
     }
 }
 
@@ -616,6 +670,7 @@ mod test {
         }
         None
     }
+
     fn create_loopback_qp(
         device: &Device,
         port: u8,
@@ -624,15 +679,23 @@ mod test {
         buf_size: usize,
     ) -> (
         QueuePair,
+        CompletionChannel,
         MemoryRegion,
         Vec<u8>,
         QueuePair,
+        CompletionChannel,
         MemoryRegion,
         Vec<u8>,
     ) {
         // register receiver
+        let channel_recv =
+            CompletionChannel::create(&device).expect("failed to create recv completion channel");
         let pd_recv = Arc::new(device.alloc_pd().expect("pd_recv"));
-        let cq_recv = Arc::new(device.create_cq(16).expect("cq_recv"));
+        let cq_recv = Arc::new(
+            device
+                .create_cq_with_channel(16, &channel_recv)
+                .expect("cq_recv"),
+        );
         let mut buf_recv = vec![0u8; buf_size];
         let mr_recv = MemoryRegion::register(
             &pd_recv,
@@ -651,8 +714,14 @@ mod test {
         .expect("qp receiver");
 
         // register sender
+        let channel_send =
+            CompletionChannel::create(&device).expect("failed to create send completion channel");
         let pd_send = Arc::new(device.alloc_pd().expect("pd_send"));
-        let cq_send = Arc::new(device.create_cq(16).expect("cq_send"));
+        let cq_send = Arc::new(
+            device
+                .create_cq_with_channel(16, &channel_send)
+                .expect("cq_send"),
+        );
         let mut buf_send = vec![0u8; buf_size];
         let mr_send = MemoryRegion::register(
             &pd_send,
@@ -707,7 +776,16 @@ mod test {
             .expect("send rtr");
         qp_send.modify_to_rts(0).expect("send rts");
 
-        (qp_send, mr_send, buf_send, qp_recv, mr_recv, buf_recv)
+        (
+            qp_send,
+            channel_send,
+            mr_send,
+            buf_send,
+            qp_recv,
+            channel_recv,
+            mr_recv,
+            buf_recv,
+        )
     }
 
     fn poll_cq_with_timeout(
@@ -851,7 +929,7 @@ mod test {
         let (device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let (qp_send, mr_send, mut buf_send, qp_recv, mr_recv, mut buf_recv) =
+        let (qp_send, _cc_send, mr_send, mut buf_send, qp_recv, _cc_recv, mr_recv, mut buf_recv) =
             create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
 
         // post reveice wr
@@ -870,7 +948,7 @@ mod test {
 
         qp_send
             .post_send(2, &mut send_sg_list, SendOp::Send, true)
-            .expect("faieled to post send wr");
+            .expect("failed to post send wr");
 
         // poll the completion queue and hope for the best
         let mut recv_wc = Vec::<ffi::ibv_wc>::new();
@@ -912,7 +990,7 @@ mod test {
         let (device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let (_qp_send, _mr_send, _buf_send, qp_recv, mr_recv, mut buf_recv) =
+        let (_qp_send, _cc_send, _mr_send, _buf_send, qp_recv, _cc_recv, mr_recv, mut buf_recv) =
             create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
 
         // post reveice wr before transitioning to error
@@ -974,5 +1052,83 @@ mod test {
         drop(qp1);
         qp2.modify_to_init(port)
             .expect("failed to modify qp to init");
+    }
+
+    #[test]
+    fn completion_channel_firing() {
+        let (device, port, gid_index, path_mtu) =
+            find_roce_device().expect("no active RoCE device found — skipping");
+
+        let buf_size = 64;
+        let (
+            qp_send,
+            channel_send,
+            mr_send,
+            mut buf_send,
+            qp_recv,
+            _channel_recv,
+            mr_recv,
+            mut buf_recv,
+        ) = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+
+        // request notifications for cq of qp_send
+        qp_send
+            .cq()
+            .req_notify_cq(false)
+            .expect("failed to request notification to cq");
+
+        // post reveice wr
+        let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
+
+        qp_recv
+            .post_recv(1, &mut recv_sg_list)
+            .expect("failed to post recv wr");
+
+        // post send wr
+        buf_send[0] = 0xff;
+        buf_send[1] = 0xde;
+        buf_send[2] = 0xad;
+
+        let mut send_sg_list = make_sge_list(1, &mut buf_send, mr_send.lkey());
+
+        qp_send
+            .post_send(2, &mut send_sg_list, SendOp::Send, true)
+            .expect("faieled to post send wr");
+
+        let mut recv_wc = Vec::<ffi::ibv_wc>::new();
+        recv_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+        let _n_wce_recv = poll_cq_with_timeout(
+            &qp_recv.cq(),
+            &mut recv_wc,
+            std::time::Duration::from_secs(2),
+        );
+
+        // wait for event in send channel
+        // this should be blocking...
+        channel_send
+            .get_cq_event()
+            .expect("failed to get completion event!");
+
+        // now we should have an event!
+        let mut send_wc = Vec::<ffi::ibv_wc>::new();
+        send_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+
+        let n_wce_send = qp_send
+            .cq()
+            .poll(&mut send_wc)
+            .expect("failed to poll completion queue");
+
+        assert_eq!(n_wce_send, 1);
+        assert!(matches!(
+            send_wc[0].status,
+            ffi::ibv_wc_status::IBV_WC_SUCCESS
+        ));
+
+        // ack the event
+        qp_send.cq().ack_cq_events(1);
     }
 }
