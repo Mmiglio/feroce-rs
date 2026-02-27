@@ -1,3 +1,4 @@
+pub mod buffer_pool;
 pub mod device;
 mod ffi;
 
