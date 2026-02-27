@@ -340,6 +340,9 @@ pub struct QueuePair {
     _cq: Arc<CompletionQueue>,
 }
 
+unsafe impl Send for QueuePair {}
+unsafe impl Sync for QueuePair {}
+
 impl QueuePair {
     pub fn create_qp(
         pd: Arc<ProtectionDomain>,

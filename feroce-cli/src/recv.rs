@@ -3,16 +3,15 @@ use feroce::{
     protocol::QpConnectionInfo,
     rdma::{
         self,
-        device::{Device, MemoryRegion, QueuePair},
+        buffer_pool::BufferPool,
+        device::{CompletionChannel, Device, QueuePair},
     },
 };
-use std::{collections::HashMap, net::IpAddr, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, sync::Arc, thread::JoinHandle};
 
 #[allow(dead_code, unused)]
 struct QpContext {
     qp: QueuePair,
-    mr: MemoryRegion,
-    buf: Vec<u8>,
 }
 
 pub fn run(
@@ -22,6 +21,10 @@ pub fn run(
     gid_index: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port_num = 1; // move to configs...
+    let max_wr_num = 128 as u32;
+    let num_buf = max_wr_num as usize;
+    let buf_size = 8192;
+
     let device = Device::open(&rdma_device)?;
     let active_path_mtu = device
         .query_rocev2_mtu(port_num, gid_index)?
@@ -31,7 +34,6 @@ pub fn run(
         ))?;
 
     let mut qps: HashMap<u32, QpContext> = HashMap::new();
-
     let mut cm = ConnectionManager::new(bind_addr, cm_port)?;
 
     loop {
@@ -43,32 +45,29 @@ pub fn run(
                 remote_qpn,
                 remote_info,
             } => {
+                let comp_channel = CompletionChannel::create(&device)?;
+
                 let pd = Arc::new(device.alloc_pd()?);
-                let cq = Arc::new(device.create_cq(16)?);
+                let cq = Arc::new(device.create_cq_with_channel(max_wr_num as i32, &comp_channel)?);
 
                 let qp = QueuePair::create_qp(
                     Arc::clone(&pd),
                     Arc::clone(&cq),
-                    4,
+                    max_wr_num,
                     1,
                     rdma::ibv_qp_type::IBV_QPT_RC,
                 )?;
 
-                let mut buf = vec![0u8; 64];
-                let mr = MemoryRegion::register(
-                    qp.pd(),
-                    &mut buf,
-                    rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-                        | rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
-                )?;
+                // create buffer pool (memory region is handled inside)
+                let buf_pool = BufferPool::new(num_buf, buf_size, &pd)?;
 
                 let loc_gid = device.query_gid(port_num, gid_index)?;
                 // register local infos
                 let local_info = QpConnectionInfo {
                     qp_num: qp.qp_num(),
                     psn: 0,
-                    rkey: mr.rkey(),
-                    addr: mr.addr(),
+                    rkey: buf_pool.rkey(),
+                    addr: buf_pool.addr(),
                     gid: loc_gid.raw,
                 };
 
@@ -77,7 +76,7 @@ pub fn run(
                 qp.modify_to_rtr(&remote_info, gid_index as u8, port_num, active_path_mtu)?;
                 qp.modify_to_rts(remote_info.psn)?;
 
-                qps.insert(qp.qp_num(), QpContext { qp, mr, buf });
+                qps.insert(qp.qp_num(), QpContext { qp });
 
                 cm.set_local_info(peer_ip, remote_qpn, &local_info)?;
                 println!(
@@ -105,3 +104,5 @@ pub fn run(
         }
     }
 }
+
+fn poller_thread(qp: Arc<QueuePair>, buffer_pool: BufferPool, channel: CompletionChannel) {}

@@ -9,6 +9,11 @@ pub struct BufferHandle {
     pub lkey: u32,
 }
 
+// Needed to move handle between channels.
+// It is actually safe because the pointer targets pinned registered memory (mr)
+// and only one thread holds the handle at a time
+unsafe impl Send for BufferHandle {}
+
 pub struct BufferPool {
     num_buf: usize,
     buf_size: usize,
@@ -18,10 +23,7 @@ pub struct BufferPool {
     free_bufs: VecDeque<usize>,
 }
 
-// Needed to move handle between channels.
-// It is actually safe because the pointer targets pinned registered memory (mr)
-// and only one thread holds the handle at a time
-unsafe impl Send for BufferHandle {}
+unsafe impl Send for BufferPool {}
 
 impl BufferPool {
     pub fn new(num_buf: usize, buf_size: usize, pd: &ProtectionDomain) -> Result<Self, String> {
@@ -53,6 +55,18 @@ impl BufferPool {
 
     pub fn num_free_bufs(&self) -> usize {
         self.free_bufs.len()
+    }
+
+    pub fn lkey(&self) -> u32 {
+        self.mr.lkey()
+    }
+
+    pub fn rkey(&self) -> u32 {
+        self.mr.rkey()
+    }
+
+    pub fn addr(&self) -> u64 {
+        self.mr.addr()
     }
 
     pub fn get_handle(&self, index: usize) -> BufferHandle {
