@@ -3,6 +3,7 @@ use std::net::IpAddr;
 
 mod recv;
 mod send;
+mod stats;
 
 #[derive(Parser)]
 #[command(name = "feroce-cli")]

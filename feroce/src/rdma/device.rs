@@ -213,6 +213,9 @@ pub struct CompletionChannel {
     channel: *mut ffi::ibv_comp_channel,
 }
 
+unsafe impl Send for CompletionChannel {}
+unsafe impl Sync for CompletionChannel {}
+
 impl CompletionChannel {
     pub fn create(device: &Device) -> Result<Self, String> {
         let ch = unsafe { ffi::ibv_create_comp_channel(device.context) };
@@ -282,7 +285,7 @@ impl CompletionQueue {
         self.cq
     }
 
-    pub fn poll(&self, completions: &mut [ffi::ibv_wc]) -> Result<i32, String> {
+    pub fn poll(&self, completions: &mut [ffi::ibv_wc]) -> Result<usize, String> {
         let ctx = unsafe { (*self.cq).context };
         let poll_fn = unsafe { (*ctx).ops.poll_cq.unwrap() };
         let num_completions =
@@ -291,7 +294,7 @@ impl CompletionQueue {
         if num_completions < 0 {
             Err(format!("failed polling cq: {}", num_completions))
         } else {
-            Ok(num_completions)
+            Ok(num_completions as usize)
         }
     }
 
@@ -795,7 +798,7 @@ mod test {
         cq: &CompletionQueue,
         wc: &mut [ffi::ibv_wc],
         timeout: std::time::Duration,
-    ) -> i32 {
+    ) -> usize {
         let start = std::time::Instant::now();
         let mut n = 0;
         while start.elapsed() < timeout {
