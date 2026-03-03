@@ -43,9 +43,9 @@ pub fn run(
     let port_num = 1; // move to configs...
     let max_wr_num = 128 as u32;
     let num_buf = max_wr_num as usize;
-    let buf_size = 8192 * 8;
-    let num_streams = 4;
-    let num_msgs = 10000 as u64;
+    let buf_size = 8192;
+    let num_streams = 1;
+    let num_msgs = 500000 as u64;
 
     let mut streams_stat = Vec::<Arc<StreamStats>>::new();
 
@@ -243,6 +243,9 @@ fn poller_thread(
             }
 
             send_completed += 1;
+            // update metrics
+            total_bytes += sge_list[wc_list[ce_idx].wr_id as usize][0].length as u64;
+            total_msgs += 1;
 
             if send_completed == num_msgs {
                 // we sent all messages, done
@@ -250,10 +253,6 @@ fn poller_thread(
             }
 
             free_idx_channel.push_back(wc_list[ce_idx].wr_id as usize);
-
-            // update metrics
-            total_bytes += sge_list[wc_list[ce_idx].wr_id as usize][0].length as u64;
-            total_msgs += 1;
         }
 
         stats
@@ -279,6 +278,14 @@ fn poller_thread(
             send_posted += 1;
         }
     }
+
+    // flush remaining stats
+    stats
+        .messages
+        .fetch_add(total_msgs, std::sync::atomic::Ordering::Relaxed);
+    stats
+        .bytes
+        .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }
