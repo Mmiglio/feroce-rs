@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use std::net::IpAddr;
 
+use crate::common::build_role;
+
 mod common;
 mod recv;
 mod send;
@@ -28,6 +30,9 @@ struct CmOpts {
     /// Remote CM port (Required for the active side)
     #[arg(long, value_parser = parse_hex)]
     remote_port: Option<u16>,
+    /// Number of data streams (=QPs)
+    #[arg(long, default_value = "1")]
+    num_streams: u32,
 }
 
 #[derive(Args)]
@@ -54,9 +59,6 @@ struct RdmaOpts {
 
 #[derive(Args)]
 struct SenderOpts {
-    /// Number of data streams (=QPs)
-    #[arg(long, default_value = "1")]
-    num_streams: u32,
     /// Number of messages sent per stream
     #[arg(long, default_value = "100")]
     num_msgs: u64,
@@ -91,25 +93,23 @@ fn parse_hex(s: &str) -> Result<u16, String> {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Recv { cm_opts, rdma_opts } => {
-            if let Err(e) = recv::run(&cm_opts, &rdma_opts) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
+            let cm_role = build_role(&cm_opts, false)?;
+            recv::run(&cm_opts, &cm_role, &rdma_opts)?;
+            Ok(())
         }
         Commands::Send {
             cm_opts,
             rdma_opts,
             sender_opts,
         } => {
-            if let Err(e) = send::run(&cm_opts, &rdma_opts, &sender_opts) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
+            let cm_role = build_role(&cm_opts, true)?;
+            send::run(&cm_opts, &cm_role, &rdma_opts, &sender_opts)?;
+            Ok(())
         }
     }
 }

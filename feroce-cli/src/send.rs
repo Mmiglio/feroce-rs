@@ -1,165 +1,63 @@
-use std::{
-    cmp::min,
-    collections::{HashMap, VecDeque},
-    net::SocketAddr,
-    sync::Arc,
-    thread::JoinHandle,
-    time::{Duration, Instant},
+use std::{cmp::min, collections::VecDeque, sync::Arc};
+
+use feroce::rdma::{
+    self,
+    buffer_pool::{BufferHandle, BufferPool},
+    device::{CompletionChannel, QueuePair},
 };
 
-use feroce::{
-    connection::ConnectionManager,
-    protocol::QpConnectionInfo,
-    rdma::{
-        self,
-        buffer_pool::{BufferHandle, BufferPool},
-        device::{CompletionChannel, Device, QueuePair},
-    },
+use crate::{
+    CmOpts, RdmaOpts, SenderOpts,
+    common::{CmRole, PreparedQP, run_cm_active},
+    stats::StreamStats,
 };
-
-use crate::{CmOpts, RdmaOpts, SenderOpts, stats::StreamStats};
-
-#[allow(dead_code, unused)]
-struct QpContext {
-    qp: Arc<QueuePair>,
-    poller_handle: JoinHandle<()>,
-}
-
-struct ConnectedQp {
-    qp: Arc<QueuePair>,
-    comp_channel: CompletionChannel,
-    buffer_pool: BufferPool,
-    stream_id: u32,
-}
 
 pub fn run(
     cm_opts: &CmOpts,
+    cm_role: &CmRole,
     rdma_opts: &RdmaOpts,
     send_opts: &SenderOpts,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // active side, validate remote options
-    let remote_addr = cm_opts
-        .remote_addr
-        .ok_or("--remote-addr is required for the active side")?;
-    let remote_port = cm_opts
-        .remote_port
-        .ok_or("--remote-port is required for the active side")?;
+    match cm_role {
+        CmRole::Active {
+            remote_addr,
+            num_streams,
+        } => {
+            // spawn poller closure
+            let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
+                let stats = Arc::new(StreamStats::new(stream_id));
 
-    let mut streams_stat = Vec::<Arc<StreamStats>>::new();
+                let handle = std::thread::spawn({
+                    let qp = Arc::clone(&prepared_qp.qp);
+                    let stats = Arc::clone(&stats);
+                    let num_msgs = send_opts.num_msgs;
+                    move || {
+                        if let Err(e) = poller_thread(
+                            qp,
+                            prepared_qp.buffer_pool,
+                            prepared_qp.comp_channel,
+                            num_msgs,
+                            stats,
+                        ) {
+                            eprintln!("poller thread error: {}", e);
+                        }
+                    }
+                });
 
-    let device = Device::open(&rdma_opts.rdma_device)?;
-    let active_path_mtu = device
-        .query_rocev2_mtu(rdma_opts.port_num, rdma_opts.gid_index)?
-        .ok_or(format!(
-            "{} GID index {} is not active RoCE v2",
-            rdma_opts.rdma_device, rdma_opts.gid_index
-        ))?;
+                (handle, stats)
+            };
 
-    let mut qps: HashMap<u32, QpContext> = HashMap::new();
-    let mut cm = ConnectionManager::new(cm_opts.bind_addr, cm_opts.cm_port)?;
-
-    let mut connected_qps = Vec::<ConnectedQp>::new();
-    // to be moved into functions
-    for stream_id in 0..send_opts.num_streams {
-        let comp_channel = CompletionChannel::create(&device)?;
-
-        // create local QP
-        let pd = Arc::new(device.alloc_pd()?);
-        let cq = Arc::new(device.create_cq_with_channel(rdma_opts.num_buf as i32, &comp_channel)?);
-
-        let qp = Arc::new(QueuePair::create_qp(
-            Arc::clone(&pd),
-            Arc::clone(&cq),
-            rdma_opts.num_buf as u32,
-            1,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )?);
-
-        let loc_gid = device.query_gid(rdma_opts.port_num, rdma_opts.gid_index)?;
-        let buffer_pool = BufferPool::new(rdma_opts.num_buf, rdma_opts.buf_size, &pd)?;
-
-        // register local infos
-        let local_info = QpConnectionInfo {
-            qp_num: qp.qp_num(),
-            psn: 0,
-            rkey: buffer_pool.rkey(),
-            addr: buffer_pool.addr(),
-            gid: loc_gid.raw,
-        };
-        qp.modify_to_init(rdma_opts.port_num)?;
-
-        println!("created local qp {}", qp.qp_num());
-
-        // connect the CM to gather remote info
-        let remote_info = cm.connect(
-            SocketAddr::new(remote_addr, remote_port),
-            &local_info,
-            Duration::from_secs(2),
-            2,
-        )?;
-
-        qp.modify_to_rtr(
-            &remote_info,
-            rdma_opts.gid_index as u8,
-            rdma_opts.port_num,
-            active_path_mtu,
-        )?;
-        qp.modify_to_rts(remote_info.psn)?;
-
-        connected_qps.push(ConnectedQp {
-            qp: Arc::clone(&qp),
-            comp_channel,
-            buffer_pool,
-            stream_id,
-        });
-
-        println!(
-            "connected qp: local {} - remote {}",
-            local_info.qp_num, remote_info.qp_num
-        );
-    }
-
-    // start senders
-    let timer_start = Instant::now();
-    for qp_ctx in connected_qps {
-        let stat = Arc::new(StreamStats::new(qp_ctx.stream_id));
-        let poller_handle = std::thread::spawn({
-            let qp = Arc::clone(&qp_ctx.qp);
-            let stat = Arc::clone(&stat);
-            let num_msgs = send_opts.num_msgs;
-            move || {
-                if let Err(e) =
-                    poller_thread(qp, qp_ctx.buffer_pool, qp_ctx.comp_channel, num_msgs, stat)
-                {
-                    eprintln!("poller thread error: {}", e);
-                };
-            }
-        });
-
-        streams_stat.push(stat);
-
-        qps.insert(
-            qp_ctx.qp.qp_num(),
-            QpContext {
-                qp: Arc::clone(&qp_ctx.qp),
-                poller_handle,
-            },
-        );
-    }
-
-    //close the qps
-    for (qpn, qp_ctx) in qps.drain() {
-        let _ = qp_ctx.poller_handle.join();
-        qp_ctx.qp.modify_to_error()?;
-        cm.close_qp(qpn, Duration::from_secs(2), 2)?;
-        println!("closed local qp {}", qpn);
-    }
-
-    let timer_stop = Instant::now();
-    let run_duration = timer_stop.duration_since(timer_start);
-
-    for stat in streams_stat {
-        stat.print_metrics(run_duration, 0, 0);
+            run_cm_active(
+                &cm_opts,
+                &rdma_opts,
+                *remote_addr,
+                *num_streams,
+                spawn_poller,
+            )?;
+        }
+        CmRole::Passive => {
+            todo!()
+        }
     }
 
     Ok(())
