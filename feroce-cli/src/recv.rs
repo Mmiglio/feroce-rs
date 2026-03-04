@@ -9,10 +9,11 @@ use feroce::{
 };
 use std::{
     collections::{HashMap, VecDeque},
-    net::IpAddr,
     sync::Arc,
     thread::JoinHandle,
 };
+
+use crate::{CmOpts, RdmaOpts};
 
 #[allow(dead_code, unused)]
 struct QpContext {
@@ -20,27 +21,17 @@ struct QpContext {
     poller_handle: JoinHandle<()>,
 }
 
-pub fn run(
-    bind_addr: IpAddr,
-    cm_port: u16,
-    rdma_device: String,
-    gid_index: i32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let port_num = 1; // move to configs...
-    let max_wr_num = 128 as u32;
-    let num_buf = max_wr_num as usize;
-    let buf_size = 8192 * 8;
-
-    let device = Device::open(&rdma_device)?;
+pub fn run(cm_opts: &CmOpts, rdma_opts: &RdmaOpts) -> Result<(), Box<dyn std::error::Error>> {
+    let device = Device::open(&rdma_opts.rdma_device)?;
     let active_path_mtu = device
-        .query_rocev2_mtu(port_num, gid_index)?
+        .query_rocev2_mtu(rdma_opts.port_num, rdma_opts.gid_index)?
         .ok_or(format!(
             "{} GID index {} is not active RoCE v2",
-            rdma_device, gid_index
+            &rdma_opts.rdma_device, rdma_opts.gid_index
         ))?;
 
     let mut qps: HashMap<u32, QpContext> = HashMap::new();
-    let mut cm = ConnectionManager::new(bind_addr, cm_port)?;
+    let mut cm = ConnectionManager::new(cm_opts.bind_addr, cm_opts.cm_port)?;
 
     loop {
         let cm_event = cm.process_next()?;
@@ -54,20 +45,22 @@ pub fn run(
                 let comp_channel = CompletionChannel::create(&device)?;
 
                 let pd = Arc::new(device.alloc_pd()?);
-                let cq = Arc::new(device.create_cq_with_channel(max_wr_num as i32, &comp_channel)?);
+                let cq = Arc::new(
+                    device.create_cq_with_channel(rdma_opts.num_buf as i32, &comp_channel)?,
+                );
 
                 let qp = Arc::new(QueuePair::create_qp(
                     Arc::clone(&pd),
                     Arc::clone(&cq),
-                    max_wr_num,
+                    rdma_opts.num_buf as u32,
                     1,
                     rdma::ibv_qp_type::IBV_QPT_RC,
                 )?);
 
                 // create buffer pool (memory region is handled inside)
-                let buf_pool = BufferPool::new(num_buf, buf_size, &pd)?;
+                let buf_pool = BufferPool::new(rdma_opts.num_buf, rdma_opts.buf_size, &pd)?;
 
-                let loc_gid = device.query_gid(port_num, gid_index)?;
+                let loc_gid = device.query_gid(rdma_opts.port_num, rdma_opts.gid_index)?;
                 // register local infos
                 let local_info = QpConnectionInfo {
                     qp_num: qp.qp_num(),
@@ -78,8 +71,13 @@ pub fn run(
                 };
 
                 // transition QPs
-                qp.modify_to_init(port_num)?;
-                qp.modify_to_rtr(&remote_info, gid_index as u8, port_num, active_path_mtu)?;
+                qp.modify_to_init(rdma_opts.port_num)?;
+                qp.modify_to_rtr(
+                    &remote_info,
+                    rdma_opts.gid_index as u8,
+                    rdma_opts.port_num,
+                    active_path_mtu,
+                )?;
                 qp.modify_to_rts(remote_info.psn)?;
 
                 let poller_thread_handle = std::thread::spawn({
@@ -175,21 +173,18 @@ fn poller_thread(
 
         // finally, process completions
         //println!("Got {} wc events", num_wce);
-        for ce_idx in 0..num_wce {
-            if wc_list[ce_idx].status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
-                if wc_list[ce_idx].status == rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR {
+        for (ce_idx, wce) in wc_list.iter().enumerate().take(num_wce) {
+            if wce.status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
+                if wce.status == rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR {
                     println!("Got IBV_WC_WR_FLUSH_ERR, QP is most likely being closed");
                 } else {
-                    println!(
-                        "WC index {} error status: {}",
-                        ce_idx, wc_list[ce_idx].status as i32
-                    )
+                    println!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
                 break 'poller_loop;
             }
 
             // release buffef for now (this will be passed to the processing thread)
-            free_idx_channel.push_back(wc_list[ce_idx].wr_id as usize);
+            free_idx_channel.push_back(wce.wr_id as usize);
         }
 
         // repost recv requests: this will come from the thread channel

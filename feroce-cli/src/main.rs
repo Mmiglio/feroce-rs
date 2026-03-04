@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::net::IpAddr;
 
+mod common;
 mod recv;
 mod send;
 mod stats;
@@ -14,18 +15,51 @@ struct Cli {
 }
 
 #[derive(Args)]
-struct RdmaOpts {
+struct CmOpts {
     /// IP address to bind the CM to
     #[arg(long, default_value = "0.0.0.0")]
     bind_addr: IpAddr,
-    /// CM port
+    /// Local CM port
     #[arg(long, default_value = "0x4321", value_parser = parse_hex)]
     cm_port: u16,
+    /// Remote CM address (Required for the active side)
+    #[arg(long)]
+    remote_addr: Option<IpAddr>,
+    /// Remote CM port (Required for the active side)
+    #[arg(long, value_parser = parse_hex)]
+    remote_port: Option<u16>,
+}
+
+#[derive(Args)]
+struct RdmaOpts {
     /// RDMA device name
     #[arg(long)]
     rdma_device: String,
+    /// Device GID index
     #[arg(long)]
     gid_index: i32,
+    /// Device port number
+    #[arg(long, default_value = "1")]
+    port_num: u8,
+    // /// Max Work Requests processed in a single batc
+    // #[arg(long, default_value = "8")]
+    // max_wr: u32,
+    // /// Size of the RDMA buffer
+    #[arg(long, default_value = "8192")]
+    buf_size: usize,
+    /// Number of RDMA buffers
+    #[arg(long, default_value = "64")]
+    num_buf: usize,
+}
+
+#[derive(Args)]
+struct SenderOpts {
+    /// Number of data streams (=QPs)
+    #[arg(long, default_value = "1")]
+    num_streams: u32,
+    /// Number of messages sent per stream
+    #[arg(long, default_value = "100")]
+    num_msgs: u64,
 }
 
 #[derive(Subcommand)]
@@ -34,18 +68,18 @@ enum Commands {
     /// FEROCE receiver
     Recv {
         #[command(flatten)]
+        cm_opts: CmOpts,
+        #[command(flatten)]
         rdma_opts: RdmaOpts,
     },
     /// FEROCE sender
     Send {
         #[command(flatten)]
+        cm_opts: CmOpts,
+        #[command(flatten)]
         rdma_opts: RdmaOpts,
-        /// Remote CM address
-        #[arg(long)]
-        remote_addr: IpAddr,
-        /// Remote CM port
-        #[arg(long)]
-        remote_port: u16,
+        #[command(flatten)]
+        sender_opts: SenderOpts,
     },
 }
 
@@ -61,30 +95,18 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Recv { rdma_opts } => {
-            if let Err(e) = recv::run(
-                rdma_opts.bind_addr,
-                rdma_opts.cm_port,
-                rdma_opts.rdma_device,
-                rdma_opts.gid_index,
-            ) {
+        Commands::Recv { cm_opts, rdma_opts } => {
+            if let Err(e) = recv::run(&cm_opts, &rdma_opts) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
         Commands::Send {
+            cm_opts,
             rdma_opts,
-            remote_addr,
-            remote_port,
+            sender_opts,
         } => {
-            if let Err(e) = send::run(
-                rdma_opts.bind_addr,
-                rdma_opts.cm_port,
-                remote_addr,
-                remote_port,
-                rdma_opts.rdma_device,
-                rdma_opts.gid_index,
-            ) {
+            if let Err(e) = send::run(&cm_opts, &rdma_opts, &sender_opts) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
