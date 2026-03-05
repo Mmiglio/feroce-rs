@@ -74,8 +74,10 @@ fn poller_thread(
 
     // start by pre-building and pre-posting send request
     let mut sge_list = Vec::<Vec<rdma::ibv_sge>>::new();
+    let mut send_wr_list = Vec::<rdma::ibv_send_wr>::new();
 
     let num_initial_posts = min(buffer_pool.num_buf(), num_msgs as usize);
+
     for idx in 0..num_initial_posts {
         let mut buf_handle = buffer_pool.get_handle(idx);
 
@@ -89,12 +91,14 @@ fn poller_thread(
             lkey: buf_handle.lkey,
         }]);
 
-        qp.post_send(
+        send_wr_list.push(QueuePair::build_send_wr(
             idx as u64,
             &mut sge_list[idx],
             rdma::device::SendOp::Send,
             true,
-        )?;
+        ));
+
+        qp.post_send(&mut send_wr_list[idx])?;
     }
 
     // create all work completions
@@ -102,7 +106,7 @@ fn poller_thread(
         rdma::ibv_wc {
             ..Default::default()
         };
-        num_initial_posts//buffer_pool.num_buf()
+        num_initial_posts
     ];
 
     // request notification from completion channel for every event
@@ -125,30 +129,27 @@ fn poller_thread(
         //println!("Got {} wc events", num_wce);
         total_bytes = 0;
         total_msgs = 0;
-        for ce_idx in 0..num_wce {
-            if wc_list[ce_idx].status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
-                if wc_list[ce_idx].status == rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR {
+        for (ce_idx, wce) in wc_list.iter().enumerate().take(num_wce) {
+            if wce.status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
+                if wce.status == rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR {
                     println!("Got IBV_WC_WR_FLUSH_ERR, QP is most likely being closed");
                 } else {
-                    println!(
-                        "WC index {} error status: {}",
-                        ce_idx, wc_list[ce_idx].status as i32
-                    )
+                    println!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
                 break 'poller_loop;
             }
 
             send_completed += 1;
             // update metrics
-            total_bytes += sge_list[wc_list[ce_idx].wr_id as usize][0].length as u64;
+            total_bytes += sge_list[wce.wr_id as usize][0].length as u64;
             total_msgs += 1;
 
-            if send_completed == num_msgs {
+            if send_completed >= num_msgs {
                 // we sent all messages, done
                 break 'poller_loop;
             }
 
-            free_idx_channel.push_back(wc_list[ce_idx].wr_id as usize);
+            free_idx_channel.push_back(ce_idx);
         }
 
         stats
@@ -159,19 +160,13 @@ fn poller_thread(
             .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
         while let Some(idx) = free_idx_channel.pop_front() {
+            let mut buf_handle = buffer_pool.get_handle(idx);
+            fill_buffer(send_posted, &mut buf_handle);
+            qp.post_send(&mut send_wr_list[idx])?;
+            send_posted += 1;
             if send_posted == num_msgs {
                 break;
             }
-            // we need to post more
-            let mut buf_handle = buffer_pool.get_handle(idx);
-            fill_buffer(send_posted, &mut buf_handle);
-            qp.post_send(
-                idx as u64,
-                &mut sge_list[idx],
-                rdma::device::SendOp::Send,
-                true,
-            )?;
-            send_posted += 1;
         }
     }
 

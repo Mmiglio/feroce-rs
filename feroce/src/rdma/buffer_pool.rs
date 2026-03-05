@@ -31,7 +31,8 @@ impl BufferPool {
 
         // register RDMA MR for the base buffer
         let access_flags = rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE;
+            | rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | rdma::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING;
         let mr = MemoryRegion::register(pd, &mut data, access_flags)?;
 
         let free_bufs = VecDeque::from_iter(0..num_buf);

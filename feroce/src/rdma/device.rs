@@ -498,18 +498,11 @@ impl QueuePair {
         }
     }
 
-    pub fn post_recv(&self, wr_id: u64, sge_list: &mut [ffi::ibv_sge]) -> Result<(), String> {
-        let mut wr = ffi::ibv_recv_wr {
-            wr_id,
-            next: std::ptr::null_mut(),
-            sg_list: sge_list.as_mut_ptr(),
-            num_sge: sge_list.len() as i32,
-        };
-
+    pub fn post_recv(&self, wr: &mut ffi::ibv_recv_wr) -> Result<(), String> {
         let mut bad_wr: *mut ffi::ibv_recv_wr = std::ptr::null_mut();
         let ctx = unsafe { (*self.qp).context };
         let post_recv_fn = unsafe { (*ctx).ops.post_recv.unwrap() };
-        let ret = unsafe { post_recv_fn(self.qp, &mut wr, &mut bad_wr) };
+        let ret = unsafe { post_recv_fn(self.qp, wr, &mut bad_wr) };
 
         if ret != 0 {
             Err(format!("post_recv failed: {}", ret))
@@ -517,14 +510,35 @@ impl QueuePair {
             Ok(())
         }
     }
+    // usefull for building wr and posting in one call
+    pub fn post_send(&self, wr: &mut ffi::ibv_send_wr) -> Result<(), String> {
+        let mut bad_wr: *mut ffi::ibv_send_wr = std::ptr::null_mut();
+        let ctx = unsafe { (*self.qp).context };
+        let post_send_fn = unsafe { (*ctx).ops.post_send.unwrap() };
+        let ret = unsafe { post_send_fn(self.qp, wr, &mut bad_wr) };
 
-    pub fn post_send(
-        &self,
+        if ret != 0 {
+            Err(format!("post_send failed: {}", ret))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn build_recv_wr(wr_id: u64, sge_list: &mut [ffi::ibv_sge]) -> ffi::ibv_recv_wr {
+        ffi::ibv_recv_wr {
+            wr_id,
+            next: std::ptr::null_mut(),
+            sg_list: sge_list.as_mut_ptr(),
+            num_sge: sge_list.len() as i32,
+        }
+    }
+
+    pub fn build_send_wr(
         wr_id: u64,
         sge_list: &mut [ffi::ibv_sge],
         op: SendOp,
         signaled: bool,
-    ) -> Result<(), String> {
+    ) -> ffi::ibv_send_wr {
         let mut flags = 0u32;
         if signaled {
             flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
@@ -564,16 +578,7 @@ impl QueuePair {
             }
         }
 
-        let mut bad_wr: *mut ffi::ibv_send_wr = std::ptr::null_mut();
-        let ctx = unsafe { (*self.qp).context };
-        let post_send_fn = unsafe { (*ctx).ops.post_send.unwrap() };
-        let ret = unsafe { post_send_fn(self.qp, &mut wr, &mut bad_wr) };
-
-        if ret != 0 {
-            Err(format!("post_send failed: {}", ret))
-        } else {
-            Ok(())
-        }
+        wr
     }
 
     pub fn cq(&self) -> &CompletionQueue {
@@ -941,8 +946,9 @@ mod test {
         // post reveice wr
         let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
 
+        let mut recv_wr = QueuePair::build_recv_wr(2, &mut recv_sg_list);
         qp_recv
-            .post_recv(1, &mut recv_sg_list)
+            .post_recv(&mut recv_wr)
             .expect("failed to post recv wr");
 
         // post send wr
@@ -952,8 +958,9 @@ mod test {
 
         let mut send_sg_list = make_sge_list(1, &mut buf_send, mr_send.lkey());
 
+        let mut send_wr = QueuePair::build_send_wr(2, &mut send_sg_list, SendOp::Send, true);
         qp_send
-            .post_send(2, &mut send_sg_list, SendOp::Send, true)
+            .post_send(&mut send_wr)
             .expect("failed to post send wr");
 
         // poll the completion queue and hope for the best
@@ -990,6 +997,134 @@ mod test {
     }
 
     #[test]
+    fn loopback_send_recv_linked() {
+        let buf_size = 64;
+        let half_buf_size = buf_size as u32 / 2;
+
+        let (device, port, gid_index, path_mtu) =
+            find_roce_device().expect("no active RoCE device found — skipping");
+
+        let (qp_send, _cc_send, mr_send, mut buf_send, qp_recv, _cc_recv, mr_recv, buf_recv) =
+            create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+
+        // post reveice wr
+        let mut recv_wr_list = Vec::<rdma::ibv_recv_wr>::new();
+        let mut recv_sg_list = Vec::<Vec<rdma::ibv_sge>>::new();
+
+        recv_sg_list.push(vec![
+            ffi::ibv_sge {
+                addr: mr_recv.addr() as u64,
+                length: half_buf_size,
+                lkey: mr_recv.lkey(),
+            };
+            1
+        ]);
+
+        recv_sg_list.push(vec![
+            ffi::ibv_sge {
+                addr: mr_recv.addr() + half_buf_size as u64,
+                length: half_buf_size,
+                lkey: mr_recv.lkey(),
+            };
+            1
+        ]);
+
+        for idx in 0..2 {
+            recv_wr_list.push(QueuePair::build_recv_wr(idx as u64, &mut recv_sg_list[idx]));
+        }
+
+        recv_wr_list[0].next = &mut recv_wr_list[1];
+
+        qp_recv
+            .post_recv(&mut recv_wr_list[0])
+            .expect("failed to post recv wr");
+
+        // post send wr
+        buf_send[0] = 0xff;
+        buf_send[1] = 0xde;
+        buf_send[2] = 0xad;
+
+        let mut send_wr_list = Vec::<rdma::ibv_send_wr>::new();
+        let mut send_sg_list = Vec::<Vec<rdma::ibv_sge>>::new();
+
+        send_sg_list.push(vec![
+            ffi::ibv_sge {
+                addr: mr_send.addr() as u64,
+                length: half_buf_size,
+                lkey: mr_send.lkey(),
+            };
+            1
+        ]);
+        send_wr_list.push(QueuePair::build_send_wr(
+            0,
+            &mut send_sg_list[0],
+            SendOp::Send,
+            false,
+        ));
+
+        send_sg_list.push(vec![
+            ffi::ibv_sge {
+                addr: mr_send.addr() + half_buf_size as u64,
+                length: half_buf_size,
+                lkey: mr_send.lkey(),
+            };
+            1
+        ]);
+
+        send_wr_list.push(QueuePair::build_send_wr(
+            1,
+            &mut send_sg_list[1],
+            SendOp::Send,
+            true,
+        ));
+
+        // link the two recv requests
+        send_wr_list[0].next = &mut send_wr_list[1];
+        qp_send
+            .post_send(&mut send_wr_list[0])
+            .expect("failed to post send wr");
+
+        // poll the completion queue and hope for the best
+        let mut recv_wc = Vec::<ffi::ibv_wc>::new();
+        recv_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+        recv_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+
+        let _n_wce_recv = poll_cq_with_timeout(
+            &qp_recv.cq(),
+            &mut recv_wc,
+            std::time::Duration::from_secs(2),
+        );
+
+        // found event in the recv_cq, check send.. it should be there as well
+        let mut send_wc = Vec::<ffi::ibv_wc>::new();
+        send_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+        send_wc.push(ffi::ibv_wc {
+            ..Default::default()
+        });
+
+        let n_wce_send = poll_cq_with_timeout(
+            &qp_send.cq(),
+            &mut send_wc,
+            std::time::Duration::from_secs(2),
+        );
+
+        assert!(matches!(
+            send_wc[0].status,
+            ffi::ibv_wc_status::IBV_WC_SUCCESS
+        ));
+        assert_eq!(n_wce_send, 1);
+        assert_eq!(send_wc[0].wr_id, 1);
+        assert_eq!(buf_recv, buf_send);
+        assert_eq!(recv_wc[0].byte_len, half_buf_size as u32);
+    }
+
+    #[test]
     fn loopback_send_recv_error_transition() {
         let buf_size = 64;
 
@@ -1002,8 +1137,9 @@ mod test {
         // post reveice wr before transitioning to error
         let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
 
+        let mut recv_wr = QueuePair::build_recv_wr(1, &mut recv_sg_list);
         qp_recv
-            .post_recv(1, &mut recv_sg_list)
+            .post_recv(&mut recv_wr)
             .expect("failed to post recv wr");
 
         // transition the QP to error state
@@ -1085,9 +1221,9 @@ mod test {
 
         // post reveice wr
         let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
-
+        let mut recv_wr = QueuePair::build_recv_wr(1, &mut recv_sg_list);
         qp_recv
-            .post_recv(1, &mut recv_sg_list)
+            .post_recv(&mut recv_wr)
             .expect("failed to post recv wr");
 
         // post send wr
@@ -1097,8 +1233,9 @@ mod test {
 
         let mut send_sg_list = make_sge_list(1, &mut buf_send, mr_send.lkey());
 
+        let mut send_wr = QueuePair::build_send_wr(2, &mut send_sg_list, SendOp::Send, true);
         qp_send
-            .post_send(2, &mut send_sg_list, SendOp::Send, true)
+            .post_send(&mut send_wr)
             .expect("faieled to post send wr");
 
         let mut recv_wc = Vec::<ffi::ibv_wc>::new();
