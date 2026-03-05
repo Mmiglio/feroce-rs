@@ -8,7 +8,7 @@ use feroce::rdma::{
 
 use crate::{
     CmOpts, RdmaOpts, SenderOpts,
-    common::{CmRole, PreparedQP, run_cm_active},
+    common::{CmRole, PreparedQP, run_cm_active, run_cm_passive},
     stats::StreamStats,
 };
 
@@ -18,45 +18,39 @@ pub fn run(
     rdma_opts: &RdmaOpts,
     send_opts: &SenderOpts,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // spawn poller closure
+    let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
+        let stats = Arc::new(StreamStats::new(stream_id));
+
+        let handle = std::thread::spawn({
+            let qp = Arc::clone(&prepared_qp.qp);
+            let stats = Arc::clone(&stats);
+            let num_msgs = send_opts.num_msgs;
+            move || {
+                if let Err(e) = poller_thread(
+                    qp,
+                    prepared_qp.buffer_pool,
+                    prepared_qp.comp_channel,
+                    num_msgs,
+                    stats,
+                ) {
+                    eprintln!("poller thread error: {}", e);
+                }
+            }
+        });
+
+        (handle, stats)
+    };
+
     match cm_role {
         CmRole::Active {
             remote_addr,
             num_streams,
         } => {
-            // spawn poller closure
-            let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
-                let stats = Arc::new(StreamStats::new(stream_id));
-
-                let handle = std::thread::spawn({
-                    let qp = Arc::clone(&prepared_qp.qp);
-                    let stats = Arc::clone(&stats);
-                    let num_msgs = send_opts.num_msgs;
-                    move || {
-                        if let Err(e) = poller_thread(
-                            qp,
-                            prepared_qp.buffer_pool,
-                            prepared_qp.comp_channel,
-                            num_msgs,
-                            stats,
-                        ) {
-                            eprintln!("poller thread error: {}", e);
-                        }
-                    }
-                });
-
-                (handle, stats)
-            };
-
-            run_cm_active(
-                &cm_opts,
-                &rdma_opts,
-                *remote_addr,
-                *num_streams,
-                spawn_poller,
-            )?;
+            run_cm_active(cm_opts, rdma_opts, *remote_addr, *num_streams, spawn_poller)?;
         }
         CmRole::Passive => {
-            todo!()
+            run_cm_passive(cm_opts, rdma_opts, spawn_poller)?;
         }
     }
 

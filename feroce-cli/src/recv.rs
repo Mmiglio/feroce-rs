@@ -1,20 +1,13 @@
-use feroce::{
-    connection::{CmEvent, ConnectionError, ConnectionManager},
-    rdma::{
-        self,
-        buffer_pool::BufferPool,
-        device::{CompletionChannel, Device, QueuePair},
-    },
+use feroce::rdma::{
+    self,
+    buffer_pool::BufferPool,
+    device::{CompletionChannel, QueuePair},
 };
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    thread::JoinHandle,
-};
+use std::{collections::VecDeque, sync::Arc, thread::JoinHandle};
 
 use crate::{
     CmOpts, RdmaOpts,
-    common::{CmRole, PreparedQP, connect_qp, run_cm_passive, setup_qp},
+    common::{CmRole, PreparedQP, run_cm_active, run_cm_passive},
     stats::StreamStats,
 };
 
@@ -29,37 +22,33 @@ pub fn run(
     cm_role: &CmRole,
     rdma_opts: &RdmaOpts,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // spawn poller closure
+    let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
+        let stats = Arc::new(StreamStats::new(stream_id));
+
+        let handle = std::thread::spawn({
+            let qp = Arc::clone(&prepared_qp.qp);
+            let stats = Arc::clone(&stats);
+            move || {
+                if let Err(e) =
+                    poller_thread(qp, prepared_qp.buffer_pool, prepared_qp.comp_channel, stats)
+                {
+                    eprintln!("poller thread error: {}", e);
+                }
+            }
+        });
+
+        (handle, stats)
+    };
     match cm_role {
         CmRole::Active {
             remote_addr,
             num_streams,
         } => {
-            todo!()
+            run_cm_active(cm_opts, rdma_opts, *remote_addr, *num_streams, spawn_poller)?;
         }
         CmRole::Passive => {
-            // spawn poller closure
-            let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
-                let stats = Arc::new(StreamStats::new(stream_id));
-
-                let handle = std::thread::spawn({
-                    let qp = Arc::clone(&prepared_qp.qp);
-                    let stats = Arc::clone(&stats);
-                    move || {
-                        if let Err(e) = poller_thread(
-                            qp,
-                            prepared_qp.buffer_pool,
-                            prepared_qp.comp_channel,
-                            stats,
-                        ) {
-                            eprintln!("poller thread error: {}", e);
-                        }
-                    }
-                });
-
-                (handle, stats)
-            };
-
-            run_cm_passive(&cm_opts, &rdma_opts, spawn_poller)?;
+            run_cm_passive(cm_opts, rdma_opts, spawn_poller)?;
         }
     }
 

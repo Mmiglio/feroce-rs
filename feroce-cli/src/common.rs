@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -58,7 +61,7 @@ pub fn setup_qp(
     device: &Device,
     rdma_opts: &RdmaOpts,
 ) -> Result<PreparedQP, Box<dyn std::error::Error>> {
-    let comp_channel = CompletionChannel::create(&device)?;
+    let comp_channel = CompletionChannel::create(device)?;
 
     // create local QP
     let pd = Arc::new(device.alloc_pd()?);
@@ -100,7 +103,7 @@ pub fn connect_qp(
     active_path_mtu: ibv_mtu,
 ) -> Result<(), Box<dyn std::error::Error>> {
     prepared_qp.qp.modify_to_rtr(
-        &remote_info,
+        remote_info,
         rdma_opts.gid_index as u8,
         rdma_opts.port_num,
         active_path_mtu,
@@ -138,7 +141,7 @@ where
     let mut cm = ConnectionManager::new(cm_opts.bind_addr, cm_opts.cm_port)?;
 
     for stream_id in 0..num_streams {
-        let prepared_qp = setup_qp(&device, &rdma_opts)?;
+        let prepared_qp = setup_qp(&device, rdma_opts)?;
         // keep a reference, prepared_qp will be moved to the poller thread
         let qp = Arc::clone(&prepared_qp.qp);
 
@@ -173,15 +176,44 @@ where
         );
     }
 
+    // monitoring loop
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
+
+    let monitoring_interval = Duration::from_secs(1);
+    loop {
+        std::thread::sleep(monitoring_interval);
+
+        // check exit conditions
+        if shutdown.load(Ordering::Relaxed) {
+            println!("Ctrl+C received, shutting down...");
+            break;
+        }
+        if qps.values().all(|ctx| ctx.poller_handle.is_finished()) {
+            break;
+        }
+
+        for qp_ctx in qps.values() {
+            qp_ctx.stats.print_interval_metrics(monitoring_interval);
+
+            // (prev_msgs, prev_bytes) =
+            //     qp_ctx
+            //         .stats
+            //         .print_metrics(monitoring_interval, prev_msgs, prev_bytes);
+        }
+    }
+
+    // Signal stop or all threads are finisched
     //close the qps
     for (qpn, qp_ctx) in qps.drain() {
+        qp_ctx.qp.modify_to_error()?;
         let _ = qp_ctx.poller_handle.join();
 
-        qp_ctx
-            .stats
-            .print_metrics(Instant::now().duration_since(qp_ctx.connected_at), 0, 0);
+        println!("[Done] Summary: ");
 
-        qp_ctx.qp.modify_to_error()?;
+        qp_ctx.stats.print_summary();
+        //.print_metrics(Instant::now().duration_since(qp_ctx.connected_at), 0, 0);
+
         cm.close_qp(qpn, Duration::from_secs(2), 2)?;
         println!("closed local qp {}", qpn);
     }
@@ -219,7 +251,7 @@ where
                 remote_qpn,
                 remote_info,
             } => {
-                let prepared_qp = setup_qp(&device, &rdma_opts)?;
+                let prepared_qp = setup_qp(&device, rdma_opts)?;
                 let qp = Arc::clone(&prepared_qp.qp);
 
                 // transition QP to RTS
@@ -236,7 +268,7 @@ where
                 qps.insert(
                     qp.qp_num(),
                     QpContext {
-                        qp: qp,
+                        qp,
                         poller_handle,
                         stats,
                         connected_at: Instant::now(),
@@ -246,7 +278,7 @@ where
                 println!("connected qp: local {} - remote {}", local_qpn, remote_qpn);
             }
             CmEvent::CloseQp {
-                peer_ip,
+                peer_ip: _,
                 local_qpn,
                 remote_qpn,
             } => {

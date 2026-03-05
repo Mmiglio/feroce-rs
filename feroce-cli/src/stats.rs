@@ -1,22 +1,65 @@
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamStats {
     pub id: u32,
     pub messages: AtomicU64,
     pub bytes: AtomicU64,
-    // more ?
+    // interval tracking
+    prev_messages: AtomicU64,
+    prev_bytes: AtomicU64,
+    started_at: Instant,
 }
 
 impl StreamStats {
     pub fn new(id: u32) -> Self {
+        let now = Instant::now();
         StreamStats {
             id,
-            ..Default::default()
+            messages: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            prev_messages: AtomicU64::new(0),
+            prev_bytes: AtomicU64::new(0),
+            started_at: now,
         }
+    }
+
+    pub fn print_interval_metrics(&self, interval: Duration) {
+        let msgs = self.messages.load(Ordering::Relaxed);
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        // update tracked values
+        let prev_msgs = self.prev_messages.swap(msgs, Ordering::Relaxed);
+        let prev_bytes = self.prev_bytes.swap(bytes, Ordering::Relaxed);
+        let secs = interval.as_secs_f64();
+
+        let interval_msgs = msgs - prev_msgs;
+        let interval_bytes = bytes - prev_bytes;
+
+        println!(
+            "Stream {id}: {tot_msgs} msgs, {tot_bytes} bytes, {rate_msg:.1} msg/s, {rate_bytes:.2} Gbit/s",
+            id = self.id,
+            tot_msgs = msgs,
+            tot_bytes = bytes,
+            rate_msg = interval_msgs as f64 / secs,
+            rate_bytes = (interval_bytes as f64) / (secs * 1024.0 * 1024.0 * 119.2),
+        );
+    }
+
+    pub fn print_summary(&self) {
+        let total_time = Instant::now().duration_since(self.started_at);
+
+        self.prev_messages.swap(0, Ordering::Relaxed);
+        self.prev_bytes.swap(0, Ordering::Relaxed);
+
+        println!(
+            "Summary for stream {}, total duration {}s",
+            self.id,
+            total_time.as_secs()
+        );
+        self.print_interval_metrics(total_time);
     }
 
     pub fn print_metrics(&self, duration: Duration, prev_msgs: u64, prev_bytes: u64) -> (u64, u64) {

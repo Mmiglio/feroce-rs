@@ -33,6 +33,9 @@ struct CmOpts {
     /// Number of data streams (=QPs)
     #[arg(long, default_value = "1")]
     num_streams: u32,
+    /// Role of the CM: active side initiates the connection process, passive waits
+    #[arg(long)]
+    active: bool,
 }
 
 #[derive(Args)]
@@ -98,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Recv { cm_opts, rdma_opts } => {
-            let cm_role = build_role(&cm_opts, false)?;
+            let cm_role = build_role(&cm_opts, cm_opts.active)?;
             recv::run(&cm_opts, &cm_role, &rdma_opts)?;
             Ok(())
         }
@@ -107,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rdma_opts,
             sender_opts,
         } => {
-            let cm_role = build_role(&cm_opts, true)?;
+            let cm_role = build_role(&cm_opts, cm_opts.active)?;
             send::run(&cm_opts, &cm_role, &rdma_opts, &sender_opts)?;
             Ok(())
         }
