@@ -125,6 +125,14 @@ fn poller_thread(
         // ack the event
         qp.cq().ack_cq_events(1);
 
+        // let mut num_wce;
+        // loop {
+        //     num_wce = qp.cq().poll(&mut wc_list)?;
+        //     if num_wce > 0 {
+        //         break;
+        //     }
+        // }
+
         // finally, process completions
         //println!("Got {} wc events", num_wce);
         total_bytes = 0;
