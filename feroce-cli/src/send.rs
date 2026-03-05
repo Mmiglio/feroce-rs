@@ -64,7 +64,6 @@ fn poller_thread(
     num_msgs: u64,
     stats: Arc<StreamStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const BATCH_SIZE: usize = 32;
     // metrics
     let mut total_bytes;
     let mut total_msgs;
@@ -76,8 +75,6 @@ fn poller_thread(
     // start by pre-building and pre-posting send request
     let mut sge_list = Vec::<Vec<rdma::ibv_sge>>::new();
     let mut send_wr_list = Vec::<rdma::ibv_send_wr>::new();
-
-    let mut pending_batches: VecDeque<Vec<usize>> = VecDeque::new();
 
     let num_initial_posts = min(buffer_pool.num_buf(), num_msgs as usize);
 
@@ -98,29 +95,10 @@ fn poller_thread(
             idx as u64,
             &mut sge_list[idx],
             rdma::device::SendOp::Send,
-            false,
+            true,
         ));
-    }
 
-    // create batches
-    for chunk_start in (0..num_initial_posts).step_by(BATCH_SIZE) {
-        let chunk_end = min(chunk_start + BATCH_SIZE, num_initial_posts);
-
-        // chain the batch WR
-        for idx in chunk_start..chunk_end - 1 {
-            send_wr_list[idx].next = &mut send_wr_list[idx + 1];
-            send_wr_list[idx].send_flags = 0;
-        }
-
-        let last = chunk_end - 1;
-        send_wr_list[last].next = std::ptr::null_mut();
-        send_wr_list[last].send_flags |= rdma::IBV_SEND_SIGNALED;
-
-        qp.post_send(&mut send_wr_list[chunk_start])?;
-
-        // record which indices are in this batch
-        let batch_indices: Vec<usize> = (chunk_start..chunk_end).collect();
-        pending_batches.push_back(batch_indices);
+        qp.post_send(&mut send_wr_list[idx])?;
     }
 
     // create all work completions
@@ -128,14 +106,13 @@ fn poller_thread(
         rdma::ibv_wc {
             ..Default::default()
         };
-        num_initial_posts//buffer_pool.num_buf()
+        num_initial_posts
     ];
 
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
     let mut free_idx_channel = VecDeque::<usize>::new();
-    let mut batch = Vec::<usize>::new();
 
     'poller_loop: loop {
         // wait for completion event
@@ -162,25 +139,17 @@ fn poller_thread(
                 break 'poller_loop;
             }
 
-            // get the completed batch
-            let completed_batch = pending_batches.pop_front().unwrap();
-            let batch_len = completed_batch.len() as u64;
-
-            send_completed += batch_len;
+            send_completed += 1;
             // update metrics
-            //total_bytes += sge_list[wce.wr_id as usize][0].length as u64;
-            for idx in completed_batch {
-                total_bytes += sge_list[idx][0].length as u64;
-                free_idx_channel.push_back(idx);
-            }
-            total_msgs += batch_len;
+            total_bytes += sge_list[wce.wr_id as usize][0].length as u64;
+            total_msgs += 1;
 
             if send_completed >= num_msgs {
                 // we sent all messages, done
                 break 'poller_loop;
             }
 
-            //free_idx_channel.push_back(wc_list[ce_idx].wr_id as usize);
+            free_idx_channel.push_back(ce_idx);
         }
 
         stats
@@ -190,32 +159,14 @@ fn poller_thread(
             .bytes
             .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
-        while !free_idx_channel.is_empty() {
-            batch.clear();
-            while let Some(idx) = free_idx_channel.pop_front() {
-                batch.push(idx);
-                let mut buf_handle = buffer_pool.get_handle(idx);
-                fill_buffer(send_posted, &mut buf_handle);
-                send_posted += 1;
-                if send_posted == num_msgs || batch.len() == BATCH_SIZE {
-                    break;
-                }
+        while let Some(idx) = free_idx_channel.pop_front() {
+            let mut buf_handle = buffer_pool.get_handle(idx);
+            fill_buffer(send_posted, &mut buf_handle);
+            qp.post_send(&mut send_wr_list[idx])?;
+            send_posted += 1;
+            if send_posted == num_msgs {
+                break;
             }
-
-            // chain and set the last to signaled
-            for idx in 0..batch.len() - 1 {
-                let curr = batch[idx];
-                let next = batch[idx + 1];
-                send_wr_list[curr].next = &mut send_wr_list[next];
-                send_wr_list[curr].send_flags = 0;
-            }
-
-            let last_idx = *batch.last().unwrap();
-            send_wr_list[last_idx].next = std::ptr::null_mut();
-            send_wr_list[last_idx].send_flags |= rdma::IBV_SEND_SIGNALED;
-
-            qp.post_send(&mut send_wr_list[batch[0]])?;
-            pending_batches.push_back(batch.clone());
         }
     }
 
