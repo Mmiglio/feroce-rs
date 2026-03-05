@@ -67,6 +67,7 @@ fn poller_thread(
 
     // start by pre-building and pre-posting recv request
     let mut sge_list = Vec::<Vec<rdma::ibv_sge>>::new();
+    let mut recv_wr_list = Vec::<rdma::ibv_recv_wr>::new();
 
     for idx in 0..buffer_pool.num_buf() {
         let buf_handle = buffer_pool.get_handle(idx);
@@ -77,7 +78,9 @@ fn poller_thread(
             lkey: buf_handle.lkey,
         }]);
 
-        qp.post_recv(idx as u64, &mut sge_list[idx])?;
+        recv_wr_list.push(QueuePair::build_recv_wr(idx as u64, &mut sge_list[idx]));
+
+        qp.post_recv(&mut recv_wr_list[idx])?;
     }
 
     // create all work completions
@@ -134,7 +137,7 @@ fn poller_thread(
 
         // repost recv requests: this will come from the thread channel
         while let Some(idx) = free_idx_channel.pop_front() {
-            qp.post_recv(idx as u64, &mut sge_list[idx])?;
+            qp.post_recv(&mut recv_wr_list[idx])?;
         }
     }
 
