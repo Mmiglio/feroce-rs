@@ -1,161 +1,57 @@
-use std::{
-    cmp::min,
-    collections::{HashMap, VecDeque},
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    thread::{JoinHandle, sleep},
-    time::{Duration, Instant},
+use std::{cmp::min, collections::VecDeque, sync::Arc};
+
+use feroce::rdma::{
+    self,
+    buffer_pool::{BufferHandle, BufferPool},
+    device::{CompletionChannel, QueuePair},
 };
 
-use feroce::{
-    connection::ConnectionManager,
-    protocol::QpConnectionInfo,
-    rdma::{
-        self,
-        buffer_pool::{BufferHandle, BufferPool},
-        device::{CompletionChannel, Device, QueuePair},
-    },
+use crate::{
+    CmOpts, RdmaOpts, SenderOpts,
+    common::{CmRole, PreparedQP, run_cm_active, run_cm_passive},
+    stats::StreamStats,
 };
-
-use crate::stats::StreamStats;
-
-#[allow(dead_code, unused)]
-struct QpContext {
-    qp: Arc<QueuePair>,
-    poller_handle: JoinHandle<()>,
-}
-
-struct ConnectedQp {
-    qp: Arc<QueuePair>,
-    comp_channel: CompletionChannel,
-    buffer_pool: BufferPool,
-    stream_id: u32,
-}
 
 pub fn run(
-    bind_addr: IpAddr,
-    cm_port: u16,
-    remote_addr: IpAddr,
-    remote_port: u16,
-    rdma_device: String,
-    gid_index: i32,
+    cm_opts: &CmOpts,
+    cm_role: &CmRole,
+    rdma_opts: &RdmaOpts,
+    send_opts: &SenderOpts,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let port_num = 1; // move to configs...
-    let max_wr_num = 128 as u32;
-    let num_buf = max_wr_num as usize;
-    let buf_size = 8192;
-    let num_streams = 1;
-    let num_msgs = 500000 as u64;
+    // spawn poller closure
+    let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
+        let stats = Arc::new(StreamStats::new(stream_id));
 
-    let mut streams_stat = Vec::<Arc<StreamStats>>::new();
-
-    let device = Device::open(&rdma_device)?;
-    let active_path_mtu = device
-        .query_rocev2_mtu(port_num, gid_index)?
-        .ok_or(format!(
-            "{} GID index {} is not active RoCE v2",
-            rdma_device, gid_index
-        ))?;
-
-    let mut qps: HashMap<u32, QpContext> = HashMap::new();
-    let mut cm = ConnectionManager::new(bind_addr, cm_port)?;
-
-    let mut connected_qps = Vec::<ConnectedQp>::new();
-    // to be moved into functions
-    for stream_id in 0..num_streams {
-        let comp_channel = CompletionChannel::create(&device)?;
-
-        // create local QP
-        let pd = Arc::new(device.alloc_pd()?);
-        let cq = Arc::new(device.create_cq_with_channel(max_wr_num as i32, &comp_channel)?);
-
-        let qp = Arc::new(QueuePair::create_qp(
-            Arc::clone(&pd),
-            Arc::clone(&cq),
-            max_wr_num,
-            1,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )?);
-
-        let loc_gid = device.query_gid(port_num, gid_index)?;
-        let buffer_pool = BufferPool::new(num_buf, buf_size, &pd)?;
-
-        // register local infos
-        let local_info = QpConnectionInfo {
-            qp_num: qp.qp_num(),
-            psn: 0,
-            rkey: buffer_pool.rkey(),
-            addr: buffer_pool.addr(),
-            gid: loc_gid.raw,
-        };
-        qp.modify_to_init(port_num)?;
-
-        println!("created local qp {}", qp.qp_num());
-
-        // connect the CM to gather remote info
-        let remote_info = cm.connect(
-            SocketAddr::new(remote_addr, remote_port),
-            &local_info,
-            Duration::from_secs(2),
-            2,
-        )?;
-
-        qp.modify_to_rtr(&remote_info, gid_index as u8, port_num, active_path_mtu)?;
-        qp.modify_to_rts(remote_info.psn)?;
-
-        connected_qps.push(ConnectedQp {
-            qp: Arc::clone(&qp),
-            comp_channel,
-            buffer_pool,
-            stream_id,
-        });
-
-        println!(
-            "connected qp: local {} - remote {}",
-            local_info.qp_num, remote_info.qp_num
-        );
-    }
-
-    // start senders
-    let timer_start = Instant::now();
-    for qp_ctx in connected_qps {
-        let stat = Arc::new(StreamStats::new(qp_ctx.stream_id));
-        let poller_handle = std::thread::spawn({
-            let qp = Arc::clone(&qp_ctx.qp);
-            let stat = Arc::clone(&stat);
+        let handle = std::thread::spawn({
+            let qp = Arc::clone(&prepared_qp.qp);
+            let stats = Arc::clone(&stats);
+            let num_msgs = send_opts.num_msgs;
             move || {
-                if let Err(e) =
-                    poller_thread(qp, qp_ctx.buffer_pool, qp_ctx.comp_channel, num_msgs, stat)
-                {
+                if let Err(e) = poller_thread(
+                    qp,
+                    prepared_qp.buffer_pool,
+                    prepared_qp.comp_channel,
+                    num_msgs,
+                    stats,
+                ) {
                     eprintln!("poller thread error: {}", e);
-                };
+                }
             }
         });
 
-        streams_stat.push(stat);
+        (handle, stats)
+    };
 
-        qps.insert(
-            qp_ctx.qp.qp_num(),
-            QpContext {
-                qp: Arc::clone(&qp_ctx.qp),
-                poller_handle: poller_handle,
-            },
-        );
-    }
-
-    //close the qps
-    for (qpn, qp_ctx) in qps.drain() {
-        let _ = qp_ctx.poller_handle.join();
-        qp_ctx.qp.modify_to_error()?;
-        cm.close_qp(qpn, Duration::from_secs(2), 2)?;
-        println!("closed local qp {}", qpn);
-    }
-
-    let timer_stop = Instant::now();
-    let run_duration = timer_stop.duration_since(timer_start);
-
-    for stat in streams_stat {
-        stat.print_metrics(run_duration, 0, 0);
+    match cm_role {
+        CmRole::Active {
+            remote_addr,
+            num_streams,
+        } => {
+            run_cm_active(cm_opts, rdma_opts, *remote_addr, *num_streams, spawn_poller)?;
+        }
+        CmRole::Passive => {
+            run_cm_passive(cm_opts, rdma_opts, spawn_poller)?;
+        }
     }
 
     Ok(())
@@ -169,12 +65,12 @@ fn poller_thread(
     stats: Arc<StreamStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // metrics
-    let mut total_bytes = 0 as u64;
-    let mut total_msgs = 0 as u64;
+    let mut total_bytes;
+    let mut total_msgs;
 
     // counter used as a pattern for the msg payload
-    let mut send_posted = 0 as u64;
-    let mut send_completed = 0 as u64;
+    let mut send_posted = 0_u64;
+    let mut send_completed = 0_u64;
 
     // start by pre-building and pre-posting send request
     let mut sge_list = Vec::<Vec<rdma::ibv_sge>>::new();
