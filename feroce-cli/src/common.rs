@@ -203,8 +203,7 @@ where
         }
     }
 
-    // Signal stop or all threads are finisched
-    //close the qps
+    // Signal stop or all threads finished
     for (qpn, qp_ctx) in qps.drain() {
         qp_ctx.qp.modify_to_error()?;
         let _ = qp_ctx.poller_handle.join();
@@ -242,68 +241,106 @@ where
 
     let mut stream_id = 0;
 
+    // set cm read timeout to avoid blocking the loop
+    cm.set_read_timout(Duration::from_millis(100))?;
+
+    // handle sigint/sigterm
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
+
+    // monitor
+    let mut last_print = Instant::now();
+    let monitoring_interval = Duration::from_secs(1);
+
+    // CM Loop
     loop {
-        let cm_event = cm.process_next()?;
+        if let Some(event) = cm.try_process_next()? {
+            // we have an actual CM event, match it
+            match event {
+                CmEvent::NewConnection {
+                    peer_ip,
+                    remote_qpn,
+                    remote_info,
+                } => {
+                    let prepared_qp = setup_qp(&device, rdma_opts)?;
+                    let qp = Arc::clone(&prepared_qp.qp);
 
-        match cm_event {
-            CmEvent::NewConnection {
-                peer_ip,
-                remote_qpn,
-                remote_info,
-            } => {
-                let prepared_qp = setup_qp(&device, rdma_opts)?;
-                let qp = Arc::clone(&prepared_qp.qp);
+                    // transition QP to RTS
+                    connect_qp(&prepared_qp, &remote_info, rdma_opts, active_path_mtu)?;
 
-                // transition QP to RTS
-                connect_qp(&prepared_qp, &remote_info, rdma_opts, active_path_mtu)?;
+                    cm.set_local_info(peer_ip, remote_qpn, &prepared_qp.local_info)?;
 
-                cm.set_local_info(peer_ip, remote_qpn, &prepared_qp.local_info)?;
+                    // spawn the threads
+                    let (poller_handle, stats) = spawn_poller(prepared_qp, stream_id);
+                    // maybe get stream id from somewhere? e.g. from the active side.
+                    stream_id += 1;
 
-                // spawn the threads
-                let (poller_handle, stats) = spawn_poller(prepared_qp, stream_id);
-                // maybe get stream id from somewhere? e.g. from the active side.
-                stream_id += 1;
+                    let local_qpn = qp.qp_num();
+                    qps.insert(
+                        qp.qp_num(),
+                        QpContext {
+                            qp,
+                            poller_handle,
+                            stats,
+                            connected_at: Instant::now(),
+                        },
+                    );
 
-                let local_qpn = qp.qp_num();
-                qps.insert(
-                    qp.qp_num(),
-                    QpContext {
-                        qp,
-                        poller_handle,
-                        stats,
-                        connected_at: Instant::now(),
-                    },
-                );
+                    println!("connected qp: local {} - remote {}", local_qpn, remote_qpn);
+                }
+                CmEvent::CloseQp {
+                    peer_ip: _,
+                    local_qpn,
+                    remote_qpn,
+                } => {
+                    // get the qp from the list
+                    let Some(qp_ctx) = qps.remove(&local_qpn) else {
+                        return Err(Box::new(ConnectionError::Protocol(
+                            "Error! the QP is not present in the list".to_string(),
+                        )));
+                    };
 
-                println!("connected qp: local {} - remote {}", local_qpn, remote_qpn);
-            }
-            CmEvent::CloseQp {
-                peer_ip: _,
-                local_qpn,
-                remote_qpn,
-            } => {
-                // get the qp from the list
-                let Some(qp_ctx) = qps.remove(&local_qpn) else {
-                    return Err(Box::new(ConnectionError::Protocol(
-                        "Error! the QP is not present in the list".to_string(),
-                    )));
-                };
+                    qp_ctx.qp.modify_to_error()?;
 
-                qp_ctx.qp.modify_to_error()?;
+                    // FIX THIS, PROPAGATE THE ERR
+                    let _ = qp_ctx.poller_handle.join();
 
-                // FIX THIS, PROPAGATE THE ERR
-                let _ = qp_ctx.poller_handle.join();
+                    cm.ack_close_qp(local_qpn)?;
 
-                cm.ack_close_qp(local_qpn)?;
-
-                println!("closed qp: local {} - remote {}", local_qpn, remote_qpn);
-
-                qp_ctx.stats.print_metrics(
-                    Instant::now().duration_since(qp_ctx.connected_at),
-                    0,
-                    0,
-                );
+                    println!("closed qp: local {} - remote {}", local_qpn, remote_qpn);
+                    println!("[Done] Summary:");
+                    qp_ctx.stats.print_metrics(
+                        Instant::now().duration_since(qp_ctx.connected_at),
+                        0,
+                        0,
+                    );
+                }
             }
         }
+
+        // monitoring, signal interrupts etc
+        if shutdown.load(Ordering::Relaxed) {
+            println!("Ctrl+C received, shutting down...");
+            break;
+        }
+
+        if last_print.elapsed() >= monitoring_interval {
+            for qp_ctx in qps.values() {
+                qp_ctx.stats.print_interval_metrics(last_print.elapsed());
+            }
+            last_print = Instant::now();
+        }
     }
+
+    // cleanup
+    for (qpn, qp_ctx) in qps.drain() {
+        qp_ctx.qp.modify_to_error()?;
+        let _ = qp_ctx.poller_handle.join();
+        println!("[Done] Summary:");
+        qp_ctx.stats.print_summary();
+        // this is the passive side, we can't send somethign to the active side.
+        println!("closed local qp {}", qpn);
+    }
+
+    Ok(())
 }

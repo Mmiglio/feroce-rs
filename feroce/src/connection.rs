@@ -98,11 +98,19 @@ impl ConnectionManager {
         Ok(self.socket.local_addr()?.port())
     }
 
+    pub fn set_read_timout(&mut self, timeout: Duration) -> Result<(), ConnectionError> {
+        self.socket.set_read_timeout(Some(timeout))?;
+        Ok(())
+    }
+
     fn recv_message(&self) -> Result<(QpMessage, SocketAddr), ConnectionError> {
         let mut buf = [0u8; QP_MESSAGE_SIZE];
         // Blocking receive, check if we reach a timeout (if set)
         let (msg_size, src_addr) = self.socket.recv_from(&mut buf).map_err(|e| {
-            if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
+            if e.kind() == io::ErrorKind::TimedOut
+                || e.kind() == io::ErrorKind::WouldBlock
+                || e.kind() == io::ErrorKind::Interrupted
+            {
                 ConnectionError::Timeout
             } else {
                 ConnectionError::Io(e)
@@ -151,6 +159,14 @@ impl ConnectionManager {
                     return Err(ConnectionError::Protocol("Invalid request".to_string()));
                 }
             }
+        }
+    }
+
+    pub fn try_process_next(&mut self) -> Result<Option<CmEvent>, ConnectionError> {
+        match self.process_next() {
+            Ok(event) => Ok(Some(event)),
+            Err(ConnectionError::Timeout) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
