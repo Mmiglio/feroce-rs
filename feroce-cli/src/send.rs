@@ -1,4 +1,7 @@
-use std::{cmp::min, collections::VecDeque, sync::Arc};
+use std::{
+    cmp::min,
+    sync::{Arc, mpsc},
+};
 
 use feroce::rdma::{
     self,
@@ -22,6 +25,26 @@ pub fn run(
     let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
         let stats = Arc::new(StreamStats::new(stream_id));
 
+        let (free_tx, free_rx) = mpsc::channel::<BufferHandle>();
+        let (work_tx, work_rx) = mpsc::channel::<BufferHandle>();
+
+        let _worker_handle = std::thread::spawn(move || {
+            let mut counter = 0;
+            loop {
+                let Ok(mut buf_handle) = free_rx.recv() else {
+                    // closed channel
+                    break;
+                };
+                // fill the buffer and sent it
+                fill_buffer(counter, &mut buf_handle);
+                buf_handle.written_bytes = buf_handle.len;
+                counter += 1;
+                work_tx
+                    .send(buf_handle)
+                    .expect("worker thread failed to sent message to poller");
+            }
+        });
+
         let handle = std::thread::spawn({
             let qp = Arc::clone(&prepared_qp.qp);
             let stats = Arc::clone(&stats);
@@ -33,6 +56,8 @@ pub fn run(
                     prepared_qp.comp_channel,
                     num_msgs,
                     stats,
+                    free_tx,
+                    work_rx,
                 ) {
                     eprintln!("poller thread error: {}", e);
                 }
@@ -63,6 +88,8 @@ fn poller_thread(
     channel: CompletionChannel,
     num_msgs: u64,
     stats: Arc<StreamStats>,
+    free_tx: mpsc::Sender<BufferHandle>,
+    work_rx: mpsc::Receiver<BufferHandle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // metrics
     let mut total_bytes;
@@ -79,10 +106,7 @@ fn poller_thread(
     let num_initial_posts = min(buffer_pool.num_buf(), num_msgs as usize);
 
     for idx in 0..num_initial_posts {
-        let mut buf_handle = buffer_pool.get_handle(idx);
-
-        fill_buffer(send_posted, &mut buf_handle);
-        send_posted += 1;
+        let buf_handle = buffer_pool.get_handle(idx);
 
         // 1 sge for now
         sge_list.push(vec![rdma::ibv_sge {
@@ -98,7 +122,9 @@ fn poller_thread(
             true,
         ));
 
-        qp.post_send(&mut send_wr_list[idx])?;
+        free_tx
+            .send(buf_handle)
+            .expect("failed to send free buf handle to worker");
     }
 
     // create all work completions
@@ -109,14 +135,26 @@ fn poller_thread(
         num_initial_posts
     ];
 
+    // set the completion channel as non-blocking
+    channel.set_nonblocking()?;
+
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
-    let mut free_idx_channel = VecDeque::<usize>::new();
-
     'poller_loop: loop {
-        // wait for completion event
-        channel.get_cq_event()?;
+        // wait for completion event / timeout
+        if !channel.get_cq_event(10)? {
+            // timed out, no new completion. Repost the free buffers.
+            while let Ok(buf_handle) = work_rx.try_recv() {
+                qp.post_send(&mut send_wr_list[buf_handle.index])?;
+                send_posted += 1;
+                if send_posted == num_msgs {
+                    break;
+                }
+            }
+            // wait again for new events
+            continue;
+        }
 
         // re-arm the notification
         qp.cq().req_notify_cq(false)?;
@@ -125,16 +163,7 @@ fn poller_thread(
         // ack the event
         qp.cq().ack_cq_events(1);
 
-        // let mut num_wce;
-        // loop {
-        //     num_wce = qp.cq().poll(&mut wc_list)?;
-        //     if num_wce > 0 {
-        //         break;
-        //     }
-        // }
-
         // finally, process completions
-        //println!("Got {} wc events", num_wce);
         total_bytes = 0;
         total_msgs = 0;
         for (ce_idx, wce) in wc_list.iter().enumerate().take(num_wce) {
@@ -157,7 +186,10 @@ fn poller_thread(
                 break 'poller_loop;
             }
 
-            free_idx_channel.push_back(ce_idx);
+            let buf_handle = buffer_pool.get_handle(wce.wr_id as usize);
+            free_tx
+                .send(buf_handle)
+                .expect("failed to send free buffer");
         }
 
         stats
@@ -167,10 +199,8 @@ fn poller_thread(
             .bytes
             .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
-        while let Some(idx) = free_idx_channel.pop_front() {
-            let mut buf_handle = buffer_pool.get_handle(idx);
-            fill_buffer(send_posted, &mut buf_handle);
-            qp.post_send(&mut send_wr_list[idx])?;
+        while let Ok(buf_handle) = work_rx.try_recv() {
+            qp.post_send(&mut send_wr_list[buf_handle.index])?;
             send_posted += 1;
             if send_posted == num_msgs {
                 break;

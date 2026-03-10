@@ -1,21 +1,15 @@
 use feroce::rdma::{
     self,
-    buffer_pool::BufferPool,
+    buffer_pool::{BufferHandle, BufferPool},
     device::{CompletionChannel, QueuePair},
 };
-use std::{collections::VecDeque, sync::Arc, thread::JoinHandle};
+use std::sync::{Arc, mpsc};
 
 use crate::{
     CmOpts, RdmaOpts,
     common::{CmRole, PreparedQP, run_cm_active, run_cm_passive},
     stats::StreamStats,
 };
-
-#[allow(dead_code, unused)]
-struct QpContext {
-    qp: Arc<QueuePair>,
-    poller_handle: JoinHandle<()>,
-}
 
 pub fn run(
     cm_opts: &CmOpts,
@@ -26,13 +20,32 @@ pub fn run(
     let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
         let stats = Arc::new(StreamStats::new(stream_id));
 
+        let (work_tx, work_rx) = mpsc::channel::<BufferHandle>();
+        let (free_tx, free_rx) = mpsc::channel::<usize>();
+
+        let _worker_handle = std::thread::spawn(move || {
+            loop {
+                let Ok(handle) = work_rx.recv() else {
+                    // closed channel
+                    break;
+                };
+                // process the buffer
+                free_tx.send(handle.index).unwrap();
+            }
+        });
+
         let handle = std::thread::spawn({
             let qp = Arc::clone(&prepared_qp.qp);
             let stats = Arc::clone(&stats);
             move || {
-                if let Err(e) =
-                    poller_thread(qp, prepared_qp.buffer_pool, prepared_qp.comp_channel, stats)
-                {
+                if let Err(e) = poller_thread(
+                    qp,
+                    prepared_qp.buffer_pool,
+                    prepared_qp.comp_channel,
+                    stats,
+                    work_tx,
+                    free_rx,
+                ) {
                     eprintln!("poller thread error: {}", e);
                 }
             }
@@ -60,6 +73,8 @@ fn poller_thread(
     buffer_pool: BufferPool,
     channel: CompletionChannel,
     stats: Arc<StreamStats>,
+    work_tx: mpsc::Sender<BufferHandle>,
+    free_rx: mpsc::Receiver<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // metrics
     let mut total_bytes;
@@ -91,13 +106,22 @@ fn poller_thread(
         buffer_pool.num_buf()
     ];
 
+    // set the completion channel as non-blocking
+    channel.set_nonblocking()?;
+
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
-    let mut free_idx_channel = VecDeque::<usize>::new();
     'poller_loop: loop {
-        // wait for completion event
-        channel.get_cq_event()?;
+        // wait for completion event / timeout
+        if !channel.get_cq_event(1)? {
+            // repost free recv buffers
+            while let Ok(idx) = free_rx.try_recv() {
+                qp.post_recv(&mut recv_wr_list[idx])?;
+            }
+            // wait for new CE/timout
+            continue;
+        }
 
         // re-arm the notification
         qp.cq().req_notify_cq(false)?;
@@ -107,7 +131,6 @@ fn poller_thread(
         qp.cq().ack_cq_events(1);
 
         // finally, process completions
-        //println!("Got {} wc events", num_wce);
         total_bytes = 0;
         total_msgs = 0;
         for (ce_idx, wce) in wc_list.iter().enumerate().take(num_wce) {
@@ -124,8 +147,10 @@ fn poller_thread(
             total_bytes += wce.byte_len as u64;
             total_msgs += 1;
 
-            // release buffef for now (this will be passed to the processing thread)
-            free_idx_channel.push_back(wce.wr_id as usize);
+            // pass the buffer to the worker thread
+            let mut handle = buffer_pool.get_handle(wce.wr_id as usize);
+            handle.written_bytes = wce.byte_len as usize;
+            work_tx.send(handle)?;
         }
 
         stats
@@ -135,8 +160,8 @@ fn poller_thread(
             .bytes
             .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
-        // repost recv requests: this will come from the thread channel
-        while let Some(idx) = free_idx_channel.pop_front() {
+        // repost free recv buffers
+        while let Ok(idx) = free_rx.try_recv() {
             qp.post_recv(&mut recv_wr_list[idx])?;
         }
     }

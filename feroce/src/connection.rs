@@ -98,7 +98,7 @@ impl ConnectionManager {
         Ok(self.socket.local_addr()?.port())
     }
 
-    pub fn set_read_timout(&mut self, timeout: Duration) -> Result<(), ConnectionError> {
+    pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), ConnectionError> {
         self.socket.set_read_timeout(Some(timeout))?;
         Ok(())
     }
@@ -209,7 +209,6 @@ impl ConnectionManager {
             Ok(None)
         } else {
             // new QP connection request
-
             let pending_qp = PendingQp {
                 remote_info,
                 remote_addr: *peer_addr,

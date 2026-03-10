@@ -49,10 +49,7 @@ struct RdmaOpts {
     /// Device port number
     #[arg(long, default_value = "1")]
     port_num: u8,
-    // /// Max Work Requests processed in a single batc
-    // #[arg(long, default_value = "8")]
-    // max_wr: u32,
-    // /// Size of the RDMA buffer
+    /// Size of the RDMA buffer
     #[arg(long, default_value = "8192")]
     buf_size: usize,
     /// Number of RDMA buffers

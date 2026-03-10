@@ -229,17 +229,71 @@ impl CompletionChannel {
         }
     }
 
-    pub fn get_cq_event(&self) -> Result<(), String> {
-        // Simplify design for now, assumes we are working with a single QP and we know which fired
-        let mut cq: *mut ffi::ibv_cq = std::ptr::null_mut();
-        let mut cq_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
-
-        let ret = unsafe { ffi::ibv_get_cq_event(self.channel, &mut cq, &mut cq_ctx) };
-
-        if ret != 0 {
-            Err("failed to get completion event".to_string())
+    // set the completion channel fd as non blocking
+    pub fn set_nonblocking(&self) -> Result<(), String> {
+        let fd = unsafe { (*self.channel).fd };
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 {
+            return Err(format!(
+                "fcntl F_GETFL failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if ret == -1 {
+            Err(format!(
+                "fcntl F_SETFL failed: {}",
+                std::io::Error::last_os_error()
+            ))
         } else {
             Ok(())
+        }
+    }
+
+    // wrapper around ibv_get_cq_event() with a timeout.
+    // Checks if data is available on comp channel fd using poll().
+    // If a valid event is available in the fd we can call get_cq_event
+    // and get the event, which we know that it won't be blocking.
+    pub fn get_cq_event(&self, timeout_ms: i32) -> Result<bool, String> {
+        let fd = unsafe { (*self.channel).fd };
+
+        // we want to monitor only the comp channel fd
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        // check if there is an event (pollin) in the fd
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        match ret {
+            -1 => {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    // interrupted by a signal
+                    return Ok(false);
+                }
+                return Err(format!("poll failed: {}", err));
+            }
+            0 => return Ok(false), // timeout
+            _ => {}                // proceed, data are available
+        }
+
+        // now get_cq_event won't block since poll flaged that there are data
+        let mut cq = std::ptr::null_mut();
+        let mut cq_ctx = std::ptr::null_mut();
+        let ret = unsafe { ffi::ibv_get_cq_event(self.channel, &mut cq, &mut cq_ctx) };
+
+        if ret == 0 {
+            Ok(true)
+        } else {
+            let err = std::io::Error::last_os_error();
+            // if err.kind() == std::io::ErrorKind::WouldBlock {
+            //     Ok(false) // EWOULDBLOCK, nothing happened... spurious wakeup?
+            // } else {
+            //     Err(format!("ibv_get_cq_event failed: {}", err))
+            // }
+            Err(format!("ibv_get_cq_event failed: {}", err))
         }
     }
 }

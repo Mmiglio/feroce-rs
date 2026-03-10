@@ -44,7 +44,8 @@ impl StreamStats {
             tot_msgs = msgs,
             tot_bytes = bytes,
             rate_msg = interval_msgs as f64 / secs,
-            rate_bytes = (interval_bytes as f64) / (secs * 1024.0 * 1024.0 * 119.2),
+            rate_bytes = (interval_bytes as f64) * 8.0 / (secs * 1e9),
+            // rate_bytes = (interval_bytes as f64) / (secs * 1024.0 * 1024.0 * 119.2),
         );
     }
 
@@ -60,25 +61,5 @@ impl StreamStats {
             total_time.as_secs()
         );
         self.print_interval_metrics(total_time);
-    }
-
-    pub fn print_metrics(&self, duration: Duration, prev_msgs: u64, prev_bytes: u64) -> (u64, u64) {
-        let msgs = self.messages.load(Ordering::Relaxed);
-        let bytes = self.bytes.load(Ordering::Relaxed);
-        let secs = duration.as_secs_f64();
-
-        let interval_msgs = msgs - prev_msgs;
-        let interval_bytes = bytes - prev_bytes;
-
-        println!(
-            "Stream {id}: {tot_msgs} msgs, {tot_bytes} bytes, {rate_msg:.1} msg/s, {rate_bytes:.2} Gbit/s",
-            id = self.id,
-            tot_msgs = msgs,
-            tot_bytes = bytes,
-            rate_msg = interval_msgs as f64 / secs,
-            rate_bytes = (interval_bytes as f64) / (secs * 1024.0 * 1024.0 * 119.2),
-        );
-
-        (msgs, bytes)
     }
 }

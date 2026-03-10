@@ -7,6 +7,7 @@ pub struct BufferHandle {
     pub addr: *mut u8,
     pub len: usize,
     pub lkey: u32,
+    pub written_bytes: usize,
 }
 
 // Needed to move handle between channels.
@@ -83,6 +84,7 @@ impl BufferPool {
             addr,
             len: self.buf_size,
             lkey: self.mr.lkey(),
+            written_bytes: 0,
         }
     }
 

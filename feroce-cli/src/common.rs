@@ -116,7 +116,7 @@ struct QpContext {
     qp: Arc<QueuePair>,
     poller_handle: JoinHandle<()>,
     stats: Arc<StreamStats>,
-    connected_at: Instant,
+    //connected_at: Instant,
 }
 
 pub fn run_cm_active<F>(
@@ -171,7 +171,7 @@ where
                 qp,
                 poller_handle,
                 stats,
-                connected_at: Instant::now(),
+                //connected_at: Instant::now(),
             },
         );
     }
@@ -195,11 +195,6 @@ where
 
         for qp_ctx in qps.values() {
             qp_ctx.stats.print_interval_metrics(monitoring_interval);
-
-            // (prev_msgs, prev_bytes) =
-            //     qp_ctx
-            //         .stats
-            //         .print_metrics(monitoring_interval, prev_msgs, prev_bytes);
         }
     }
 
@@ -242,7 +237,7 @@ where
     let mut stream_id = 0;
 
     // set cm read timeout to avoid blocking the loop
-    cm.set_read_timout(Duration::from_millis(100))?;
+    cm.set_read_timeout(Duration::from_millis(100))?;
 
     // handle sigint/sigterm
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -282,7 +277,7 @@ where
                             qp,
                             poller_handle,
                             stats,
-                            connected_at: Instant::now(),
+                            //connected_at: Instant::now(),
                         },
                     );
 
@@ -309,11 +304,7 @@ where
 
                     println!("closed qp: local {} - remote {}", local_qpn, remote_qpn);
                     println!("[Done] Summary:");
-                    qp_ctx.stats.print_metrics(
-                        Instant::now().duration_since(qp_ctx.connected_at),
-                        0,
-                        0,
-                    );
+                    qp_ctx.stats.print_summary();
                 }
             }
         }
