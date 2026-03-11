@@ -3,6 +3,8 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
+use log::{info, warn};
+
 use crate::protocol::{
     AckType, QP_MESSAGE_SIZE, QpConnectionInfo, QpFlags, QpMessage, RequestType, gid_from_ipv4,
     ipv4_from_gid,
@@ -87,6 +89,7 @@ pub struct ConnectionManager {
 impl ConnectionManager {
     pub fn new(bind_addr: IpAddr, port: u16) -> Result<Self, ConnectionError> {
         let socket = UdpSocket::bind(SocketAddr::new(bind_addr, port))?;
+        info!("Binding Connection Manager to {}:{}", bind_addr, port);
         Ok(ConnectionManager {
             socket,
             pending: HashMap::new(),
@@ -183,6 +186,11 @@ impl ConnectionManager {
             gid: gid_from_ipv4(qp_msg.loc_ip),
         };
 
+        info!(
+            "Received OpenQP request from {}, remote QPN={}",
+            peer_addr, remote_info.qp_num
+        );
+
         // search if the QP exists already
         let res_qp_state = self.qps.values().find(|qp| match qp {
             QpState::Connected { remote_info, .. } => {
@@ -199,6 +207,10 @@ impl ConnectionManager {
         }) = res_qp_state
         {
             // we already have this QP! just send again the ack message
+            warn!(
+                "Remote QPN {} from {} already connected. Sending new ACK",
+                remote_info.qp_num, peer_addr
+            );
             self.send_reply(
                 local_info,
                 remote_info,
@@ -221,8 +233,8 @@ impl ConnectionManager {
                 .insert((peer_addr.ip(), qp_msg.loc_qpn), pending_qp)
                 .is_some()
             {
-                println!(
-                    "Warning: duplicated connection request: peer addr: {}, qpn: {}",
+                warn!(
+                    "Duplicated connection request: peer addr={}, local qpn={}",
                     peer_addr.ip(),
                     qp_msg.loc_qpn
                 );
@@ -251,6 +263,11 @@ impl ConnectionManager {
                 peer_ip, remote_qpn
             ))
         })?;
+
+        info!(
+            "Completing connection handshake with {}. Remote QPN={}, local QPN={}",
+            peer_ip, remote_qpn, local_info.qp_num
+        );
 
         // send ACK with local QP info
         self.send_reply(
@@ -282,6 +299,11 @@ impl ConnectionManager {
         let local_qpn = qp_msg.rem_qpn;
         let remote_qpn = qp_msg.loc_qpn;
 
+        info!(
+            "Received CloseQP request from {}. Remote QPN={}, local QPN={}",
+            peer_addr, remote_qpn, local_qpn
+        );
+
         match self.qps.remove(&local_qpn) {
             Some(QpState::Connected {
                 peer_addr,
@@ -307,6 +329,7 @@ impl ConnectionManager {
                     }))
                 } else {
                     // wrong local QP, send nak
+                    warn!("Wrong local QPN={local_qpn}. Sending NAK.");
 
                     self.qps.insert(
                         local_qpn,
@@ -331,6 +354,10 @@ impl ConnectionManager {
                 remote_info,
             }) => {
                 // Qp is already in closing state, ignore request
+                warn!(
+                    "Local QPN={} already in Closing state. Ignoring request.",
+                    local_info.qp_num
+                );
                 self.qps.insert(
                     local_qpn,
                     QpState::Closing {
@@ -343,6 +370,7 @@ impl ConnectionManager {
             }
             None => {
                 // No qp!
+                warn!("Local QPN={} doesn't exist. Ignoring request.", local_qpn);
                 let (local_info, remote_info) = self.get_qp_info(qp_msg);
                 self.send_reply(
                     &local_info,
@@ -442,7 +470,7 @@ impl ConnectionManager {
                     ConnectionError::Timeout => {
                         // receiver hit the timeout, decrease the retry counter and try again
                         retry_left -= 1;
-                        println!("Timeout while waiting for ACK, {} retries left", retry_left);
+                        warn!("Timeout while waiting for ACK, {} retries left", retry_left);
                         continue;
                     }
                     _ => {
@@ -486,6 +514,10 @@ impl ConnectionManager {
             ..Default::default()
         };
 
+        info!(
+            "Sending OpenQP to {}, local QPN={}",
+            remote_addr, local_info.qp_num
+        );
         // Try up to max_retries times to open a QP, with a timeout
         let validate_ack = |reply: &QpMessage| -> bool {
             (reply.flags.request_type() == Ok(RequestType::OpenQp))
@@ -520,6 +552,11 @@ impl ConnectionManager {
             },
         );
 
+        info!(
+            "Local QP {} connected to remote QP {}",
+            local_info.qp_num, remote_info.qp_num
+        );
+
         Ok(remote_info)
     }
 
@@ -541,6 +578,11 @@ impl ConnectionManager {
                     &local_info,
                     &remote_info,
                     self.cm_port()?,
+                );
+
+                info!(
+                    "Sending closeQP to {}, local QPN={}, remote QPN={}",
+                    peer_addr, local_info.qp_num, remote_info.qp_num
                 );
 
                 let validate_ack = |reply: &QpMessage| -> bool {
@@ -569,6 +611,8 @@ impl ConnectionManager {
                             },
                         );
                     })?;
+
+                info!("Closed remote QPN={}", remote_info.qp_num);
 
                 Ok(())
             }

@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use log::debug;
+
 use crate::rdma::{self, device::MemoryRegion, device::ProtectionDomain};
 
 pub struct BufferHandle {
@@ -37,6 +39,14 @@ impl BufferPool {
         let mr = MemoryRegion::register(pd, &mut data, access_flags)?;
 
         let free_bufs = VecDeque::from_iter(0..num_buf);
+
+        debug!(
+            "Created BufferPool: addr={:p}, {} buffers x {} bytes = {} MiB.",
+            data.as_ptr(),
+            num_buf,
+            buf_size,
+            (num_buf * buf_size) as f64 / 1024.0 / 1024.0
+        );
 
         Ok(BufferPool {
             num_buf,

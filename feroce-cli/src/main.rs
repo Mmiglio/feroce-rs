@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::net::IpAddr;
 
-use crate::common::build_role;
+use crate::common::build_cm_role;
 
 mod common;
 mod recv;
@@ -94,11 +94,13 @@ fn parse_hex(s: &str) -> Result<u16, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Recv { cm_opts, rdma_opts } => {
-            let cm_role = build_role(&cm_opts, cm_opts.active)?;
+            let cm_role = build_cm_role(&cm_opts, cm_opts.active)?;
             recv::run(&cm_opts, &cm_role, &rdma_opts)?;
             Ok(())
         }
@@ -107,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rdma_opts,
             sender_opts,
         } => {
-            let cm_role = build_role(&cm_opts, cm_opts.active)?;
+            let cm_role = build_cm_role(&cm_opts, cm_opts.active)?;
             send::run(&cm_opts, &cm_role, &rdma_opts, &sender_opts)?;
             Ok(())
         }

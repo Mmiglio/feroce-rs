@@ -8,6 +8,7 @@ use feroce::rdma::{
     buffer_pool::{BufferHandle, BufferPool},
     device::{CompletionChannel, QueuePair},
 };
+use log::{debug, error};
 
 use crate::{
     CmOpts, RdmaOpts, SenderOpts,
@@ -23,7 +24,7 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
     let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
-        let stats = Arc::new(StreamStats::new(stream_id));
+        let stats = Arc::new(StreamStats::new(stream_id, prepared_qp.qp.qp_num()));
 
         let (free_tx, free_rx) = mpsc::channel::<BufferHandle>();
         let (work_tx, work_rx) = mpsc::channel::<BufferHandle>();
@@ -39,9 +40,10 @@ pub fn run(
                 fill_buffer(counter, &mut buf_handle);
                 buf_handle.written_bytes = buf_handle.len;
                 counter += 1;
-                work_tx
-                    .send(buf_handle)
-                    .expect("worker thread failed to sent message to poller");
+                if work_tx.send(buf_handle).is_err() {
+                    // channel droped by the sender
+                    break;
+                }
             }
         });
 
@@ -59,7 +61,7 @@ pub fn run(
                     free_tx,
                     work_rx,
                 ) {
-                    eprintln!("poller thread error: {}", e);
+                    error!("poller thread error: {}", e);
                 }
             }
         });
@@ -122,9 +124,10 @@ fn poller_thread(
             true,
         ));
 
-        free_tx
-            .send(buf_handle)
-            .expect("failed to send free buf handle to worker");
+        if free_tx.send(buf_handle).is_err() {
+            error!("failed to send free buf handle to worker");
+            panic!();
+        }
     }
 
     // create all work completions
@@ -135,15 +138,12 @@ fn poller_thread(
         num_initial_posts
     ];
 
-    // set the completion channel as non-blocking
-    channel.set_nonblocking()?;
-
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
     'poller_loop: loop {
         // wait for completion event / timeout
-        if !channel.get_cq_event(10)? {
+        if !channel.try_get_cq_event(10)? {
             // timed out, no new completion. Repost the free buffers.
             while let Ok(buf_handle) = work_rx.try_recv() {
                 qp.post_send(&mut send_wr_list[buf_handle.index])?;
@@ -169,9 +169,9 @@ fn poller_thread(
         for (ce_idx, wce) in wc_list.iter().enumerate().take(num_wce) {
             if wce.status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
                 if wce.status == rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR {
-                    println!("Got IBV_WC_WR_FLUSH_ERR, QP is most likely being closed");
+                    debug!("Got IBV_WC_WR_FLUSH_ERR, QP is most likely being closed");
                 } else {
-                    println!("WC index {} error status: {}", ce_idx, wce.status as i32)
+                    error!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
                 break 'poller_loop;
             }
