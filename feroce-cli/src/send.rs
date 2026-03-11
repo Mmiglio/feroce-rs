@@ -1,13 +1,11 @@
-use std::{
-    cmp::min,
-    sync::{Arc, mpsc},
-};
+use std::sync::{Arc, mpsc};
 
 use feroce::rdma::{
     self,
     buffer_pool::{BufferHandle, BufferPool},
     device::{CompletionChannel, QueuePair},
 };
+use log::{debug, error};
 
 use crate::{
     CmOpts, RdmaOpts, SenderOpts,
@@ -23,43 +21,50 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
     let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
-        let stats = Arc::new(StreamStats::new(stream_id));
+        let stats = Arc::new(StreamStats::new(stream_id, prepared_qp.qp.qp_num()));
 
         let (free_tx, free_rx) = mpsc::channel::<BufferHandle>();
         let (work_tx, work_rx) = mpsc::channel::<BufferHandle>();
 
-        let _worker_handle = std::thread::spawn(move || {
-            let mut counter = 0;
-            loop {
-                let Ok(mut buf_handle) = free_rx.recv() else {
-                    // closed channel
-                    break;
-                };
-                // fill the buffer and sent it
-                fill_buffer(counter, &mut buf_handle);
-                buf_handle.written_bytes = buf_handle.len;
-                counter += 1;
-                work_tx
-                    .send(buf_handle)
-                    .expect("worker thread failed to sent message to poller");
+        let _worker_handle = std::thread::spawn({
+            let num_msgs = send_opts.num_msgs;
+            move || {
+                let mut counter = 0;
+                loop {
+                    let Ok(mut buf_handle) = free_rx.recv() else {
+                        // closed channel
+                        break;
+                    };
+                    // fill the buffer and sent it
+                    fill_buffer(counter, &mut buf_handle);
+                    buf_handle.written_bytes = buf_handle.len;
+                    counter += 1;
+                    if work_tx.send(buf_handle).is_err() {
+                        // channel droped by the sender
+                        break;
+                    }
+                    // check if we produced all the messages
+                    if counter == num_msgs {
+                        debug!("Worker done, produced {num_msgs} messages");
+                        break;
+                    }
+                }
             }
         });
 
         let handle = std::thread::spawn({
             let qp = Arc::clone(&prepared_qp.qp);
             let stats = Arc::clone(&stats);
-            let num_msgs = send_opts.num_msgs;
             move || {
                 if let Err(e) = poller_thread(
                     qp,
                     prepared_qp.buffer_pool,
                     prepared_qp.comp_channel,
-                    num_msgs,
                     stats,
                     free_tx,
                     work_rx,
                 ) {
-                    eprintln!("poller thread error: {}", e);
+                    error!("poller thread error: {}", e);
                 }
             }
         });
@@ -86,7 +91,6 @@ fn poller_thread(
     qp: Arc<QueuePair>,
     buffer_pool: BufferPool,
     channel: CompletionChannel,
-    num_msgs: u64,
     stats: Arc<StreamStats>,
     free_tx: mpsc::Sender<BufferHandle>,
     work_rx: mpsc::Receiver<BufferHandle>,
@@ -103,9 +107,10 @@ fn poller_thread(
     let mut sge_list = Vec::<Vec<rdma::ibv_sge>>::new();
     let mut send_wr_list = Vec::<rdma::ibv_send_wr>::new();
 
-    let num_initial_posts = min(buffer_pool.num_buf(), num_msgs as usize);
+    // detect when the worker is done
+    let mut worker_done = false;
 
-    for idx in 0..num_initial_posts {
+    for idx in 0..buffer_pool.num_buf() {
         let buf_handle = buffer_pool.get_handle(idx);
 
         // 1 sge for now
@@ -122,9 +127,10 @@ fn poller_thread(
             true,
         ));
 
-        free_tx
-            .send(buf_handle)
-            .expect("failed to send free buf handle to worker");
+        if free_tx.send(buf_handle).is_err() {
+            error!("failed to send free buf handle to worker");
+            panic!();
+        }
     }
 
     // create all work completions
@@ -132,27 +138,25 @@ fn poller_thread(
         rdma::ibv_wc {
             ..Default::default()
         };
-        num_initial_posts
+        buffer_pool.num_buf()
     ];
-
-    // set the completion channel as non-blocking
-    channel.set_nonblocking()?;
 
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
     'poller_loop: loop {
         // wait for completion event / timeout
-        if !channel.get_cq_event(10)? {
-            // timed out, no new completion. Repost the free buffers.
-            while let Ok(buf_handle) = work_rx.try_recv() {
-                qp.post_send(&mut send_wr_list[buf_handle.index])?;
-                send_posted += 1;
-                if send_posted == num_msgs {
-                    break;
-                }
-            }
-            // wait again for new events
+        if !channel.try_get_cq_event(10)? {
+            // timed out, no new completion. Repost the free buffers and check if the worker is still connected.
+            drain_work_rx(
+                &work_rx,
+                &qp,
+                &mut send_wr_list,
+                &mut send_posted,
+                &mut worker_done,
+            )?;
+
+            // go back to waiting
             continue;
         }
 
@@ -169,9 +173,9 @@ fn poller_thread(
         for (ce_idx, wce) in wc_list.iter().enumerate().take(num_wce) {
             if wce.status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
                 if wce.status == rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR {
-                    println!("Got IBV_WC_WR_FLUSH_ERR, QP is most likely being closed");
+                    debug!("Got IBV_WC_WR_FLUSH_ERR, QP is most likely being closed");
                 } else {
-                    println!("WC index {} error status: {}", ce_idx, wce.status as i32)
+                    error!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
                 break 'poller_loop;
             }
@@ -181,15 +185,16 @@ fn poller_thread(
             total_bytes += sge_list[wce.wr_id as usize][0].length as u64;
             total_msgs += 1;
 
-            if send_completed >= num_msgs {
-                // we sent all messages, done
+            if worker_done && send_completed == send_posted {
+                // we sent all posted messages and the worker is done
                 break 'poller_loop;
             }
 
             let buf_handle = buffer_pool.get_handle(wce.wr_id as usize);
-            free_tx
-                .send(buf_handle)
-                .expect("failed to send free buffer");
+            if free_tx.send(buf_handle).is_err() {
+                // worker done, but we still need to drain completions
+                continue;
+            }
         }
 
         stats
@@ -199,13 +204,14 @@ fn poller_thread(
             .bytes
             .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
-        while let Ok(buf_handle) = work_rx.try_recv() {
-            qp.post_send(&mut send_wr_list[buf_handle.index])?;
-            send_posted += 1;
-            if send_posted == num_msgs {
-                break;
-            }
-        }
+        // Repost the free buffers and check if the worker is still connected.
+        drain_work_rx(
+            &work_rx,
+            &qp,
+            &mut send_wr_list,
+            &mut send_posted,
+            &mut worker_done,
+        )?;
     }
 
     // flush remaining stats
@@ -222,4 +228,27 @@ fn poller_thread(
 fn fill_buffer(counter: u64, buf_handle: &mut BufferHandle) {
     let slice = unsafe { std::slice::from_raw_parts_mut(buf_handle.addr, buf_handle.len) };
     slice[0..8].copy_from_slice(&counter.to_be_bytes());
+}
+
+fn drain_work_rx(
+    work_rx: &mpsc::Receiver<BufferHandle>,
+    qp: &QueuePair,
+    send_wr_list: &mut [rdma::ibv_send_wr],
+    send_posted: &mut u64,
+    worker_done: &mut bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        match work_rx.try_recv() {
+            Ok(buf_handle) => {
+                qp.post_send(&mut send_wr_list[buf_handle.index])?;
+                *send_posted += 1;
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                *worker_done = true;
+                break;
+            }
+        }
+    }
+    Ok(())
 }

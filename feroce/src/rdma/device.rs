@@ -1,3 +1,5 @@
+use log::debug;
+
 use super::ffi;
 use crate::protocol::QpConnectionInfo;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ impl DeviceList {
         if list.is_null() {
             Err("failed to get rdma device list".to_string())
         } else {
+            debug!("Found {} rdma devices", count);
             Ok(DeviceList { list, count })
         }
     }
@@ -73,6 +76,7 @@ impl Device {
                 if context.is_null() {
                     return Err(format!("failed to open device {}", name));
                 } else {
+                    debug!("Opened device {}", name);
                     return Ok(Device { context });
                 }
             }
@@ -229,32 +233,24 @@ impl CompletionChannel {
         }
     }
 
-    // set the completion channel fd as non blocking
-    pub fn set_nonblocking(&self) -> Result<(), String> {
-        let fd = unsafe { (*self.channel).fd };
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags == -1 {
-            return Err(format!(
-                "fcntl F_GETFL failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        if ret == -1 {
-            Err(format!(
-                "fcntl F_SETFL failed: {}",
-                std::io::Error::last_os_error()
-            ))
+    pub fn get_cq_event(&self) -> Result<(), String> {
+        let mut cq: *mut ffi::ibv_cq = std::ptr::null_mut();
+        let mut cq_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        let ret = unsafe { ffi::ibv_get_cq_event(self.channel, &mut cq, &mut cq_ctx) };
+
+        if ret != 0 {
+            Err("failed to get completion event".to_string())
         } else {
             Ok(())
         }
     }
 
-    // wrapper around ibv_get_cq_event() with a timeout.
+    // Wrapper around ibv_get_cq_event() with a timeout.
     // Checks if data is available on comp channel fd using poll().
     // If a valid event is available in the fd we can call get_cq_event
     // and get the event, which we know that it won't be blocking.
-    pub fn get_cq_event(&self, timeout_ms: i32) -> Result<bool, String> {
+    pub fn try_get_cq_event(&self, timeout_ms: i32) -> Result<bool, String> {
         let fd = unsafe { (*self.channel).fd };
 
         // we want to monitor only the comp channel fd
@@ -280,21 +276,9 @@ impl CompletionChannel {
         }
 
         // now get_cq_event won't block since poll flaged that there are data
-        let mut cq = std::ptr::null_mut();
-        let mut cq_ctx = std::ptr::null_mut();
-        let ret = unsafe { ffi::ibv_get_cq_event(self.channel, &mut cq, &mut cq_ctx) };
+        self.get_cq_event()?;
 
-        if ret == 0 {
-            Ok(true)
-        } else {
-            let err = std::io::Error::last_os_error();
-            // if err.kind() == std::io::ErrorKind::WouldBlock {
-            //     Ok(false) // EWOULDBLOCK, nothing happened... spurious wakeup?
-            // } else {
-            //     Err(format!("ibv_get_cq_event failed: {}", err))
-            // }
-            Err(format!("ibv_get_cq_event failed: {}", err))
-        }
+        Ok(true)
     }
 }
 
@@ -431,6 +415,12 @@ impl QueuePair {
                 std::io::Error::last_os_error()
             ))
         } else {
+            debug!(
+                "Created QP {}, max WR={}, max SGE={}",
+                unsafe { (*qp).qp_num },
+                max_wr,
+                max_sge
+            );
             Ok(QueuePair {
                 qp,
                 _pd: pd,
@@ -458,6 +448,7 @@ impl QueuePair {
         if ret != 0 {
             Err(format!("Failed to modify QP to INIT: error {}", ret))
         } else {
+            debug!("QP {} modified from RESET to INIT", self.qp_num());
             Ok(())
         }
     }
@@ -505,6 +496,14 @@ impl QueuePair {
         if ret != 0 {
             Err(format!("Failed to modify QP to RTR: error {}", ret))
         } else {
+            debug!(
+                "QP {} modified from INIT to RTR. Local GID Index={}. Remote QPN={}, PSN={}, GID={:?}",
+                self.qp_num(),
+                gid_index,
+                remote_info.qp_num,
+                remote_info.psn,
+                remote_info.gid,
+            );
             Ok(())
         }
     }
@@ -532,6 +531,11 @@ impl QueuePair {
         if ret != 0 {
             Err(format!("Failed to modify QP to RTS: error {}", ret))
         } else {
+            debug!(
+                "QP {} modified from RTR to RTS. Set local psn to {}",
+                self.qp_num(),
+                sq_psn,
+            );
             Ok(())
         }
     }
@@ -548,6 +552,7 @@ impl QueuePair {
         if ret != 0 {
             Err(format!("Failed to modify QP to RTS: error {}", ret))
         } else {
+            debug!("QP {} modify to ERROR", self.qp_num());
             Ok(())
         }
     }
@@ -675,6 +680,11 @@ impl MemoryRegion {
                 std::io::Error::last_os_error()
             ))
         } else {
+            debug!(
+                "Registered MR: addr={:#x}, len={}",
+                unsafe { (*mr).addr as u64 },
+                unsafe { (*mr).length as u32 }
+            );
             Ok(MemoryRegion { mr })
         }
     }
@@ -705,6 +715,8 @@ impl Drop for MemoryRegion {
 #[cfg(test)]
 #[cfg(feature = "rdma-test")]
 mod test {
+    use log::info;
+
     use super::*;
     use crate::rdma;
 
@@ -724,7 +736,7 @@ mod test {
                     let port = entry.port_num as u8;
                     let port_attr = device.query_port(port).ok()?;
                     if matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE) {
-                        println!(
+                        info!(
                             "Discovery: device={}, port={}, gid_index={}, mtu={:?}",
                             name, port, entry.gid_index, port_attr.active_mtu as u32
                         );
@@ -1305,7 +1317,7 @@ mod test {
         // wait for event in send channel
         // this should be blocking with a timeout...
         channel_send
-            .get_cq_event(1000)
+            .get_cq_event()
             .expect("failed to get completion event!");
 
         // now we should have an event!

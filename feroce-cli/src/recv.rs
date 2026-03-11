@@ -3,6 +3,7 @@ use feroce::rdma::{
     buffer_pool::{BufferHandle, BufferPool},
     device::{CompletionChannel, QueuePair},
 };
+use log::{debug, error};
 use std::sync::{Arc, mpsc};
 
 use crate::{
@@ -18,7 +19,7 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
     let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
-        let stats = Arc::new(StreamStats::new(stream_id));
+        let stats = Arc::new(StreamStats::new(stream_id, prepared_qp.qp.qp_num()));
 
         let (work_tx, work_rx) = mpsc::channel::<BufferHandle>();
         let (free_tx, free_rx) = mpsc::channel::<usize>();
@@ -26,11 +27,13 @@ pub fn run(
         let _worker_handle = std::thread::spawn(move || {
             loop {
                 let Ok(handle) = work_rx.recv() else {
-                    // closed channel
+                    // poller closed the channel
                     break;
                 };
                 // process the buffer
-                free_tx.send(handle.index).unwrap();
+                // .....fake processing......
+                // (try to) return the buffer to poller
+                let _ = free_tx.send(handle.index).is_err();
             }
         });
 
@@ -106,20 +109,17 @@ fn poller_thread(
         buffer_pool.num_buf()
     ];
 
-    // set the completion channel as non-blocking
-    channel.set_nonblocking()?;
-
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
     'poller_loop: loop {
         // wait for completion event / timeout
-        if !channel.get_cq_event(1)? {
+        if !channel.try_get_cq_event(1)? {
             // repost free recv buffers
             while let Ok(idx) = free_rx.try_recv() {
                 qp.post_recv(&mut recv_wr_list[idx])?;
             }
-            // wait for new CE/timout
+            // wait for new CE/timeout
             continue;
         }
 
@@ -136,9 +136,9 @@ fn poller_thread(
         for (ce_idx, wce) in wc_list.iter().enumerate().take(num_wce) {
             if wce.status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
                 if wce.status == rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR {
-                    println!("Got IBV_WC_WR_FLUSH_ERR, QP is most likely being closed");
+                    debug!("Got IBV_WC_WR_FLUSH_ERR, QP is most likely being closed");
                 } else {
-                    println!("WC index {} error status: {}", ce_idx, wce.status as i32)
+                    error!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
                 break 'poller_loop;
             }

@@ -19,6 +19,7 @@ use feroce::{
         ibv_mtu,
     },
 };
+use log::{error, info};
 
 use crate::{CmOpts, RdmaOpts, stats::StreamStats};
 
@@ -31,7 +32,7 @@ pub enum CmRole {
     Passive,
 }
 
-pub fn build_role(cm_opts: &CmOpts, active: bool) -> Result<CmRole, String> {
+pub fn build_cm_role(cm_opts: &CmOpts, active: bool) -> Result<CmRole, String> {
     if active {
         let addr = cm_opts
             .remote_addr
@@ -116,7 +117,6 @@ struct QpContext {
     qp: Arc<QueuePair>,
     poller_handle: JoinHandle<()>,
     stats: Arc<StreamStats>,
-    //connected_at: Instant,
 }
 
 pub fn run_cm_active<F>(
@@ -145,8 +145,6 @@ where
         // keep a reference, prepared_qp will be moved to the poller thread
         let qp = Arc::clone(&prepared_qp.qp);
 
-        println!("created local qp {}", prepared_qp.qp.qp_num());
-
         // connect the CM to gather remote info
         let remote_info = cm.connect(
             remote_addr,
@@ -157,11 +155,6 @@ where
 
         connect_qp(&prepared_qp, &remote_info, rdma_opts, active_path_mtu)?;
 
-        println!(
-            "connected qp: local {} - remote {}",
-            prepared_qp.local_info.qp_num, remote_info.qp_num
-        );
-
         // spawn the threads
         let (poller_handle, stats) = spawn_poller(prepared_qp, stream_id);
 
@@ -171,7 +164,6 @@ where
                 qp,
                 poller_handle,
                 stats,
-                //connected_at: Instant::now(),
             },
         );
     }
@@ -186,7 +178,7 @@ where
 
         // check exit conditions
         if shutdown.load(Ordering::Relaxed) {
-            println!("Ctrl+C received, shutting down...");
+            info!("Ctrl+C received, shutting down...");
             break;
         }
         if qps.values().all(|ctx| ctx.poller_handle.is_finished()) {
@@ -206,10 +198,8 @@ where
         println!("[Done] Summary: ");
 
         qp_ctx.stats.print_summary();
-        //.print_metrics(Instant::now().duration_since(qp_ctx.connected_at), 0, 0);
 
         cm.close_qp(qpn, Duration::from_secs(2), 2)?;
-        println!("closed local qp {}", qpn);
     }
 
     Ok(())
@@ -270,23 +260,19 @@ where
                     // maybe get stream id from somewhere? e.g. from the active side.
                     stream_id += 1;
 
-                    let local_qpn = qp.qp_num();
                     qps.insert(
                         qp.qp_num(),
                         QpContext {
                             qp,
                             poller_handle,
                             stats,
-                            //connected_at: Instant::now(),
                         },
                     );
-
-                    println!("connected qp: local {} - remote {}", local_qpn, remote_qpn);
                 }
                 CmEvent::CloseQp {
                     peer_ip: _,
                     local_qpn,
-                    remote_qpn,
+                    remote_qpn: _,
                 } => {
                     // get the qp from the list
                     let Some(qp_ctx) = qps.remove(&local_qpn) else {
@@ -298,11 +284,12 @@ where
                     qp_ctx.qp.modify_to_error()?;
 
                     // FIX THIS, PROPAGATE THE ERR
-                    let _ = qp_ctx.poller_handle.join();
+                    if let Err(e) = qp_ctx.poller_handle.join() {
+                        error!("Poller thread panicked: {:?}", e);
+                    }
 
                     cm.ack_close_qp(local_qpn)?;
 
-                    println!("closed qp: local {} - remote {}", local_qpn, remote_qpn);
                     println!("[Done] Summary:");
                     qp_ctx.stats.print_summary();
                 }
@@ -311,7 +298,7 @@ where
 
         // monitoring, signal interrupts etc
         if shutdown.load(Ordering::Relaxed) {
-            println!("Ctrl+C received, shutting down...");
+            info!("Ctrl+C received, shutting down...");
             break;
         }
 
@@ -324,13 +311,12 @@ where
     }
 
     // cleanup
-    for (qpn, qp_ctx) in qps.drain() {
+    for (_qpn, qp_ctx) in qps.drain() {
         qp_ctx.qp.modify_to_error()?;
         let _ = qp_ctx.poller_handle.join();
         println!("[Done] Summary:");
         qp_ctx.stats.print_summary();
         // this is the passive side, we can't send somethign to the active side.
-        println!("closed local qp {}", qpn);
     }
 
     Ok(())
