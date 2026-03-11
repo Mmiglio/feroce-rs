@@ -1303,9 +1303,9 @@ mod test {
         );
 
         // wait for event in send channel
-        // this should be blocking...
+        // this should be blocking with a timeout...
         channel_send
-            .get_cq_event()
+            .get_cq_event(1000)
             .expect("failed to get completion event!");
 
         // now we should have an event!

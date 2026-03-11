@@ -45,7 +45,6 @@ impl StreamStats {
             tot_bytes = bytes,
             rate_msg = interval_msgs as f64 / secs,
             rate_bytes = (interval_bytes as f64) * 8.0 / (secs * 1e9),
-            // rate_bytes = (interval_bytes as f64) / (secs * 1024.0 * 1024.0 * 119.2),
         );
     }
 
