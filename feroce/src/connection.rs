@@ -484,8 +484,12 @@ impl ConnectionManager {
                 self.socket.set_read_timeout(original_socket_timeout)?;
                 return Ok(reply_qp_message);
             } else {
-                //Err(ConnectionError::Protocol("Invalid ACK message".to_string()))
-                // invalid message received, just keep waiting and don't waste a retry
+                retry_left -= 1;
+                warn!(
+                    "Received unexpected reply (flags={:#x}), {} retries left",
+                    reply_qp_message.flags.as_byte(),
+                    retry_left
+                );
                 continue;
             }
         }
