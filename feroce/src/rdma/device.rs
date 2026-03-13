@@ -550,7 +550,7 @@ impl QueuePair {
         let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
 
         if ret != 0 {
-            Err(format!("Failed to modify QP to RTS: error {}", ret))
+            Err(format!("Failed to modify QP ERROR: error {}", ret))
         } else {
             debug!("QP {} modify to ERROR", self.qp_num());
             Ok(())
