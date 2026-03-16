@@ -41,128 +41,62 @@ impl std::fmt::Display for ConnectionError {
     }
 }
 
+// Pending connection request, consumed when handshake finishes
+enum PendingQp {
+    Active {
+        _local_info: QpConnectionInfo,
+        _peer_addr: SocketAddr,
+    },
+    Passive {
+        remote_info: QpConnectionInfo,
+        reply_addr: SocketAddr,
+    },
+}
+
+// states of connected QP
+#[derive(Debug, PartialEq)]
+enum QpPhase {
+    Connected,
+    Running,
+    Closing,
+}
+
 struct QpContext {
     peer_addr: SocketAddr,
     local_info: QpConnectionInfo,
     remote_info: QpConnectionInfo,
 }
-
-enum TransitionError {
-    // invalid transition in the FSM, returns the consumed state
-    InvalidTransition(QpState),
+// QP that has completed the handshake and is store in the CM
+struct ActiveQp {
+    phase: QpPhase,
+    ctx: QpContext,
 }
 
-enum QpState {
-    // sent a connection request
-    PendingActive {
-        local_info: QpConnectionInfo,
-        peer_addr: SocketAddr,
-    },
-    // received a connection request
-    PendingPassive {
-        remote_info: QpConnectionInfo,
-        reply_addr: SocketAddr,
-    },
-    Connected(QpContext),
-    Running(QpContext),
-    Closing(QpContext),
-}
-
-impl QpState {
-    // Caller create QpState in PendingActive / PendingPassive based on the role
-
-    // passive side sent the connection ack -> Connected
-    fn on_connect_ack_sent(self, local_info: QpConnectionInfo) -> Result<QpState, TransitionError> {
-        match self {
-            QpState::PendingPassive {
-                remote_info,
-                reply_addr,
-            } => Ok(QpState::Connected(QpContext {
-                peer_addr: reply_addr,
-                local_info,
-                remote_info,
-            })),
-            _ => Err(TransitionError::InvalidTransition(self)),
-        }
+impl ActiveQp {
+    fn new(phase: QpPhase, ctx: QpContext) -> Self {
+        ActiveQp { phase, ctx }
     }
 
-    // active side received an ack -> Connected
-    fn on_connect_ack_received(
-        self,
-        remote_info: QpConnectionInfo,
-    ) -> Result<QpState, TransitionError> {
-        match self {
-            QpState::PendingActive {
-                local_info,
-                peer_addr,
-            } => Ok(QpState::Connected(QpContext {
-                peer_addr,
-                local_info,
-                remote_info,
-            })),
-            _ => Err(TransitionError::InvalidTransition(self)),
-        }
-    }
-
-    // ready to process -> Running
-    fn on_start(self) -> Result<QpState, TransitionError> {
-        match self {
-            QpState::Connected(qp_ctx) => Ok(QpState::Running(qp_ctx)),
-            _ => Err(TransitionError::InvalidTransition(self)),
-        }
-    }
-
-    // active side requested close QP -> Closing
-    fn on_close_requested(self) -> Result<QpState, TransitionError> {
-        match self {
-            QpState::Connected(qp_ctx) => Ok(QpState::Closing(qp_ctx)),
-            QpState::Running(qp_ctx) => Ok(QpState::Closing(qp_ctx)),
-            _ => Err(TransitionError::InvalidTransition(self)),
-        }
-    }
-
-    // passive side received close QP req -> Closing
-    fn on_close_received(self) -> Result<QpState, TransitionError> {
-        match self {
-            QpState::Connected(qp_ctx) => Ok(QpState::Closing(qp_ctx)),
-            QpState::Running(qp_ctx) => Ok(QpState::Closing(qp_ctx)),
-            _ => Err(TransitionError::InvalidTransition(self)),
-        }
-    }
-
-    // passive side sent the ack -> done, remove QP
-    fn on_close_ack_sent(self) -> Result<(), TransitionError> {
-        match self {
-            QpState::Closing(_qp_ctx) => Ok(()),
-            _ => Err(TransitionError::InvalidTransition(self)),
-        }
-    }
-
-    // active received close qp ack -> done, remove QP
-    fn on_close_ack_received(self) -> Result<(), TransitionError> {
-        match self {
-            QpState::Closing(_qp_ctx) => Ok(()),
-            _ => Err(TransitionError::InvalidTransition(self)),
-        }
-    }
-
-    fn peer_addr(&self) -> SocketAddr {
-        match self {
-            QpState::PendingActive { peer_addr, .. } => *peer_addr,
-            QpState::PendingPassive { reply_addr, .. } => *reply_addr,
-            QpState::Connected(ctx) | QpState::Running(ctx) | QpState::Closing(ctx) => {
-                ctx.peer_addr
+    fn transition_to_running(&mut self) -> Result<(), ConnectionError> {
+        match self.phase {
+            QpPhase::Connected => {
+                self.phase = QpPhase::Running;
+                Ok(())
             }
+            _ => Err(ConnectionError::Protocol(format!(
+                "cannot start: QP is {:?}, expected Connected",
+                self.phase
+            ))),
         }
     }
 
-    fn remote_info(&self) -> Option<&QpConnectionInfo> {
-        match self {
-            QpState::PendingPassive { remote_info, .. } => Some(remote_info),
-            QpState::Connected(ctx) | QpState::Running(ctx) | QpState::Closing(ctx) => {
-                Some(&ctx.remote_info)
+    fn transition_to_closing(&mut self) -> Result<(), ConnectionError> {
+        match self.phase {
+            QpPhase::Connected | QpPhase::Running => {
+                self.phase = QpPhase::Closing;
+                Ok(())
             }
-            QpState::PendingActive { .. } => None,
+            QpPhase::Closing => Err(ConnectionError::Protocol("QP is already closing".into())),
         }
     }
 }
@@ -186,8 +120,8 @@ pub enum CmEvent {
 
 pub struct ConnectionManager {
     socket: UdpSocket,
-    pending: HashMap<(IpAddr, u32), QpState>,
-    qps: HashMap<u32, QpState>,
+    pending: HashMap<(IpAddr, u32), PendingQp>,
+    qps: HashMap<u32, ActiveQp>,
 }
 
 impl ConnectionManager {
@@ -210,10 +144,9 @@ impl ConnectionManager {
         Ok(())
     }
 
-    fn recv_message(&self) -> Result<(QpMessage, SocketAddr), ConnectionError> {
+    fn recv_message(socket: &UdpSocket) -> Result<(QpMessage, SocketAddr), ConnectionError> {
         let mut buf = [0u8; QP_MESSAGE_SIZE];
-        // Blocking receive, check if we reach a timeout (if set)
-        let (msg_size, src_addr) = self.socket.recv_from(&mut buf).map_err(|e| {
+        let (msg_size, src_addr) = socket.recv_from(&mut buf).map_err(|e| {
             if e.kind() == io::ErrorKind::TimedOut
                 || e.kind() == io::ErrorKind::WouldBlock
                 || e.kind() == io::ErrorKind::Interrupted
@@ -232,13 +165,12 @@ impl ConnectionManager {
         }
 
         let qp_msg = QpMessage::unpack(&buf).map_err(ConnectionError::Protocol)?;
-
         Ok((qp_msg, src_addr))
     }
 
     pub fn process_next(&mut self) -> Result<CmEvent, ConnectionError> {
         loop {
-            let (qp_msg, peer_addr) = self.recv_message()?;
+            let (qp_msg, peer_addr) = Self::recv_message(&self.socket)?;
 
             let request_type = qp_msg.flags.request_type().map_err(|val| {
                 ConnectionError::Protocol(format!("Received unknown request value {}", val))
@@ -295,37 +227,32 @@ impl ConnectionManager {
             peer_addr, remote_info.qp_num
         );
 
-        // search if the QP exists already
-        let res_qp_state = self.qps.values().find(|qp| match qp {
-            QpState::Connected(qp_ctx) => {
-                qp_ctx.remote_info.qp_num == qp_msg.loc_qpn
-                    && ipv4_from_gid(&qp_ctx.remote_info.gid) == qp_msg.loc_ip
-            }
-            _ => false,
+        // check if the QP already exists (duplicate open / retransmission)
+        let duplicate = self.qps.values().find(|active_qp| {
+            active_qp.ctx.remote_info.qp_num == qp_msg.loc_qpn
+                && ipv4_from_gid(&active_qp.ctx.remote_info.gid) == qp_msg.loc_ip
         });
 
-        if let Some(QpState::Connected(qp_ctx)) = res_qp_state {
-            // we already have this QP! just send again the ack message
+        if let Some(active_qp) = duplicate {
             warn!(
                 "Remote QPN {} from {} already connected. Sending new ACK",
                 remote_info.qp_num, peer_addr
             );
-            self.send_reply(
-                &qp_ctx.local_info,
-                &qp_ctx.remote_info,
+            Self::send_reply(
+                &self.socket,
+                &active_qp.ctx.local_info,
+                &active_qp.ctx.remote_info,
                 QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
                 SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
             )?;
 
             Ok(None)
         } else {
-            // new QP connection request
-            let pending_qp = QpState::PendingPassive {
+            let pending_qp = PendingQp::Passive {
                 remote_info,
                 reply_addr: SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
             };
 
-            // insert it in the pending requests
             if self
                 .pending
                 .insert((peer_addr.ip(), qp_msg.loc_qpn), pending_qp)
@@ -354,37 +281,48 @@ impl ConnectionManager {
         remote_qpn: u32,
         local_info: &QpConnectionInfo,
     ) -> Result<(), ConnectionError> {
-        // remove the request from pending
-        let state = self.pending.remove(&(peer_ip, remote_qpn)).ok_or_else(|| {
+        let pending = self.pending.remove(&(peer_ip, remote_qpn)).ok_or_else(|| {
             ConnectionError::Generic(format!(
                 "Connection request ({}, {}) not found in pending",
                 peer_ip, remote_qpn
             ))
         })?;
 
+        // extract remote info from the pending passive QP
+        let PendingQp::Passive {
+            remote_info,
+            reply_addr,
+        } = pending
+        else {
+            return Err(ConnectionError::Protocol(
+                "expected passive pending QP".into(),
+            ));
+        };
+
         info!(
             "Completing connection handshake with {}. Remote QPN={}, local QPN={}",
             peer_ip, remote_qpn, local_info.qp_num
         );
 
-        // send ACK with local QP info
-        let remote_info = state.remote_info().ok_or(ConnectionError::Protocol(
-            "Failed to get remote info from current QP state".into(),
-        ))?;
-
-        self.send_reply(
+        Self::send_reply(
+            &self.socket,
             local_info,
-            remote_info,
+            &remote_info,
             QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
-            state.peer_addr(),
+            reply_addr,
         )?;
 
-        let connected_state = state
-            .on_connect_ack_sent(*local_info)
-            .map_err(|_| ConnectionError::Protocol("Invalid transition".into()))?;
-
-        // store it in the active QPs
-        self.qps.insert(local_info.qp_num, connected_state);
+        self.qps.insert(
+            local_info.qp_num,
+            ActiveQp::new(
+                QpPhase::Connected,
+                QpContext {
+                    peer_addr: reply_addr,
+                    local_info: *local_info,
+                    remote_info,
+                },
+            ),
+        );
 
         Ok(())
     }
@@ -394,7 +332,6 @@ impl ConnectionManager {
         qp_msg: &QpMessage,
         peer_addr: &SocketAddr,
     ) -> Result<Option<CmEvent>, ConnectionError> {
-        // local qpn (passive-view) is stored in the remote info (active-view)
         let local_qpn = qp_msg.rem_qpn;
         let remote_qpn = qp_msg.loc_qpn;
 
@@ -403,148 +340,83 @@ impl ConnectionManager {
             peer_addr, remote_qpn, local_qpn
         );
 
-        let Some(qp_state) = self.qps.remove(&local_qpn) else {
-            // No local qp!
+        let Some(active_qp) = self.qps.get_mut(&local_qpn) else {
             warn!("Local QPN={} doesn't exist. Ignoring request.", local_qpn);
             let (local_info, remote_info) = self.get_qp_info(qp_msg);
-            self.send_reply(
+            Self::send_reply(
+                &self.socket,
                 &local_info,
                 &remote_info,
                 QpFlags::new(RequestType::CloseQp, AckType::NoQp, true),
                 SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
             )?;
-
             return Ok(None);
         };
 
-        match qp_state.on_close_received() {
-            Ok(closing_qp_state) => {
-                // valid transition, close the QP
-                // ...
-                self.qps.insert(local_qpn, closing_qp_state);
-            }
-            Err(e) => {
-                // invalid transition, e.g. from Closing->Closing check for it
-                // ...
-                self.qps.insert(local_qpn, qp_state);
-            }
+        // validate QPN mapping (remote and expected remote)
+        if active_qp.ctx.remote_info.qp_num != remote_qpn {
+            warn!(
+                "Requested to close local QPN={}, but remote QPN={} doesn't match (expected {}). Sending NAK.",
+                local_qpn, remote_qpn, active_qp.ctx.remote_info.qp_num
+            );
+            Self::send_reply(
+                &self.socket,
+                &active_qp.ctx.local_info,
+                &active_qp.ctx.remote_info,
+                QpFlags::new(RequestType::CloseQp, AckType::NAck, true),
+                SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
+            )?;
+            return Ok(None);
         }
 
-        match self.qps.remove(&local_qpn) {
-            Some(QpState::Connected {
-                peer_addr,
-                local_info,
-                remote_info,
-            }) => {
-                // The QP exists, check if the remote value is correct
-                if remote_info.qp_num == remote_qpn {
-                    // change the state to closing
-                    self.qps.insert(
-                        local_qpn,
-                        QpState::Closing {
-                            peer_addr,
-                            local_info,
-                            remote_info,
-                        },
-                    );
-
-                    Ok(Some(CmEvent::CloseQp {
-                        peer_ip: peer_addr.ip(),
-                        local_qpn,
-                        remote_qpn,
-                    }))
-                } else {
-                    // wrong local QP, send nak
-                    warn!("Wrong local QPN={local_qpn}. Sending NAK.");
-
-                    self.qps.insert(
-                        local_qpn,
-                        QpState::Connected {
-                            peer_addr,
-                            local_info,
-                            remote_info,
-                        },
-                    );
-                    self.send_reply(
-                        &local_info,
-                        &remote_info,
-                        QpFlags::new(RequestType::CloseQp, AckType::NAck, true),
-                        SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
-                    )?;
-                    Ok(None)
-                }
-            }
-            Some(QpState::Closing {
-                peer_addr,
-                local_info,
-                remote_info,
-            }) => {
-                // Qp is already in closing state, ignore request
-                warn!(
-                    "Local QPN={} already in Closing state. Ignoring request.",
-                    local_info.qp_num
-                );
-                self.qps.insert(
-                    local_qpn,
-                    QpState::Closing {
-                        peer_addr,
-                        local_info,
-                        remote_info,
-                    },
-                );
-                Ok(None)
-            }
-            None => {
-                // No qp!
-                warn!("Local QPN={} doesn't exist. Ignoring request.", local_qpn);
-                let (local_info, remote_info) = self.get_qp_info(qp_msg);
-                self.send_reply(
-                    &local_info,
-                    &remote_info,
-                    QpFlags::new(RequestType::CloseQp, AckType::NoQp, true),
-                    SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
-                )?;
-
-                Ok(None)
-            }
+        // duplicate close: already closing, just ignore for now
+        if active_qp.phase == QpPhase::Closing {
+            warn!(
+                "QPN={} already closing, duplicate close. Ignoring.",
+                local_qpn
+            );
+            return Ok(None);
         }
+
+        // finally transition to closing
+        active_qp.transition_to_closing()?;
+        let peer_ip = active_qp.ctx.peer_addr.ip();
+
+        Ok(Some(CmEvent::CloseQp {
+            peer_ip,
+            local_qpn,
+            remote_qpn,
+        }))
     }
 
     /// Called by the application after the local QP has been closed to signal the remote
     pub fn ack_close_qp(&mut self, local_qpn: u32) -> Result<(), ConnectionError> {
-        match self.qps.remove(&local_qpn) {
-            Some(QpState::Closing {
-                peer_addr,
-                local_info,
-                remote_info,
-            }) => {
-                self.send_reply(
-                    &local_info,
-                    &remote_info,
-                    QpFlags::new(RequestType::CloseQp, AckType::Ack, true),
-                    peer_addr,
-                )?;
+        let Some(aqp) = self.qps.remove(&local_qpn) else {
+            return Err(ConnectionError::Generic(
+                "requested close QP ack, but the QP doesn't exist".to_string(),
+            ));
+        };
 
-                Ok(())
-            }
-            Some(other) => {
-                // wrong state, put it back but return an error
-                self.qps.insert(local_qpn, other);
-                Err(ConnectionError::Generic(
-                    "Requested to delete QP in the wrong state".to_string(),
-                ))
-            }
-            None => {
-                // this should not be possible, the presence of the QP has been checked in handle_close_qp.
-                Err(ConnectionError::Generic(
-                    "requested close QP ack, but the QP doesn't exist".to_string(),
-                ))
-            }
+        if aqp.phase != QpPhase::Closing {
+            self.qps.insert(local_qpn, aqp);
+            return Err(ConnectionError::Protocol(
+                "requested to ack close QP, but it is not in Closing state".to_string(),
+            ));
         }
+
+        Self::send_reply(
+            &self.socket,
+            &aqp.ctx.local_info,
+            &aqp.ctx.remote_info,
+            QpFlags::new(RequestType::CloseQp, AckType::Ack, true),
+            aqp.ctx.peer_addr,
+        )?;
+
+        Ok(())
     }
 
     fn send_reply(
-        &self,
+        socket: &UdpSocket,
         local_info: &QpConnectionInfo,
         remote_info: &QpConnectionInfo,
         qp_flags: QpFlags,
@@ -562,52 +434,46 @@ impl ConnectionManager {
             rem_rkey: remote_info.rkey,
             rem_base_addr: remote_info.addr,
             rem_ip: ipv4_from_gid(&remote_info.gid),
-            udp_port: self.socket.local_addr()?.port(),
+            udp_port: socket.local_addr()?.port(),
             ..Default::default()
         };
 
-        self.socket.send_to(&reply_qp_msg.pack(), dest)?;
-
+        socket.send_to(&reply_qp_msg.pack(), dest)?;
         Ok(())
     }
 
     /// Send QP message with retry and wait for the ack packet
     fn send_and_wait_for_ack(
-        &mut self,
+        socket: &UdpSocket,
         msg: &QpMessage,
         dest: SocketAddr,
         validate: impl Fn(&QpMessage) -> bool,
         timeout: Duration,
         max_retries: u8,
     ) -> Result<QpMessage, ConnectionError> {
-        // store original socket timeout
-        let original_socket_timeout = self.socket.read_timeout()?;
-        self.socket.set_read_timeout(Some(timeout))?;
+        let original_socket_timeout = socket.read_timeout()?;
+        socket.set_read_timeout(Some(timeout))?;
 
         let mut retry_left = max_retries;
         while retry_left > 0 {
-            self.socket.send_to(&msg.pack(), dest)?;
+            socket.send_to(&msg.pack(), dest)?;
 
-            // wait for the ack reply
-            // Note: we should somehow filter for the correct message.. what about the others?
-            let (reply_qp_message, _peer_addr) = match self.recv_message() {
+            let (reply_qp_message, _peer_addr) = match Self::recv_message(socket) {
                 Ok((qp_msg, addr)) => (qp_msg, addr),
                 Err(err) => match err {
                     ConnectionError::Timeout => {
-                        // receiver hit the timeout, decrease the retry counter and try again
                         retry_left -= 1;
                         warn!("Timeout while waiting for ACK, {} retries left", retry_left);
                         continue;
                     }
                     _ => {
-                        // Actual error, return it
                         return Err(err);
                     }
                 },
             };
 
             if validate(&reply_qp_message) {
-                self.socket.set_read_timeout(original_socket_timeout)?;
+                socket.set_read_timeout(original_socket_timeout)?;
                 return Ok(reply_qp_message);
             } else {
                 retry_left -= 1;
@@ -620,8 +486,7 @@ impl ConnectionManager {
             }
         }
 
-        // exhausted retries, return a timeout error
-        self.socket.set_read_timeout(original_socket_timeout)?;
+        socket.set_read_timeout(original_socket_timeout)?;
         Err(ConnectionError::Timeout)
     }
 
@@ -644,11 +509,27 @@ impl ConnectionManager {
             ..Default::default()
         };
 
+        let pending_qp = PendingQp::Active {
+            _local_info: *local_info,
+            _peer_addr: remote_addr,
+        };
+        if self
+            .pending
+            .insert((remote_addr.ip(), local_info.qp_num), pending_qp)
+            .is_some()
+        {
+            warn!(
+                "Duplicated connection request: peer addr={}, local qpn={}",
+                remote_addr.ip(),
+                local_info.qp_num
+            );
+        }
+
         info!(
             "Sending OpenQP to {}, local QPN={}",
             remote_addr, local_info.qp_num
         );
-        // Try up to max_retries times to open a QP, with a timeout
+
         let validate_ack = |reply: &QpMessage| -> bool {
             (reply.flags.request_type() == Ok(RequestType::OpenQp))
                 && (reply.flags.ack_type() == Ok(AckType::Ack))
@@ -656,7 +537,8 @@ impl ConnectionManager {
                 && (reply.rem_qpn == local_info.qp_num)
                 && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
         };
-        let reply_qp_message = self.send_and_wait_for_ack(
+        let reply_qp_message = Self::send_and_wait_for_ack(
+            &self.socket,
             &open_qp_message,
             remote_addr,
             validate_ack,
@@ -664,7 +546,6 @@ impl ConnectionManager {
             max_retries,
         )?;
 
-        // valid ack, parse remote infos
         let remote_info = QpConnectionInfo {
             qp_num: reply_qp_message.loc_qpn,
             psn: reply_qp_message.loc_psn,
@@ -673,13 +554,20 @@ impl ConnectionManager {
             gid: gid_from_ipv4(reply_qp_message.loc_ip),
         };
 
+        // remove current qp from pending
+        self.pending.remove(&(remote_addr.ip(), local_info.qp_num));
+
+        // ... and create the new ActiveQP
         self.qps.insert(
             local_info.qp_num,
-            QpState::Connected {
-                peer_addr: remote_addr,
-                local_info: *local_info,
-                remote_info,
-            },
+            ActiveQp::new(
+                QpPhase::Connected,
+                QpContext {
+                    peer_addr: remote_addr,
+                    local_info: *local_info,
+                    remote_info,
+                },
+            ),
         );
 
         info!(
@@ -690,76 +578,66 @@ impl ConnectionManager {
         Ok(remote_info)
     }
 
+    pub fn start_qp(&mut self, local_qpn: u32) -> Result<(), ConnectionError> {
+        let qp = self
+            .qps
+            .get_mut(&local_qpn)
+            .ok_or_else(|| ConnectionError::Generic(format!("QP {} not found", local_qpn)))?;
+        qp.transition_to_running()
+    }
+
     pub fn close_qp(
         &mut self,
         local_qpn: u32,
         request_timeout: Duration,
         max_retries: u8,
     ) -> Result<(), ConnectionError> {
-        match self.qps.remove(&local_qpn) {
-            Some(QpState::Connected {
-                peer_addr,
-                local_info,
-                remote_info,
-            }) => {
-                // send close message, retry if needed
-                let close_qp_msg = build_qp_message(
-                    QpFlags::new(RequestType::CloseQp, AckType::Null, false),
-                    &local_info,
-                    &remote_info,
-                    self.cm_port()?,
-                );
+        info!("Requested to close local QPN {local_qpn}");
 
-                info!(
-                    "Sending closeQP to {}, local QPN={}, remote QPN={}",
-                    peer_addr, local_info.qp_num, remote_info.qp_num
-                );
+        let aqp = self.qps.get_mut(&local_qpn).ok_or_else(|| {
+            ConnectionError::Generic("requested to close QP, but it doesn't exist".into())
+        })?;
 
-                let validate_ack = |reply: &QpMessage| -> bool {
-                    (reply.flags.request_type() == Ok(RequestType::CloseQp))
-                        && (reply.flags.ack_type() == Ok(AckType::Ack))
-                        && (reply.flags.ack_valid())
-                        && (reply.rem_qpn == local_info.qp_num)
-                        && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
-                };
-                let _reply_qp_message = self
-                    .send_and_wait_for_ack(
-                        &close_qp_msg,
-                        peer_addr,
-                        validate_ack,
-                        request_timeout,
-                        max_retries,
-                    )
-                    .inspect_err(|_err| {
-                        // timed out/actual error, reinsert the QP and return the err
-                        self.qps.insert(
-                            local_qpn,
-                            QpState::Connected {
-                                peer_addr,
-                                local_info,
-                                remote_info,
-                            },
-                        );
-                    })?;
+        aqp.transition_to_closing()?;
 
-                info!("Closed remote QPN={}", remote_info.qp_num);
+        // copy small Copy values for the closure and send_and_wait_for_ack
+        let local_info = aqp.ctx.local_info;
+        let remote_info = aqp.ctx.remote_info;
+        let peer_addr = aqp.ctx.peer_addr;
 
-                Ok(())
-            }
-            Some(other) => {
-                // wrong state, put it back but return an error
-                self.qps.insert(local_qpn, other);
-                Err(ConnectionError::Generic(
-                    "requested to close QP, but it is in the wrong state".to_string(),
-                ))
-            }
-            None => {
-                // Requesting to close a QP that doesn't exist
-                Err(ConnectionError::Generic(
-                    "requested close QP ack, but the QP doesn't exist".to_string(),
-                ))
-            }
-        }
+        let close_qp_msg = build_qp_message(
+            QpFlags::new(RequestType::CloseQp, AckType::Null, false),
+            &local_info,
+            &remote_info,
+            self.socket.local_addr()?.port(),
+        );
+
+        info!(
+            "Sending closeQP to {}, local QPN={}, remote QPN={}",
+            peer_addr, local_info.qp_num, remote_info.qp_num
+        );
+
+        let validate_ack = |reply: &QpMessage| -> bool {
+            (reply.flags.request_type() == Ok(RequestType::CloseQp))
+                && (reply.flags.ack_type() == Ok(AckType::Ack))
+                && (reply.flags.ack_valid())
+                && (reply.rem_qpn == local_info.qp_num)
+                && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
+        };
+
+        Self::send_and_wait_for_ack(
+            &self.socket,
+            &close_qp_msg,
+            peer_addr,
+            validate_ack,
+            request_timeout,
+            max_retries,
+        )?;
+
+        self.qps.remove(&local_qpn);
+        info!("Closed remote QPN={}", remote_info.qp_num);
+
+        Ok(())
     }
 
     /// Extract connection infos from a QP msg
@@ -868,29 +746,34 @@ mod test {
         let mut sender_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
         let mut receiver_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
 
-        // manually insert the QPs connected
         sender_cm.qps.insert(
             sender_info.qp_num,
-            QpState::Connected {
-                peer_addr: SocketAddr::new(
-                    receiver_cm.socket.local_addr()?.ip(),
-                    receiver_cm.cm_port()?,
-                ),
-                local_info: sender_info,
-                remote_info: receiver_info,
-            },
+            ActiveQp::new(
+                QpPhase::Connected,
+                QpContext {
+                    peer_addr: SocketAddr::new(
+                        receiver_cm.socket.local_addr()?.ip(),
+                        receiver_cm.cm_port()?,
+                    ),
+                    local_info: sender_info,
+                    remote_info: receiver_info,
+                },
+            ),
         );
 
         receiver_cm.qps.insert(
             receiver_info.qp_num,
-            QpState::Connected {
-                peer_addr: SocketAddr::new(
-                    sender_cm.socket.local_addr()?.ip(),
-                    sender_cm.cm_port()?,
-                ),
-                local_info: receiver_info,
-                remote_info: sender_info,
-            },
+            ActiveQp::new(
+                QpPhase::Connected,
+                QpContext {
+                    peer_addr: SocketAddr::new(
+                        sender_cm.socket.local_addr()?.ip(),
+                        sender_cm.cm_port()?,
+                    ),
+                    local_info: receiver_info,
+                    remote_info: sender_info,
+                },
+            ),
         );
 
         Ok((sender_cm, receiver_cm))
@@ -999,16 +882,12 @@ mod test {
         let qp_state = cm.qps.get(&receiver_info.qp_num);
         assert!(qp_state.is_some());
 
-        if let Some(QpState::Connected {
-            peer_addr: _,
-            local_info,
-            remote_info,
-        }) = qp_state
-        {
-            validate_qp_connection_info(local_info, &receiver_info);
-            validate_qp_connection_info(remote_info, &sender_info);
+        if let Some(active_qp) = qp_state {
+            assert_eq!(active_qp.phase, QpPhase::Connected);
+            validate_qp_connection_info(&active_qp.ctx.local_info, &receiver_info);
+            validate_qp_connection_info(&active_qp.ctx.remote_info, &sender_info);
         } else {
-            panic!("expected QpState::Connected")
+            panic!("expected ActiveQp")
         }
     }
 
@@ -1112,21 +991,11 @@ mod test {
         let sender_qp_state = sender_cm.qps.get(&sender_info.qp_num);
         assert!(sender_qp_state.is_some());
 
-        if let (
-            Some(QpState::Connected {
-                peer_addr: _,
-                local_info: recv_local,
-                remote_info: recv_remote,
-            }),
-            Some(QpState::Connected {
-                peer_addr: _,
-                local_info: send_local,
-                remote_info: send_remote,
-            }),
-        ) = (receiver_qp_state, sender_qp_state)
-        {
-            assert_eq!(recv_local, send_remote);
-            assert_eq!(send_local, recv_remote);
+        if let (Some(recv_qp), Some(send_qp)) = (receiver_qp_state, sender_qp_state) {
+            assert_eq!(recv_qp.phase, QpPhase::Connected);
+            assert_eq!(send_qp.phase, QpPhase::Connected);
+            assert_eq!(recv_qp.ctx.local_info, send_qp.ctx.remote_info);
+            assert_eq!(send_qp.ctx.local_info, recv_qp.ctx.remote_info);
         } else {
             panic!("Expected QPs to be connected!")
         }

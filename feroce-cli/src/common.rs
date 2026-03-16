@@ -168,6 +168,11 @@ where
         );
     }
 
+    // start signal: dummy for now, it can be external in the future
+    for qp_num in qps.keys() {
+        cm.start_qp(*qp_num)?;
+    }
+
     // monitoring loop
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
