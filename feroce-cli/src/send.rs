@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
-use feroce::rdma::{
-    self,
-    buffer_pool::{BufferHandle, BufferPool},
-    device::{CompletionChannel, QueuePair},
+use feroce::{
+    rdma::{
+        self,
+        buffer_pool::{BufferHandle, BufferPool},
+        device::{CompletionChannel, QueuePair},
+    },
+    runtime::RdmaEndpoint,
 };
 use log::{debug, error};
 
 use crate::{
     CmOpts, RdmaOpts, SenderOpts,
-    common::{CmRole, PreparedQP, run_cm_active, run_cm_passive},
+    common::{CmRole, run_cm_active, run_cm_passive},
     stats::StreamStats,
 };
 
@@ -20,18 +23,18 @@ pub fn run(
     send_opts: &SenderOpts,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
-        let stats = Arc::new(StreamStats::new(stream_id, prepared_qp.qp.qp_num()));
+    let spawn_poller = |rdma_endpoint: RdmaEndpoint, stream_id: u32| {
+        let stats = Arc::new(StreamStats::new(stream_id, rdma_endpoint.qp.qp_num()));
 
         let handle = std::thread::spawn({
             let num_msgs = send_opts.num_msgs;
-            let qp = Arc::clone(&prepared_qp.qp);
+            let qp = Arc::clone(&rdma_endpoint.qp);
             let stats = Arc::clone(&stats);
             move || {
                 if let Err(e) = poller_thread(
                     qp,
-                    prepared_qp.buffer_pool,
-                    prepared_qp.comp_channel,
+                    rdma_endpoint.buffer_pool,
+                    rdma_endpoint.comp_channel,
                     stats,
                     num_msgs,
                 ) {

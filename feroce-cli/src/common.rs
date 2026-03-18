@@ -11,13 +11,8 @@ use std::{
 
 use feroce::{
     connection::{CmEvent, ConnectionError, ConnectionManager},
-    protocol::QpConnectionInfo,
-    rdma::{
-        self,
-        buffer_pool::BufferPool,
-        device::{CompletionChannel, Device, QueuePair},
-        ibv_mtu,
-    },
+    rdma::device::{Device, QueuePair},
+    runtime::{RdmaConfig, RdmaEndpoint, connect_endpoint, setup_endpoint},
 };
 use log::{error, info};
 
@@ -50,67 +45,15 @@ pub fn build_cm_role(cm_opts: &CmOpts, active: bool) -> Result<CmRole, String> {
     }
 }
 
-// Create and init a QP
-pub struct PreparedQP {
-    pub qp: Arc<QueuePair>,
-    pub comp_channel: CompletionChannel,
-    pub buffer_pool: BufferPool,
-    pub local_info: QpConnectionInfo,
-}
-
-pub fn setup_qp(
-    device: &Device,
-    rdma_opts: &RdmaOpts,
-) -> Result<PreparedQP, Box<dyn std::error::Error>> {
-    let comp_channel = CompletionChannel::create(device)?;
-
-    // create local QP
-    let pd = Arc::new(device.alloc_pd()?);
-    let cq = Arc::new(device.create_cq_with_channel(rdma_opts.num_buf as i32, &comp_channel)?);
-
-    let qp = Arc::new(QueuePair::create_qp(
-        Arc::clone(&pd),
-        Arc::clone(&cq),
-        rdma_opts.num_buf as u32,
-        1,
-        rdma::ibv_qp_type::IBV_QPT_RC,
-    )?);
-
-    let loc_gid = device.query_gid(rdma_opts.port_num, rdma_opts.gid_index)?;
-    let buffer_pool = BufferPool::new(rdma_opts.num_buf, rdma_opts.buf_size, &pd)?;
-
-    // register local infos
-    let local_info = QpConnectionInfo {
-        qp_num: qp.qp_num(),
-        psn: 0,
-        rkey: buffer_pool.rkey(),
-        addr: buffer_pool.addr(),
-        gid: loc_gid.raw,
-    };
-    qp.modify_to_init(rdma_opts.port_num)?;
-
-    Ok(PreparedQP {
-        qp,
-        comp_channel,
-        buffer_pool,
-        local_info,
-    })
-}
-
-pub fn connect_qp(
-    prepared_qp: &PreparedQP,
-    remote_info: &QpConnectionInfo,
-    rdma_opts: &RdmaOpts,
-    active_path_mtu: ibv_mtu,
-) -> Result<(), Box<dyn std::error::Error>> {
-    prepared_qp.qp.modify_to_rtr(
-        remote_info,
-        rdma_opts.gid_index as u8,
-        rdma_opts.port_num,
-        active_path_mtu,
-    )?;
-    prepared_qp.qp.modify_to_rts(remote_info.psn)?;
-    Ok(())
+impl From<&RdmaOpts> for RdmaConfig {
+    fn from(opts: &RdmaOpts) -> Self {
+        RdmaConfig {
+            port_num: opts.port_num,
+            gid_index: opts.gid_index,
+            num_buf: opts.num_buf,
+            buf_size: opts.buf_size,
+        }
+    }
 }
 
 struct QpContext {
@@ -127,7 +70,7 @@ pub fn run_cm_active<F>(
     mut spawn_poller: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut(PreparedQP, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    F: FnMut(RdmaEndpoint, u32) -> (JoinHandle<()>, Arc<StreamStats>),
 {
     let device = Device::open(&rdma_opts.rdma_device)?;
     let active_path_mtu = device
@@ -140,23 +83,25 @@ where
     let mut qps: HashMap<u32, QpContext> = HashMap::new();
     let mut cm = ConnectionManager::new(cm_opts.bind_addr, cm_opts.cm_port)?;
 
+    let rdma_cfg = RdmaConfig::from(rdma_opts);
+
     for stream_id in 0..num_streams {
-        let prepared_qp = setup_qp(&device, rdma_opts)?;
-        // keep a reference, prepared_qp will be moved to the poller thread
-        let qp = Arc::clone(&prepared_qp.qp);
+        let rdma_endpoint = setup_endpoint(&device, &rdma_cfg)?;
+        // keep a reference, rdma_endpoint will be moved to the poller thread
+        let qp = Arc::clone(&rdma_endpoint.qp);
 
         // connect the CM to gather remote info
         let remote_info = cm.connect(
             remote_addr,
-            &prepared_qp.local_info,
+            &rdma_endpoint.local_info,
             Duration::from_secs(2),
             2,
         )?;
 
-        connect_qp(&prepared_qp, &remote_info, rdma_opts, active_path_mtu)?;
+        connect_endpoint(&rdma_endpoint, &remote_info, &rdma_cfg, active_path_mtu)?;
 
         // spawn the threads
-        let (poller_handle, stats) = spawn_poller(prepared_qp, stream_id);
+        let (poller_handle, stats) = spawn_poller(rdma_endpoint, stream_id);
 
         qps.insert(
             qp.qp_num(),
@@ -216,7 +161,7 @@ pub fn run_cm_passive<F>(
     mut spawn_poller: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut(PreparedQP, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    F: FnMut(RdmaEndpoint, u32) -> (JoinHandle<()>, Arc<StreamStats>),
 {
     let device = Device::open(&rdma_opts.rdma_device)?;
     let active_path_mtu = device
@@ -228,6 +173,8 @@ where
 
     let mut qps: HashMap<u32, QpContext> = HashMap::new();
     let mut cm = ConnectionManager::new(cm_opts.bind_addr, cm_opts.cm_port)?;
+
+    let rdma_cfg = RdmaConfig::from(rdma_opts);
 
     let mut stream_id = 0;
 
@@ -252,16 +199,16 @@ where
                     remote_qpn,
                     remote_info,
                 } => {
-                    let prepared_qp = setup_qp(&device, rdma_opts)?;
-                    let qp = Arc::clone(&prepared_qp.qp);
+                    let rdma_endpoint = setup_endpoint(&device, &rdma_cfg)?;
+                    let qp = Arc::clone(&rdma_endpoint.qp);
 
                     // transition QP to RTS
-                    connect_qp(&prepared_qp, &remote_info, rdma_opts, active_path_mtu)?;
+                    connect_endpoint(&rdma_endpoint, &remote_info, &rdma_cfg, active_path_mtu)?;
 
-                    cm.set_local_info(peer_ip, remote_qpn, &prepared_qp.local_info)?;
+                    cm.set_local_info(peer_ip, remote_qpn, &rdma_endpoint.local_info)?;
 
                     // spawn the threads
-                    let (poller_handle, stats) = spawn_poller(prepared_qp, stream_id);
+                    let (poller_handle, stats) = spawn_poller(rdma_endpoint, stream_id);
                     // maybe get stream id from somewhere? e.g. from the active side.
                     stream_id += 1;
 
