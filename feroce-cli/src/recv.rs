@@ -1,33 +1,25 @@
-use feroce::rdma::{
-    self,
-    buffer_pool::BufferPool,
-    device::{CompletionChannel, QueuePair},
-};
+use feroce::rdma;
+use feroce::{BufferPool, CompletionChannel, QueuePair, RdmaEndpoint};
 use log::{debug, error};
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
-use crate::{
-    CmOpts, RdmaOpts,
-    common::{CmRole, PreparedQP, run_cm_active, run_cm_passive},
-    stats::StreamStats,
-};
+use crate::{CmOpts, RdmaOpts, common::SessionRunner, stats::StreamStats};
 
-pub fn run(
-    cm_opts: &CmOpts,
-    cm_role: &CmRole,
-    rdma_opts: &RdmaOpts,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(cm_opts: &CmOpts, rdma_opts: &RdmaOpts) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller = |prepared_qp: PreparedQP, stream_id: u32| {
-        let stats = Arc::new(StreamStats::new(stream_id, prepared_qp.qp.qp_num()));
+    let spawn_poller = |rdma_endpoint: RdmaEndpoint, stream_id: u32| {
+        let stats = Arc::new(StreamStats::new(stream_id, rdma_endpoint.qp.qp_num()));
 
         let handle = std::thread::spawn({
-            let qp = Arc::clone(&prepared_qp.qp);
+            let qp = Arc::clone(&rdma_endpoint.qp);
             let stats = Arc::clone(&stats);
             move || {
-                if let Err(e) =
-                    poller_thread(qp, prepared_qp.buffer_pool, prepared_qp.comp_channel, stats)
-                {
+                if let Err(e) = poller_thread(
+                    qp,
+                    rdma_endpoint.buffer_pool,
+                    rdma_endpoint.comp_channel,
+                    stats,
+                ) {
                     error!("poller thread error: {}", e);
                 }
             }
@@ -35,16 +27,17 @@ pub fn run(
 
         (handle, stats)
     };
-    match cm_role {
-        CmRole::Active {
-            remote_addr,
-            num_streams,
-        } => {
-            run_cm_active(cm_opts, rdma_opts, *remote_addr, *num_streams, spawn_poller)?;
-        }
-        CmRole::Passive => {
-            run_cm_passive(cm_opts, rdma_opts, spawn_poller)?;
-        }
+
+    let mut runner = SessionRunner::new(cm_opts, rdma_opts, spawn_poller)?;
+
+    if cm_opts.active {
+        let remote_addr = SocketAddr::new(
+            cm_opts.remote_addr.ok_or("--remote-addr required")?,
+            cm_opts.remote_port.ok_or("--remote-port required")?,
+        );
+        runner.connect_and_run(remote_addr, cm_opts.num_streams)?;
+    } else {
+        runner.listen_and_run()?;
     }
 
     Ok(())
