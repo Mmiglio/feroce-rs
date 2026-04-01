@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use feroce::rdma::buffer_pool::CpuAllocator;
 use std::net::IpAddr;
 
 mod common;
@@ -98,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Recv { cm_opts, rdma_opts } => {
-            recv::run(&cm_opts, &rdma_opts)?;
+            recv::run(&cm_opts, &rdma_opts, CpuAllocator)?;
             Ok(())
         }
         Commands::Send {

@@ -1,13 +1,18 @@
 use feroce::rdma;
+use feroce::rdma::buffer_pool::BufferAllocator;
 use feroce::{BufferPool, CompletionChannel, QueuePair, RdmaEndpoint};
 use log::{debug, error};
 use std::{net::SocketAddr, sync::Arc};
 
 use crate::{CmOpts, RdmaOpts, common::SessionRunner, stats::StreamStats};
 
-pub fn run(cm_opts: &CmOpts, rdma_opts: &RdmaOpts) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run<A: BufferAllocator>(
+    cm_opts: &CmOpts,
+    rdma_opts: &RdmaOpts,
+    allocator: A,
+) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller = |rdma_endpoint: RdmaEndpoint, stream_id: u32| {
+    let spawn_poller = |rdma_endpoint: RdmaEndpoint<A>, stream_id: u32| {
         let stats = Arc::new(StreamStats::new(stream_id, rdma_endpoint.qp.qp_num()));
 
         let handle = std::thread::spawn({
@@ -28,7 +33,7 @@ pub fn run(cm_opts: &CmOpts, rdma_opts: &RdmaOpts) -> Result<(), Box<dyn std::er
         (handle, stats)
     };
 
-    let mut runner = SessionRunner::new(cm_opts, rdma_opts, spawn_poller)?;
+    let mut runner = SessionRunner::new(cm_opts, rdma_opts, allocator, spawn_poller)?;
 
     if cm_opts.active {
         let remote_addr = SocketAddr::new(
@@ -43,9 +48,9 @@ pub fn run(cm_opts: &CmOpts, rdma_opts: &RdmaOpts) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-fn poller_thread(
+fn poller_thread<A: BufferAllocator>(
     qp: Arc<QueuePair>,
-    buffer_pool: BufferPool,
+    buffer_pool: BufferPool<A>,
     channel: CompletionChannel,
     stats: Arc<StreamStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
