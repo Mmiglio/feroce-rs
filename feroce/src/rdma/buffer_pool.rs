@@ -13,7 +13,7 @@ pub trait BufferAllocator: Send + 'static {
         &self,
         pd: &ProtectionDomain,
         size: usize,
-    ) -> Result<(Self::Storage, MemoryRegion), String>;
+    ) -> Result<(Self::Storage, MemoryRegion, u64), String>;
 }
 
 pub struct CpuAllocator;
@@ -24,14 +24,15 @@ impl BufferAllocator for CpuAllocator {
         &self,
         pd: &ProtectionDomain,
         size: usize,
-    ) -> Result<(Self::Storage, MemoryRegion), String> {
+    ) -> Result<(Self::Storage, MemoryRegion, u64), String> {
         let mut data = vec![0u8; size];
+        let base_addr = data.as_ptr() as u64;
         let access_flags = rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | rdma::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING;
         let mr = MemoryRegion::register(pd, &mut data, access_flags)?;
 
-        Ok((data, mr))
+        Ok((data, mr, base_addr))
     }
 }
 
@@ -52,6 +53,7 @@ pub struct BufferPool<A: BufferAllocator> {
     num_buf: usize,
     buf_size: usize,
 
+    base_addr: u64,
     mr: MemoryRegion,
     _storage: A::Storage,
     free_bufs: VecDeque<usize>,
@@ -66,13 +68,13 @@ impl<A: BufferAllocator> BufferPool<A> {
         pd: &ProtectionDomain,
         allocator: &A,
     ) -> Result<Self, String> {
-        let (storage, mr) = allocator.alloc_and_register(pd, num_buf * buf_size)?;
+        let (storage, mr, base_addr) = allocator.alloc_and_register(pd, num_buf * buf_size)?;
 
         let free_bufs = VecDeque::from_iter(0..num_buf);
 
         debug!(
             "Created BufferPool: addr={:p}, {} buffers x {} bytes = {} MiB.",
-            mr.addr() as *mut u8,
+            base_addr as *mut u8,
             num_buf,
             buf_size,
             (num_buf * buf_size) as f64 / 1024.0 / 1024.0
@@ -81,6 +83,7 @@ impl<A: BufferAllocator> BufferPool<A> {
         Ok(BufferPool {
             num_buf,
             buf_size,
+            base_addr,
             mr,
             _storage: storage,
             free_bufs,
@@ -108,7 +111,8 @@ impl<A: BufferAllocator> BufferPool<A> {
     }
 
     pub fn addr(&self) -> u64 {
-        self.mr.addr()
+        //self.mr.addr()
+        self.base_addr
     }
 
     pub fn get_handle(&self, index: usize) -> BufferHandle {
@@ -118,7 +122,7 @@ impl<A: BufferAllocator> BufferPool<A> {
             index,
             self.num_buf
         );
-        let addr = unsafe { (self.mr.addr() as *mut u8).add(index * self.buf_size) };
+        let addr = unsafe { (self.base_addr as *mut u8).add(index * self.buf_size) };
         BufferHandle {
             index,
             addr,

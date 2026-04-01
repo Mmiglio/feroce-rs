@@ -63,6 +63,13 @@ struct SenderOpts {
     num_msgs: u64,
 }
 
+#[derive(Args)]
+struct ReceiverOpts {
+    /// Receive on GPU memory
+    #[arg(long)]
+    gpu: bool,
+}
+
 #[derive(Subcommand)]
 #[command(version, about, long_about = None)]
 enum Commands {
@@ -72,6 +79,8 @@ enum Commands {
         cm_opts: CmOpts,
         #[command(flatten)]
         rdma_opts: RdmaOpts,
+        #[command(flatten)]
+        receiver_opts: ReceiverOpts,
     },
     /// FEROCE sender
     Send {
@@ -98,8 +107,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Recv { cm_opts, rdma_opts } => {
-            recv::run(&cm_opts, &rdma_opts, CpuAllocator)?;
+        Commands::Recv {
+            cm_opts,
+            rdma_opts,
+            receiver_opts,
+        } => {
+            // pick the selected allocator
+            if receiver_opts.gpu {
+                #[cfg(feature = "gpu")]
+                {
+                    use feroce::rdma::gpu::GpuAllocator;
+
+                    let allocator = GpuAllocator::new(0)?;
+                    recv::run(&cm_opts, &rdma_opts, allocator)?;
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    return Err("--gpu requires building with --features gpu".into());
+                }
+            } else {
+                recv::run(&cm_opts, &rdma_opts, CpuAllocator)?;
+            }
             Ok(())
         }
         Commands::Send {

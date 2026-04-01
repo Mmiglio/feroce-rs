@@ -1,6 +1,8 @@
 pub mod buffer_pool;
 pub mod device;
 mod ffi;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 pub use ffi::ibv_access_flags;
 pub use ffi::ibv_mtu;

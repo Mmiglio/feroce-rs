@@ -1,0 +1,7 @@
+{
+  //"rust-analyzer.cargo.features": ["rdma-test"]
+  "rust-analyzer.cargo.features": [
+    "gpu"
+  ],
+  "rust-analyzer.check.allTargets": true,
+}

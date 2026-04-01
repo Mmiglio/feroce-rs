@@ -1,4 +1,4 @@
-fn main() {
+fn setup_ibverbs() {
     println!("cargo:rustc-link-lib=ibverbs");
 
     let header = "/usr/include/infiniband/verbs.h";
@@ -12,7 +12,7 @@ fn main() {
         );
     }
 
-    // // generate rdma bindings only if they are not present
+    // generate rdma bindings only if they are not present
     if std::path::Path::new(output).exists() {
         println!("cargo:rerun-if-changed={}", header);
         println!("cargo:rerun-if-changed={}", output);
@@ -45,4 +45,21 @@ fn main() {
     bindings
         .write_to_file(output)
         .expect("failed to write bindings");
+}
+
+#[cfg(feature = "gpu")]
+fn link_cuda() {
+    if !std::path::Path::new("/usr/lib64/libcuda.so").exists()
+        && !std::path::Path::new("/usr/local/cuda/lib64/libcuda.so").exists()
+    {
+        panic!("GPU feature enabled but libcuda.so not found. Install NVIDIA drivers.");
+    }
+    println!("cargo:rustc-link-lib=cuda");
+}
+
+fn main() {
+    setup_ibverbs();
+
+    #[cfg(feature = "gpu")]
+    link_cuda();
 }

@@ -689,6 +689,34 @@ impl MemoryRegion {
         }
     }
 
+    #[cfg(feature = "gpu")]
+    pub fn register_dmabuf(
+        pd: &ProtectionDomain,
+        offset: u64,
+        length: usize,
+        iova: u64,
+        dmabuf_fd: i32,
+        access: ffi::ibv_access_flags,
+    ) -> Result<Self, String> {
+        let mr = unsafe {
+            ffi::ibv_reg_dmabuf_mr(pd.raw(), offset, length, iova, dmabuf_fd, access.0 as i32)
+        };
+
+        if mr.is_null() {
+            Err(format!(
+                "failed to register DMA BUF MR: errno {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            debug!(
+                "Registered DMA BUF MR: addr={:#x}, len={}",
+                unsafe { (*mr).addr as u64 },
+                unsafe { (*mr).length as u32 }
+            );
+            Ok(MemoryRegion { mr })
+        }
+    }
+
     pub fn addr(&self) -> u64 {
         unsafe { (*self.mr).addr as u64 }
     }

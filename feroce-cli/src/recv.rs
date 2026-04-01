@@ -54,6 +54,9 @@ fn poller_thread<A: BufferAllocator>(
     channel: CompletionChannel,
     stats: Arc<StreamStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "gpu")]
+    feroce::rdma::gpu::init_cuda_thread(0).unwrap();
+
     // metrics
     let mut total_bytes;
     let mut total_msgs;
@@ -115,6 +118,16 @@ fn poller_thread<A: BufferAllocator>(
                     error!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
                 break 'poller_loop;
+            }
+
+            #[cfg(feature = "gpu")]
+            {
+                let mut check = [0u8; 8];
+                let handle = buffer_pool.get_handle(wce.wr_id as usize);
+                match feroce::rdma::gpu::copy_device_to_host(&mut check, handle.addr as u64) {
+                    Ok(_) => println!("GPU buffer content: {:02x?}", check),
+                    Err(e) => println!("Can't read GPU buffer (no CUDA ctx in this thread): {}", e),
+                }
             }
 
             // update metrics
