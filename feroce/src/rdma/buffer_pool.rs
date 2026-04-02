@@ -4,6 +4,38 @@ use log::debug;
 
 use crate::rdma::{self, device::MemoryRegion, device::ProtectionDomain};
 
+pub trait BufferAllocator: Send + 'static {
+    /// Backing storage type: Vec<u8> for CPU, device buffer for GPU
+    type Storage: Send + 'static;
+
+    /// allocate and register RDMA memory region
+    fn alloc_and_register(
+        &self,
+        pd: &ProtectionDomain,
+        size: usize,
+    ) -> Result<(Self::Storage, MemoryRegion, u64), String>;
+}
+
+pub struct CpuAllocator;
+impl BufferAllocator for CpuAllocator {
+    type Storage = Vec<u8>;
+
+    fn alloc_and_register(
+        &self,
+        pd: &ProtectionDomain,
+        size: usize,
+    ) -> Result<(Self::Storage, MemoryRegion, u64), String> {
+        let mut data = vec![0u8; size];
+        let base_addr = data.as_ptr() as u64;
+        let access_flags = rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | rdma::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING;
+        let mr = MemoryRegion::register(pd, &mut data, access_flags)?;
+
+        Ok((data, mr, base_addr))
+    }
+}
+
 pub struct BufferHandle {
     pub index: usize,
     pub addr: *mut u8,
@@ -17,32 +49,32 @@ pub struct BufferHandle {
 // and only one thread holds the handle at a time
 unsafe impl Send for BufferHandle {}
 
-pub struct BufferPool {
+pub struct BufferPool<A: BufferAllocator> {
     num_buf: usize,
     buf_size: usize,
 
+    base_addr: u64,
     mr: MemoryRegion,
-    data: Vec<u8>,
+    _storage: A::Storage,
     free_bufs: VecDeque<usize>,
 }
 
-unsafe impl Send for BufferPool {}
+unsafe impl<A: BufferAllocator> Send for BufferPool<A> {}
 
-impl BufferPool {
-    pub fn new(num_buf: usize, buf_size: usize, pd: &ProtectionDomain) -> Result<Self, String> {
-        let mut data = vec![0u8; num_buf * buf_size];
-
-        // register RDMA MR for the base buffer
-        let access_flags = rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | rdma::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING;
-        let mr = MemoryRegion::register(pd, &mut data, access_flags)?;
+impl<A: BufferAllocator> BufferPool<A> {
+    pub fn new(
+        num_buf: usize,
+        buf_size: usize,
+        pd: &ProtectionDomain,
+        allocator: &A,
+    ) -> Result<Self, String> {
+        let (storage, mr, base_addr) = allocator.alloc_and_register(pd, num_buf * buf_size)?;
 
         let free_bufs = VecDeque::from_iter(0..num_buf);
 
         debug!(
             "Created BufferPool: addr={:p}, {} buffers x {} bytes = {} MiB.",
-            data.as_ptr(),
+            base_addr as *mut u8,
             num_buf,
             buf_size,
             (num_buf * buf_size) as f64 / 1024.0 / 1024.0
@@ -51,8 +83,9 @@ impl BufferPool {
         Ok(BufferPool {
             num_buf,
             buf_size,
+            base_addr,
             mr,
-            data,
+            _storage: storage,
             free_bufs,
         })
     }
@@ -78,7 +111,8 @@ impl BufferPool {
     }
 
     pub fn addr(&self) -> u64 {
-        self.mr.addr()
+        //self.mr.addr()
+        self.base_addr
     }
 
     pub fn get_handle(&self, index: usize) -> BufferHandle {
@@ -88,7 +122,7 @@ impl BufferPool {
             index,
             self.num_buf
         );
-        let addr = unsafe { (self.data.as_ptr() as *mut u8).add(index * self.buf_size) };
+        let addr = unsafe { (self.base_addr as *mut u8).add(index * self.buf_size) };
         BufferHandle {
             index,
             addr,
@@ -121,7 +155,9 @@ mod test {
 
         let pd = device.alloc_pd().expect("failed to allocate PD");
 
-        let mut buf_pool = BufferPool::new(2, 128, &pd).expect("failed to create buffer pool");
+        let allocator = CpuAllocator;
+        let mut buf_pool =
+            BufferPool::new(2, 128, &pd, &allocator).expect("failed to create buffer pool");
 
         let Some(buf_handle) = buf_pool.get_buffer() else {
             panic!("expect at least one buffer")

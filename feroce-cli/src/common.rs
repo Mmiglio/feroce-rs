@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use feroce::rdma;
+use feroce::rdma::{self, buffer_pool::BufferAllocator};
 use feroce::{
     CmEvent, ConnectionError, ConnectionManager, Device, QueuePair, RdmaConfig, RdmaEndpoint,
     connect_endpoint, setup_endpoint,
@@ -35,13 +35,15 @@ struct QpContext {
     stats: Arc<StreamStats>,
 }
 
-pub struct SessionRunner<F>
+pub struct SessionRunner<F, A>
 where
-    F: FnMut(RdmaEndpoint, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    A: BufferAllocator,
+    F: FnMut(RdmaEndpoint<A>, u32) -> (JoinHandle<()>, Arc<StreamStats>),
 {
     rdma_cfg: RdmaConfig,
     device: rdma::device::Device,
     path_mtu: rdma::ibv_mtu,
+    allocator: A,
 
     cm: ConnectionManager,
     qps: HashMap<u32, QpContext>,
@@ -53,13 +55,15 @@ where
     next_stream_id: u32,
 }
 
-impl<F> SessionRunner<F>
+impl<F, A> SessionRunner<F, A>
 where
-    F: FnMut(RdmaEndpoint, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    A: BufferAllocator,
+    F: FnMut(RdmaEndpoint<A>, u32) -> (JoinHandle<()>, Arc<StreamStats>),
 {
     pub fn new(
         cm_opts: &CmOpts,
         rdma_opts: &RdmaOpts,
+        allocator: A,
         spawn_poller: F,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = Device::open(&rdma_opts.rdma_device)?;
@@ -79,6 +83,7 @@ where
             rdma_cfg: RdmaConfig::from(rdma_opts),
             device,
             path_mtu: active_path_mtu,
+            allocator,
             cm,
             qps: HashMap::new(),
             spawn_poller,
@@ -94,7 +99,7 @@ where
         num_streams: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..num_streams {
-            let rdma_endpoint = setup_endpoint(&self.device, &self.rdma_cfg)?;
+            let rdma_endpoint = setup_endpoint(&self.device, &self.rdma_cfg, &self.allocator)?;
             // keep a reference, rdma_endpoint will be moved to the poller thread
             let qp = Arc::clone(&rdma_endpoint.qp);
 
@@ -172,11 +177,13 @@ where
         }
 
         // event loop has been interrupted, clean up resources
-        for (_qpn, qp_ctx) in self.qps.drain() {
+        for (qpn, qp_ctx) in self.qps.drain() {
             qp_ctx.qp.modify_to_error()?;
             let _ = qp_ctx.poller_handle.join();
             println!("[Done] Summary:");
             qp_ctx.stats.print_summary();
+
+            self.cm.close_qp(qpn, Duration::from_secs(2), 2)?;
         }
 
         Ok(())
@@ -189,7 +196,7 @@ where
                 remote_qpn,
                 remote_info,
             } => {
-                let rdma_endpoint = setup_endpoint(&self.device, &self.rdma_cfg)?;
+                let rdma_endpoint = setup_endpoint(&self.device, &self.rdma_cfg, &self.allocator)?;
                 let qp = Arc::clone(&rdma_endpoint.qp);
 
                 // transition QP to RTS

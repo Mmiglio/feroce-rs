@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use feroce::rdma;
+use feroce::rdma::buffer_pool::{BufferAllocator, CpuAllocator};
 use feroce::{BufferHandle, BufferPool, CompletionChannel, QueuePair, RdmaEndpoint};
 use log::{debug, error};
 
@@ -12,7 +13,7 @@ pub fn run(
     send_opts: &SenderOpts,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller = |rdma_endpoint: RdmaEndpoint, stream_id: u32| {
+    let spawn_poller = |rdma_endpoint: RdmaEndpoint<CpuAllocator>, stream_id: u32| {
         let stats = Arc::new(StreamStats::new(stream_id, rdma_endpoint.qp.qp_num()));
 
         let handle = std::thread::spawn({
@@ -35,7 +36,7 @@ pub fn run(
         (handle, stats)
     };
 
-    let mut runner = SessionRunner::new(cm_opts, rdma_opts, spawn_poller)?;
+    let mut runner = SessionRunner::new(cm_opts, rdma_opts, CpuAllocator, spawn_poller)?;
 
     if cm_opts.active {
         let remote_addr = SocketAddr::new(
@@ -50,9 +51,9 @@ pub fn run(
     Ok(())
 }
 
-fn poller_thread(
+fn poller_thread<A: BufferAllocator>(
     qp: Arc<QueuePair>,
-    buffer_pool: BufferPool,
+    buffer_pool: BufferPool<A>,
     channel: CompletionChannel,
     stats: Arc<StreamStats>,
     num_msgs: u64,
@@ -110,7 +111,8 @@ fn poller_thread(
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
-    'poller_loop: loop {
+    let mut poller_done = false;
+    while !poller_done {
         // wait for completion event, blocking with timout of 10 ms
         let got_event = channel.try_get_cq_event(10)?;
 
@@ -136,7 +138,8 @@ fn poller_thread(
                 } else {
                     error!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
-                break 'poller_loop;
+                poller_done = true;
+                break;
             }
 
             send_completed += 1;
@@ -149,7 +152,8 @@ fn poller_thread(
 
             if send_completed == num_msgs {
                 // we sent all posted messages and the worker is done
-                break 'poller_loop;
+                poller_done = true;
+                break;
             }
         }
 
@@ -169,14 +173,6 @@ fn poller_thread(
             send_posted += 1;
         }
     }
-
-    // flush remaining stats
-    stats
-        .messages
-        .fetch_add(total_msgs, std::sync::atomic::Ordering::Relaxed);
-    stats
-        .bytes
-        .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }

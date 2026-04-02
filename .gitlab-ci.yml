@@ -1,9 +1,46 @@
 image: gitlab-registry.cern.ch/matteomi/feroce-rs:latest
 
 stages:
+  - docker
   - check
   - build
   - test
+
+build-docker:
+  stage: docker
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  rules:
+    - changes:
+        - ci/Dockerfile
+      when: always
+    - when: never
+  script:
+    - >
+      /kaniko/executor
+      --context $CI_PROJECT_DIR
+      --dockerfile ci/Dockerfile
+      --destination $CI_REGISTRY_IMAGE:latest
+      --cache=true
+
+build-docker-gpu:
+  stage: docker
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  rules:
+    - changes:
+        - ci/Dockerfile.gpu
+      when: always
+    - when: never
+  script:
+    - >
+      /kaniko/executor
+      --context $CI_PROJECT_DIR
+      --dockerfile ci/Dockerfile.gpu
+      --destination $CI_REGISTRY_IMAGE:gpu
+      --cache=true
 
 cache:
   key: cargo-cache
@@ -50,3 +87,14 @@ test-rdma:
       - rdma link show
   script:
     - cargo test --features rdma-test -- --nocapture
+
+test-gpu:
+  stage: test
+  image: gitlab-registry.cern.ch/matteomi/feroce-rs:gpu
+  tags:
+    - roce
+  before_script:
+    - nvidia-smi
+    - ibv_devinfo -v
+  script:
+    - cargo test --features gpu,rdma-test -- --nocapture

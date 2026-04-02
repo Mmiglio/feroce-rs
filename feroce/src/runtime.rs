@@ -4,7 +4,7 @@ use crate::{
     protocol::QpConnectionInfo,
     rdma::{
         self,
-        buffer_pool::BufferPool,
+        buffer_pool::{BufferAllocator, BufferPool},
         device::{CompletionChannel, Device, QueuePair},
     },
 };
@@ -16,18 +16,19 @@ pub struct RdmaConfig {
     pub buf_size: usize,
 }
 
-pub struct RdmaEndpoint {
+pub struct RdmaEndpoint<A: BufferAllocator> {
     pub qp: Arc<QueuePair>,
     pub comp_channel: CompletionChannel,
-    pub buffer_pool: BufferPool,
+    pub buffer_pool: BufferPool<A>,
     pub local_info: QpConnectionInfo,
 }
 
 // Create and init resources for a qp/data stream
-pub fn setup_endpoint(
+pub fn setup_endpoint<A: BufferAllocator>(
     device: &Device,
     rdma_cfg: &RdmaConfig,
-) -> Result<RdmaEndpoint, Box<dyn std::error::Error>> {
+    allocator: &A,
+) -> Result<RdmaEndpoint<A>, Box<dyn std::error::Error>> {
     let comp_channel = CompletionChannel::create(device)?;
 
     // create local QP
@@ -43,7 +44,7 @@ pub fn setup_endpoint(
     )?);
 
     let loc_gid = device.query_gid(rdma_cfg.port_num, rdma_cfg.gid_index)?;
-    let buffer_pool = BufferPool::new(rdma_cfg.num_buf, rdma_cfg.buf_size, &pd)?;
+    let buffer_pool = BufferPool::new(rdma_cfg.num_buf, rdma_cfg.buf_size, &pd, allocator)?;
 
     // register local infos
     let local_info = QpConnectionInfo {
@@ -64,8 +65,8 @@ pub fn setup_endpoint(
     })
 }
 
-pub fn connect_endpoint(
-    endpoint: &RdmaEndpoint,
+pub fn connect_endpoint<A: BufferAllocator>(
+    endpoint: &RdmaEndpoint<A>,
     remote_info: &QpConnectionInfo,
     rdma_cfg: &RdmaConfig,
     active_path_mtu: rdma::ibv_mtu,
