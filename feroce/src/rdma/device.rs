@@ -466,7 +466,7 @@ impl QueuePair {
             dest_qp_num: remote_info.qp_num,
             rq_psn: remote_info.psn,
             max_dest_rd_atomic: 1,
-            min_rnr_timer: 12,
+            min_rnr_timer: 10,
             ah_attr: ffi::ibv_ah_attr {
                 is_global: 1,
                 port_num,
