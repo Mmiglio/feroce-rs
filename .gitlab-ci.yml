@@ -50,3 +50,14 @@ test-rdma:
       - rdma link show
   script:
     - cargo test --features rdma-test -- --nocapture
+
+test-gpu:
+  stage: test
+  image: gitlab-registry.cern.ch/matteomi/feroce-rs:gpu
+  tags:
+    - roce
+  before_script:
+    - nvidia-smi
+    - ibv_devinfo -v
+  script:
+    - cargo test --features gpu,rdma-test -- --nocapture

@@ -54,9 +54,6 @@ fn poller_thread<A: BufferAllocator>(
     channel: CompletionChannel,
     stats: Arc<StreamStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "gpu")]
-    feroce::rdma::gpu::init_cuda_thread(0).unwrap();
-
     // metrics
     let mut total_bytes;
     let mut total_msgs;
@@ -91,7 +88,8 @@ fn poller_thread<A: BufferAllocator>(
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
-    'poller_loop: loop {
+    let mut poller_done = false;
+    while !poller_done {
         // wait for completion event, blocking with timout of 10 ms
         let got_event = channel.try_get_cq_event(10)?;
 
@@ -117,17 +115,8 @@ fn poller_thread<A: BufferAllocator>(
                 } else {
                     error!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
-                break 'poller_loop;
-            }
-
-            #[cfg(feature = "gpu")]
-            {
-                let mut check = [0u8; 8];
-                let handle = buffer_pool.get_handle(wce.wr_id as usize);
-                match feroce::rdma::gpu::copy_device_to_host(&mut check, handle.addr as u64) {
-                    Ok(_) => println!("GPU buffer content: {:02x?}", check),
-                    Err(e) => println!("Can't read GPU buffer (no CUDA ctx in this thread): {}", e),
-                }
+                poller_done = true;
+                break;
             }
 
             // update metrics
@@ -145,13 +134,6 @@ fn poller_thread<A: BufferAllocator>(
             .bytes
             .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
     }
-
-    stats
-        .messages
-        .fetch_add(total_msgs, std::sync::atomic::Ordering::Relaxed);
-    stats
-        .bytes
-        .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }

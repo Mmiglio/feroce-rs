@@ -111,7 +111,8 @@ fn poller_thread<A: BufferAllocator>(
     // request notification from completion channel for every event
     qp.cq().req_notify_cq(false)?;
 
-    'poller_loop: loop {
+    let mut poller_done = false;
+    while !poller_done {
         // wait for completion event, blocking with timout of 10 ms
         let got_event = channel.try_get_cq_event(10)?;
 
@@ -137,7 +138,8 @@ fn poller_thread<A: BufferAllocator>(
                 } else {
                     error!("WC index {} error status: {}", ce_idx, wce.status as i32)
                 }
-                break 'poller_loop;
+                poller_done = true;
+                break;
             }
 
             send_completed += 1;
@@ -150,7 +152,8 @@ fn poller_thread<A: BufferAllocator>(
 
             if send_completed == num_msgs {
                 // we sent all posted messages and the worker is done
-                break 'poller_loop;
+                poller_done = true;
+                break;
             }
         }
 
@@ -170,14 +173,6 @@ fn poller_thread<A: BufferAllocator>(
             send_posted += 1;
         }
     }
-
-    // flush remaining stats
-    stats
-        .messages
-        .fetch_add(total_msgs, std::sync::atomic::Ordering::Relaxed);
-    stats
-        .bytes
-        .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }

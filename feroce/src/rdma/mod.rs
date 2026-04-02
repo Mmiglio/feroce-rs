@@ -3,6 +3,8 @@ pub mod device;
 mod ffi;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 pub use ffi::ibv_access_flags;
 pub use ffi::ibv_mtu;

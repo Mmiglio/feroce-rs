@@ -199,7 +199,14 @@ impl BufferAllocator for GpuAllocator {
 #[cfg(test)]
 #[cfg(feature = "gpu")]
 mod test {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::{
+        CompletionChannel, QueuePair,
+        protocol::QpConnectionInfo,
+        rdma::{device::find_roce_device, ffi, test_utils::*},
+    };
 
     #[test]
     fn alloc_gpu_buffer() {
@@ -228,5 +235,137 @@ mod test {
             mr.lkey()
         );
         drop(buffer);
+    }
+
+    #[test]
+    fn gpu_direct_loopback() {
+        let (_name, device, port, gid_index, mtu) =
+            find_roce_device().expect("no RoCE device found");
+
+        // Sender side uses a CPU buffer
+        let pd_send = Arc::new(device.alloc_pd().expect("pd_send"));
+        let channel_send = CompletionChannel::create(&device).expect("channel_send");
+        let cq_send = Arc::new(
+            device
+                .create_cq_with_channel(16, &channel_send)
+                .expect("cq_send"),
+        );
+        let mut buf_send = vec![0xABu8; 4096];
+        let mr_send = MemoryRegion::register(
+            &pd_send,
+            &mut buf_send,
+            rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE,
+        )
+        .expect("mr_send");
+        let qp_send = QueuePair::create_qp(
+            Arc::clone(&pd_send),
+            Arc::clone(&cq_send),
+            8,
+            1,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )
+        .expect("qp_send");
+
+        // Receiver side with GPU buffer
+        let allocator = GpuAllocator::new(0).expect("GpuAllocator");
+        let pd_recv = Arc::new(device.alloc_pd().expect("pd_recv"));
+        let channel_recv = CompletionChannel::create(&device).expect("channel_recv");
+        let cq_recv = Arc::new(
+            device
+                .create_cq_with_channel(16, &channel_recv)
+                .expect("cq_recv"),
+        );
+        let (gpu_buf, mr_recv, base_addr) = allocator
+            .alloc_and_register(&pd_recv, 4096)
+            .expect("gpu alloc");
+        let qp_recv = QueuePair::create_qp(
+            Arc::clone(&pd_recv),
+            Arc::clone(&cq_recv),
+            8,
+            1,
+            rdma::ibv_qp_type::IBV_QPT_RC,
+        )
+        .expect("qp_recv");
+
+        // Connect QPs in loopback
+        let loc_gid = device.query_gid(port, gid_index).expect("gid");
+
+        qp_recv.modify_to_init(port).expect("recv init");
+        qp_recv
+            .modify_to_rtr(
+                &QpConnectionInfo {
+                    qp_num: qp_send.qp_num(),
+                    psn: 0,
+                    rkey: mr_recv.rkey(),
+                    addr: base_addr,
+                    gid: loc_gid.raw,
+                },
+                gid_index as u8,
+                port,
+                mtu,
+            )
+            .expect("recv rtr");
+        qp_recv.modify_to_rts(0).expect("recv rts");
+
+        qp_send.modify_to_init(port).expect("send init");
+        qp_send
+            .modify_to_rtr(
+                &QpConnectionInfo {
+                    qp_num: qp_recv.qp_num(),
+                    psn: 0,
+                    rkey: mr_send.rkey(),
+                    addr: mr_send.addr(),
+                    gid: loc_gid.raw,
+                },
+                gid_index as u8,
+                port,
+                mtu,
+            )
+            .expect("send rtr");
+        qp_send.modify_to_rts(0).expect("send rts");
+
+        // Post recv on GPU buffer
+        let mut sge_recv = ffi::ibv_sge {
+            addr: base_addr,
+            length: 4096,
+            lkey: mr_recv.lkey(),
+        };
+        let mut recv_wr = ffi::ibv_recv_wr {
+            sg_list: &mut sge_recv,
+            num_sge: 1,
+            ..Default::default()
+        };
+        qp_recv.post_recv(&mut recv_wr).expect("post_recv");
+
+        // Post send from CPU buffer
+        let mut sge_send = vec![
+            ffi::ibv_sge {
+                addr: buf_send.as_ptr() as u64,
+                length: 4096,
+                lkey: mr_send.lkey(),
+            };
+            1
+        ];
+
+        let mut send_wr =
+            QueuePair::build_send_wr(0, &mut sge_send, rdma::device::SendOp::Send, true);
+        qp_send.post_send(&mut send_wr).expect("post_send");
+
+        // Poll the CQs
+        let mut wc = [ffi::ibv_wc::default(); 1];
+        let timeout = std::time::Duration::from_secs(5);
+
+        let n = poll_cq_with_timeout(&cq_send, &mut wc, timeout);
+        assert_eq!(n, 1, "send completion not received");
+        assert_eq!(wc[0].status, ffi::ibv_wc_status::IBV_WC_SUCCESS);
+
+        let n = poll_cq_with_timeout(&cq_recv, &mut wc, timeout);
+        assert_eq!(n, 1, "recv completion not received");
+        assert_eq!(wc[0].status, ffi::ibv_wc_status::IBV_WC_SUCCESS);
+
+        // Copy data back to host
+        let mut result = vec![0u8; 4096];
+        copy_device_to_host(&mut result, gpu_buf.dptr).expect("DtoH copy");
+        assert_eq!(result, vec![0xABu8; 4096], "GPU buffer content mismatch");
     }
 }

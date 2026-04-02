@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, info};
 
 use super::ffi;
 use crate::protocol::QpConnectionInfo;
@@ -740,187 +740,46 @@ impl Drop for MemoryRegion {
     }
 }
 
-#[cfg(test)]
-#[cfg(feature = "rdma-test")]
-mod test {
-    use log::info;
-
-    use super::*;
-    use crate::rdma;
-
-    // Find one available roce device, returns the device, port number, gid_index and mtu.
-    fn find_roce_device() -> Option<(Device, u8, i32, ffi::ibv_mtu)> {
-        let devices = DeviceList::new().ok()?;
-        for i in 0..devices.len() {
-            let name = devices.device_name(i)?;
-            let device = Device::open(name).ok()?;
-            let entries = device.query_gid_table().ok()?;
-            for entry in &entries {
-                if entry.gid_type == ffi::ibv_gid_type::IBV_GID_TYPE_ROCE_V2 as u32
-                    && entry.gid.raw.iter().any(|&b| b != 0)
-                    && entry.gid.raw[10] == 0xff
-                    && entry.gid.raw[11] == 0xff
-                {
-                    let port = entry.port_num as u8;
-                    let port_attr = device.query_port(port).ok()?;
-                    if matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE) {
-                        info!(
-                            "Discovery: device={}, port={}, gid_index={}, mtu={:?}",
-                            name, port, entry.gid_index, port_attr.active_mtu as u32
-                        );
-                        return Some((device, port, entry.gid_index as i32, port_attr.active_mtu));
-                    }
+// Find one available roce device, returns the device, port number, gid_index and mtu.
+pub fn find_roce_device() -> Option<(String, Device, u8, i32, ffi::ibv_mtu)> {
+    let devices = DeviceList::new().ok()?;
+    for i in 0..devices.len() {
+        let name = devices.device_name(i)?;
+        let device = Device::open(name).ok()?;
+        let entries = device.query_gid_table().ok()?;
+        for entry in &entries {
+            if entry.gid_type == ffi::ibv_gid_type::IBV_GID_TYPE_ROCE_V2 as u32
+                && entry.gid.raw.iter().any(|&b| b != 0)
+                && entry.gid.raw[10] == 0xff
+                && entry.gid.raw[11] == 0xff
+            {
+                let port = entry.port_num as u8;
+                let port_attr = device.query_port(port).ok()?;
+                if matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE) {
+                    info!(
+                        "Discovery: device={}, port={}, gid_index={}, mtu={:?}",
+                        name, port, entry.gid_index, port_attr.active_mtu as u32
+                    );
+                    return Some((
+                        name.to_string(),
+                        device,
+                        port,
+                        entry.gid_index as i32,
+                        port_attr.active_mtu,
+                    ));
                 }
             }
         }
-        None
     }
+    None
+}
 
-    fn create_loopback_qp(
-        device: &Device,
-        port: u8,
-        gid_index: i32,
-        path_mtu: ffi::ibv_mtu,
-        buf_size: usize,
-    ) -> (
-        QueuePair,
-        CompletionChannel,
-        MemoryRegion,
-        Vec<u8>,
-        QueuePair,
-        CompletionChannel,
-        MemoryRegion,
-        Vec<u8>,
-    ) {
-        // register receiver
-        let channel_recv =
-            CompletionChannel::create(&device).expect("failed to create recv completion channel");
-        let pd_recv = Arc::new(device.alloc_pd().expect("pd_recv"));
-        let cq_recv = Arc::new(
-            device
-                .create_cq_with_channel(16, &channel_recv)
-                .expect("cq_recv"),
-        );
-        let mut buf_recv = vec![0u8; buf_size];
-        let mr_recv = MemoryRegion::register(
-            &pd_recv,
-            &mut buf_recv,
-            ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
-        )
-        .expect("mr rcv");
-        let qp_recv = QueuePair::create_qp(
-            Arc::clone(&pd_recv),
-            Arc::clone(&cq_recv),
-            8,
-            1,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )
-        .expect("qp receiver");
-
-        // register sender
-        let channel_send =
-            CompletionChannel::create(&device).expect("failed to create send completion channel");
-        let pd_send = Arc::new(device.alloc_pd().expect("pd_send"));
-        let cq_send = Arc::new(
-            device
-                .create_cq_with_channel(16, &channel_send)
-                .expect("cq_send"),
-        );
-        let mut buf_send = vec![0u8; buf_size];
-        let mr_send = MemoryRegion::register(
-            &pd_send,
-            &mut buf_send,
-            ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
-        )
-        .expect("mr rcv");
-        let qp_send = QueuePair::create_qp(
-            Arc::clone(&pd_send),
-            Arc::clone(&cq_send),
-            8,
-            1,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )
-        .expect("qp sender");
-
-        // state transition of qps
-        let loc_gid = device.query_gid(port, gid_index).expect("gid");
-
-        qp_recv.modify_to_init(port).expect("recv init");
-        qp_recv
-            .modify_to_rtr(
-                &QpConnectionInfo {
-                    qp_num: qp_send.qp_num(), // point at the sender
-                    psn: 0,
-                    rkey: mr_recv.rkey(),
-                    addr: mr_recv.addr(),
-                    gid: loc_gid.raw,
-                },
-                gid_index as u8,
-                port,
-                path_mtu,
-            )
-            .expect("recv rtr");
-        qp_recv.modify_to_rts(0).expect("recv rts");
-
-        qp_send.modify_to_init(port).expect("send init");
-        qp_send
-            .modify_to_rtr(
-                &QpConnectionInfo {
-                    qp_num: qp_recv.qp_num(), // point at the receiver
-                    psn: 0,
-                    rkey: mr_send.rkey(),
-                    addr: mr_send.addr(),
-                    gid: loc_gid.raw,
-                },
-                gid_index as u8,
-                port,
-                path_mtu,
-            )
-            .expect("send rtr");
-        qp_send.modify_to_rts(0).expect("send rts");
-
-        (
-            qp_send,
-            channel_send,
-            mr_send,
-            buf_send,
-            qp_recv,
-            channel_recv,
-            mr_recv,
-            buf_recv,
-        )
-    }
-
-    fn poll_cq_with_timeout(
-        cq: &CompletionQueue,
-        wc: &mut [ffi::ibv_wc],
-        timeout: std::time::Duration,
-    ) -> usize {
-        let start = std::time::Instant::now();
-        let mut n = 0;
-        while start.elapsed() < timeout {
-            n = cq.poll(wc).unwrap();
-            if n > 0 {
-                break;
-            }
-        }
-        n
-    }
-
-    fn make_sge_list(n: usize, buf: &mut Vec<u8>, lkey: u32) -> Vec<ffi::ibv_sge> {
-        let sg_list = vec![
-            ffi::ibv_sge {
-                addr: buf.as_mut_ptr() as u64,
-                length: buf.len() as u32,
-                lkey,
-            };
-            n
-        ];
-
-        sg_list
-    }
+#[cfg(test)]
+#[cfg(feature = "rdma-test")]
+mod test {
+    use super::*;
+    use crate::rdma;
+    use crate::rdma::test_utils::*;
 
     #[test]
     fn list_devices() {
@@ -952,7 +811,7 @@ mod test {
 
     #[test]
     fn create_qp() {
-        let (device, _port, _gid_index, _path_mtu) =
+        let (_name, device, _port, _gid_index, _path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
@@ -970,7 +829,7 @@ mod test {
 
     #[test]
     fn qp_state_transitions_rts() {
-        let (device, port, gid_index, path_mtu) =
+        let (_name, device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
@@ -1007,7 +866,7 @@ mod test {
 
     #[test]
     fn register_memory_region() {
-        let (device, _port, _gid_index, _path_mtu) =
+        let (_name, device, _port, _gid_index, _path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = device.alloc_pd().expect("failed to allocate PD");
@@ -1031,7 +890,7 @@ mod test {
     fn loopback_send_recv() {
         let buf_size = 64;
 
-        let (device, port, gid_index, path_mtu) =
+        let (_name, device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let (qp_send, _cc_send, mr_send, mut buf_send, qp_recv, _cc_recv, mr_recv, mut buf_recv) =
@@ -1095,7 +954,7 @@ mod test {
         let buf_size = 64;
         let half_buf_size = buf_size as u32 / 2;
 
-        let (device, port, gid_index, path_mtu) =
+        let (_name, device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let (qp_send, _cc_send, mr_send, mut buf_send, qp_recv, _cc_recv, mr_recv, buf_recv) =
@@ -1222,7 +1081,7 @@ mod test {
     fn loopback_send_recv_error_transition() {
         let buf_size = 64;
 
-        let (device, port, gid_index, path_mtu) =
+        let (_name, device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let (_qp_send, _cc_send, _mr_send, _buf_send, qp_recv, _cc_recv, mr_recv, mut buf_recv) =
@@ -1260,7 +1119,7 @@ mod test {
 
     #[test]
     fn two_qps_share_pd_and_cq() {
-        let (device, port, _gid_index, _path_mtu) =
+        let (_name, device, port, _gid_index, _path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = Arc::new(device.alloc_pd().expect("failed to alloc pd"));
@@ -1292,7 +1151,7 @@ mod test {
 
     #[test]
     fn completion_channel_firing() {
-        let (device, port, gid_index, path_mtu) =
+        let (_name, device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let buf_size = 64;

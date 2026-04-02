@@ -1,0 +1,12 @@
+FROM docker.io/nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y \
+    libibverbs-dev \
+    rdma-core \
+    infiniband-diags \
+    ibverbs-utils \
+    clang \
+    && rm -rf /var/lib/apt/lists/*

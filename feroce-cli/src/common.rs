@@ -177,11 +177,13 @@ where
         }
 
         // event loop has been interrupted, clean up resources
-        for (_qpn, qp_ctx) in self.qps.drain() {
+        for (qpn, qp_ctx) in self.qps.drain() {
             qp_ctx.qp.modify_to_error()?;
             let _ = qp_ctx.poller_handle.join();
             println!("[Done] Summary:");
             qp_ctx.stats.print_summary();
+
+            self.cm.close_qp(qpn, Duration::from_secs(2), 2)?;
         }
 
         Ok(())

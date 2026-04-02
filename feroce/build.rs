@@ -49,11 +49,6 @@ fn setup_ibverbs() {
 
 #[cfg(feature = "gpu")]
 fn link_cuda() {
-    if !std::path::Path::new("/usr/lib64/libcuda.so").exists()
-        && !std::path::Path::new("/usr/local/cuda/lib64/libcuda.so").exists()
-    {
-        panic!("GPU feature enabled but libcuda.so not found. Install NVIDIA drivers.");
-    }
     println!("cargo:rustc-link-lib=cuda");
 }
 
