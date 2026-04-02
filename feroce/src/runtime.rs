@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    FeroceError,
     protocol::QpConnectionInfo,
     rdma::{
         self,
@@ -28,7 +29,7 @@ pub fn setup_endpoint<A: BufferAllocator>(
     device: &Device,
     rdma_cfg: &RdmaConfig,
     allocator: &A,
-) -> Result<RdmaEndpoint<A>, Box<dyn std::error::Error>> {
+) -> Result<RdmaEndpoint<A>, FeroceError> {
     let comp_channel = CompletionChannel::create(device)?;
 
     // create local QP
@@ -70,7 +71,7 @@ pub fn connect_endpoint<A: BufferAllocator>(
     remote_info: &QpConnectionInfo,
     rdma_cfg: &RdmaConfig,
     active_path_mtu: rdma::ibv_mtu,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), FeroceError> {
     endpoint.qp.modify_to_rtr(
         remote_info,
         rdma_cfg.gid_index as u8,

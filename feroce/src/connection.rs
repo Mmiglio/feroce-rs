@@ -10,36 +10,7 @@ use crate::protocol::{
     ipv4_from_gid,
 };
 
-#[derive(Debug)]
-pub enum ConnectionError {
-    /// Socket error
-    Io(io::Error),
-    /// Protocol error
-    Protocol(String),
-    /// Timeout error
-    Timeout,
-    /// Generic error, tbd
-    Generic(String),
-}
-
-impl std::error::Error for ConnectionError {}
-
-impl From<io::Error> for ConnectionError {
-    fn from(err: io::Error) -> Self {
-        ConnectionError::Io(err)
-    }
-}
-
-impl std::fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectionError::Io(e) => write!(f, "IO error: {}", e),
-            ConnectionError::Protocol(msg) => write!(f, "Protocol error: {}", msg),
-            ConnectionError::Timeout => write!(f, "Timeout"),
-            ConnectionError::Generic(msg) => write!(f, "{}", msg),
-        }
-    }
-}
+use crate::FeroceError;
 
 // Pending connection request, consumed when handshake finishes
 enum PendingQp {
@@ -77,26 +48,26 @@ impl ActiveQp {
         ActiveQp { phase, ctx }
     }
 
-    fn transition_to_running(&mut self) -> Result<(), ConnectionError> {
+    fn transition_to_running(&mut self) -> Result<(), FeroceError> {
         match self.phase {
             QpPhase::Connected => {
                 self.phase = QpPhase::Running;
                 Ok(())
             }
-            _ => Err(ConnectionError::Protocol(format!(
+            _ => Err(FeroceError::Protocol(format!(
                 "cannot start: QP is {:?}, expected Connected",
                 self.phase
             ))),
         }
     }
 
-    fn transition_to_closing(&mut self) -> Result<(), ConnectionError> {
+    fn transition_to_closing(&mut self) -> Result<(), FeroceError> {
         match self.phase {
             QpPhase::Connected | QpPhase::Running => {
                 self.phase = QpPhase::Closing;
                 Ok(())
             }
-            QpPhase::Closing => Err(ConnectionError::Protocol("QP is already closing".into())),
+            QpPhase::Closing => Err(FeroceError::Protocol("QP is already closing".into())),
         }
     }
 }
@@ -125,7 +96,7 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    pub fn new(bind_addr: IpAddr, port: u16) -> Result<Self, ConnectionError> {
+    pub fn new(bind_addr: IpAddr, port: u16) -> Result<Self, FeroceError> {
         let socket = UdpSocket::bind(SocketAddr::new(bind_addr, port))?;
         info!("Binding Connection Manager to {}:{}", bind_addr, port);
         Ok(ConnectionManager {
@@ -139,41 +110,41 @@ impl ConnectionManager {
         Ok(self.socket.local_addr()?.port())
     }
 
-    pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), ConnectionError> {
+    pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), FeroceError> {
         self.socket.set_read_timeout(Some(timeout))?;
         Ok(())
     }
 
-    fn recv_message(socket: &UdpSocket) -> Result<(QpMessage, SocketAddr), ConnectionError> {
+    fn recv_message(socket: &UdpSocket) -> Result<(QpMessage, SocketAddr), FeroceError> {
         let mut buf = [0u8; QP_MESSAGE_SIZE];
         let (msg_size, src_addr) = socket.recv_from(&mut buf).map_err(|e| {
             if e.kind() == io::ErrorKind::TimedOut
                 || e.kind() == io::ErrorKind::WouldBlock
                 || e.kind() == io::ErrorKind::Interrupted
             {
-                ConnectionError::Timeout
+                FeroceError::Timeout
             } else {
-                ConnectionError::Io(e)
+                FeroceError::Io(e)
             }
         })?;
 
         if msg_size != QP_MESSAGE_SIZE {
-            return Err(ConnectionError::Protocol(format!(
+            return Err(FeroceError::Protocol(format!(
                 "expected {} bytes, received {}",
                 QP_MESSAGE_SIZE, msg_size
             )));
         }
 
-        let qp_msg = QpMessage::unpack(&buf).map_err(ConnectionError::Protocol)?;
+        let qp_msg = QpMessage::unpack(&buf)?;
         Ok((qp_msg, src_addr))
     }
 
-    pub fn process_next(&mut self) -> Result<CmEvent, ConnectionError> {
+    pub fn process_next(&mut self) -> Result<CmEvent, FeroceError> {
         loop {
             let (qp_msg, peer_addr) = Self::recv_message(&self.socket)?;
 
             let request_type = qp_msg.flags.request_type().map_err(|val| {
-                ConnectionError::Protocol(format!("Received unknown request value {}", val))
+                FeroceError::Protocol(format!("Received unknown request value {}", val))
             })?;
 
             match request_type {
@@ -195,16 +166,16 @@ impl ConnectionManager {
                     }
                 }
                 _ => {
-                    return Err(ConnectionError::Protocol("Invalid request".to_string()));
+                    return Err(FeroceError::Protocol("Invalid request".to_string()));
                 }
             }
         }
     }
 
-    pub fn try_process_next(&mut self) -> Result<Option<CmEvent>, ConnectionError> {
+    pub fn try_process_next(&mut self) -> Result<Option<CmEvent>, FeroceError> {
         match self.process_next() {
             Ok(event) => Ok(Some(event)),
-            Err(ConnectionError::Timeout) => Ok(None),
+            Err(FeroceError::Timeout) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -213,7 +184,7 @@ impl ConnectionManager {
         &mut self,
         qp_msg: &QpMessage,
         peer_addr: &SocketAddr,
-    ) -> Result<Option<CmEvent>, ConnectionError> {
+    ) -> Result<Option<CmEvent>, FeroceError> {
         let remote_info = QpConnectionInfo {
             qp_num: qp_msg.loc_qpn,
             psn: qp_msg.loc_psn,
@@ -280,9 +251,9 @@ impl ConnectionManager {
         peer_ip: IpAddr,
         remote_qpn: u32,
         local_info: &QpConnectionInfo,
-    ) -> Result<(), ConnectionError> {
+    ) -> Result<(), FeroceError> {
         let pending = self.pending.remove(&(peer_ip, remote_qpn)).ok_or_else(|| {
-            ConnectionError::Generic(format!(
+            FeroceError::Protocol(format!(
                 "Connection request ({}, {}) not found in pending",
                 peer_ip, remote_qpn
             ))
@@ -294,9 +265,7 @@ impl ConnectionManager {
             reply_addr,
         } = pending
         else {
-            return Err(ConnectionError::Protocol(
-                "expected passive pending QP".into(),
-            ));
+            return Err(FeroceError::Protocol("expected passive pending QP".into()));
         };
 
         info!(
@@ -331,7 +300,7 @@ impl ConnectionManager {
         &mut self,
         qp_msg: &QpMessage,
         peer_addr: &SocketAddr,
-    ) -> Result<Option<CmEvent>, ConnectionError> {
+    ) -> Result<Option<CmEvent>, FeroceError> {
         let local_qpn = qp_msg.rem_qpn;
         let remote_qpn = qp_msg.loc_qpn;
 
@@ -390,16 +359,16 @@ impl ConnectionManager {
     }
 
     /// Called by the application after the local QP has been closed to signal the remote
-    pub fn ack_close_qp(&mut self, local_qpn: u32) -> Result<(), ConnectionError> {
+    pub fn ack_close_qp(&mut self, local_qpn: u32) -> Result<(), FeroceError> {
         let Some(aqp) = self.qps.remove(&local_qpn) else {
-            return Err(ConnectionError::Generic(
+            return Err(FeroceError::Protocol(
                 "requested close QP ack, but the QP doesn't exist".to_string(),
             ));
         };
 
         if aqp.phase != QpPhase::Closing {
             self.qps.insert(local_qpn, aqp);
-            return Err(ConnectionError::Protocol(
+            return Err(FeroceError::Protocol(
                 "requested to ack close QP, but it is not in Closing state".to_string(),
             ));
         }
@@ -421,7 +390,7 @@ impl ConnectionManager {
         remote_info: &QpConnectionInfo,
         qp_flags: QpFlags,
         dest: SocketAddr,
-    ) -> Result<(), ConnectionError> {
+    ) -> Result<(), FeroceError> {
         let reply_qp_msg = QpMessage {
             flags: qp_flags,
             loc_qpn: local_info.qp_num,
@@ -450,7 +419,7 @@ impl ConnectionManager {
         validate: impl Fn(&QpMessage) -> bool,
         timeout: Duration,
         max_retries: u8,
-    ) -> Result<QpMessage, ConnectionError> {
+    ) -> Result<QpMessage, FeroceError> {
         let original_socket_timeout = socket.read_timeout()?;
         socket.set_read_timeout(Some(timeout))?;
 
@@ -461,7 +430,7 @@ impl ConnectionManager {
             let (reply_qp_message, _peer_addr) = match Self::recv_message(socket) {
                 Ok((qp_msg, addr)) => (qp_msg, addr),
                 Err(err) => match err {
-                    ConnectionError::Timeout => {
+                    FeroceError::Timeout => {
                         retry_left -= 1;
                         warn!("Timeout while waiting for ACK, {} retries left", retry_left);
                         continue;
@@ -487,7 +456,7 @@ impl ConnectionManager {
         }
 
         socket.set_read_timeout(original_socket_timeout)?;
-        Err(ConnectionError::Timeout)
+        Err(FeroceError::Timeout)
     }
 
     // Used by the active side to connect to a remote QP
@@ -497,7 +466,7 @@ impl ConnectionManager {
         local_info: &QpConnectionInfo,
         request_timeout: Duration,
         max_retries: u8,
-    ) -> Result<QpConnectionInfo, ConnectionError> {
+    ) -> Result<QpConnectionInfo, FeroceError> {
         let open_qp_message = QpMessage {
             flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
             loc_qpn: local_info.qp_num,
@@ -578,11 +547,11 @@ impl ConnectionManager {
         Ok(remote_info)
     }
 
-    pub fn start_qp(&mut self, local_qpn: u32) -> Result<(), ConnectionError> {
+    pub fn start_qp(&mut self, local_qpn: u32) -> Result<(), FeroceError> {
         let qp = self
             .qps
             .get_mut(&local_qpn)
-            .ok_or_else(|| ConnectionError::Generic(format!("QP {} not found", local_qpn)))?;
+            .ok_or_else(|| FeroceError::Protocol(format!("QP {} not found", local_qpn)))?;
         qp.transition_to_running()
     }
 
@@ -591,11 +560,11 @@ impl ConnectionManager {
         local_qpn: u32,
         request_timeout: Duration,
         max_retries: u8,
-    ) -> Result<(), ConnectionError> {
+    ) -> Result<(), FeroceError> {
         info!("Requested to close local QPN {local_qpn}");
 
         let aqp = self.qps.get_mut(&local_qpn).ok_or_else(|| {
-            ConnectionError::Generic("requested to close QP, but it doesn't exist".into())
+            FeroceError::Protocol("requested to close QP, but it doesn't exist".into())
         })?;
 
         aqp.transition_to_closing()?;
@@ -740,7 +709,7 @@ mod test {
         assert_eq!(a.gid, b.gid);
     }
 
-    fn cm_with_connected_qp() -> Result<(ConnectionManager, ConnectionManager), ConnectionError> {
+    fn cm_with_connected_qp() -> Result<(ConnectionManager, ConnectionManager), FeroceError> {
         let (sender_info, receiver_info) = make_test_infos();
 
         let mut sender_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
@@ -926,7 +895,7 @@ mod test {
             .unwrap();
 
         let res = cm_handle.join().unwrap();
-        assert!(matches!(res, Err(ConnectionError::Protocol(_))));
+        assert!(matches!(res, Err(FeroceError::Protocol(_))));
     }
 
     #[test]

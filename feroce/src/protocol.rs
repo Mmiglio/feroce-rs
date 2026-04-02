@@ -1,3 +1,4 @@
+use crate::FeroceError;
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,13 +205,13 @@ impl QpMessage {
         buf
     }
 
-    pub fn unpack(buf: &[u8]) -> Result<Self, String> {
+    pub fn unpack(buf: &[u8]) -> Result<Self, FeroceError> {
         if buf.len() < QP_MESSAGE_SIZE {
-            return Err(format!(
+            return Err(FeroceError::Protocol(format!(
                 "Buffer is too small: expected size {}, found {}",
                 QP_MESSAGE_SIZE,
                 buf.len()
-            ));
+            )));
         }
 
         let mut pos = 0;

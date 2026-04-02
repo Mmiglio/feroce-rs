@@ -11,7 +11,7 @@ use std::{
 
 use feroce::rdma::{self, buffer_pool::BufferAllocator};
 use feroce::{
-    CmEvent, ConnectionError, ConnectionManager, Device, QueuePair, RdmaConfig, RdmaEndpoint,
+    CmEvent, ConnectionManager, Device, FeroceError, QueuePair, RdmaConfig, RdmaEndpoint,
     connect_endpoint, setup_endpoint,
 };
 use log::{error, info};
@@ -229,7 +229,7 @@ where
             } => {
                 // get the qp from the list
                 let Some(qp_ctx) = self.qps.remove(&local_qpn) else {
-                    return Err(Box::new(ConnectionError::Protocol(
+                    return Err(Box::new(FeroceError::Protocol(
                         "Error! the QP is not present in the list".to_string(),
                     )));
                 };
