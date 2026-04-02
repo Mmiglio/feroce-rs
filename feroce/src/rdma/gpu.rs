@@ -1,5 +1,6 @@
 use log::warn;
 
+use crate::FeroceError;
 use crate::rdma::{
     self,
     buffer_pool::BufferAllocator,
@@ -38,30 +39,30 @@ unsafe extern "C" {
     ) -> CUresult;
 }
 
-fn check_cuda(result: CUresult, msg: &str) -> Result<(), String> {
+fn check_cuda(result: CUresult, call: &'static str) -> Result<(), FeroceError> {
     if result != CUDA_SUCCESS {
-        Err(format!("{}: CUDA error {}", msg, result))
+        Err(FeroceError::Cuda { call, code: result })
     } else {
         Ok(())
     }
 }
 
-pub fn init_cuda_thread(device_ordinal: i32) -> Result<(), String> {
-    check_cuda(unsafe { cuInit(0) }, "cuInit failed")?;
+pub fn init_cuda_thread(device_ordinal: i32) -> Result<(), FeroceError> {
+    check_cuda(unsafe { cuInit(0) }, "cuInit")?;
     let mut dev = 0;
     check_cuda(
         unsafe { cuDeviceGet(&mut dev, device_ordinal) },
-        "cuDeviceGet failed",
+        "cuDeviceGet",
     )?;
     let mut ctx = std::ptr::null_mut();
     check_cuda(
         unsafe { cuCtxCreate_v2(&mut ctx, 0, dev) },
-        "cuCtxCreate failed",
+        "cuCtxCreate_v2",
     )?;
     Ok(())
 }
 
-pub fn copy_device_to_host(dst: &mut [u8], device_addr: u64) -> Result<(), String> {
+pub fn copy_device_to_host(dst: &mut [u8], device_addr: u64) -> Result<(), FeroceError> {
     check_cuda(
         unsafe {
             cuMemcpyDtoH_v2(
@@ -70,7 +71,7 @@ pub fn copy_device_to_host(dst: &mut [u8], device_addr: u64) -> Result<(), Strin
                 dst.len(),
             )
         },
-        "Failed to copy device to host",
+        "cuMemcpyDtoH_v2",
     )
 }
 
@@ -81,17 +82,17 @@ pub struct CudaContext {
 unsafe impl Send for CudaContext {}
 
 impl CudaContext {
-    pub fn new(device_number: i32) -> Result<Self, String> {
+    pub fn new(device_number: i32) -> Result<Self, FeroceError> {
         let mut res = unsafe { cuInit(0) };
-        check_cuda(res, "Initialize the CUDA driver API")?;
+        check_cuda(res, "cuInit")?;
 
         let mut dev = 0;
         res = unsafe { cuDeviceGet(&mut dev, device_number) };
-        check_cuda(res, "Failed to get CUDA device")?;
+        check_cuda(res, "cuDeviceGet")?;
 
         let mut ctx = std::ptr::null_mut();
         res = unsafe { cuCtxCreate_v2(&mut ctx, 0, dev) };
-        check_cuda(res, "Failed to create ctx")?;
+        check_cuda(res, "cuCtxCreate_v2")?;
 
         Ok(CudaContext { ctx })
     }
@@ -112,11 +113,14 @@ pub struct GpuBuffer {
 }
 
 impl GpuBuffer {
-    pub fn alloc(size: usize) -> Result<Self, String> {
+    pub fn alloc(size: usize) -> Result<Self, FeroceError> {
         // allign to page size
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page_size <= 0 {
-            return Err("Failed to get page size".into());
+            return Err(FeroceError::Cuda {
+                call: "sysconf(_SC_PAGESIZE)",
+                code: -1,
+            });
         }
         let page_size = page_size as usize;
         let alligned_size = size.next_multiple_of(page_size);
@@ -129,7 +133,7 @@ impl GpuBuffer {
 
         let mut dptr = 0;
         let mut res = unsafe { cuMemAlloc_v2(&mut dptr, alligned_size) };
-        check_cuda(res, "Failed to allocate memory")?;
+        check_cuda(res, "cuMemAlloc_v2")?;
 
         let mut dmabuf_fd = 0;
         res = unsafe {
@@ -141,7 +145,7 @@ impl GpuBuffer {
                 0,
             )
         };
-        check_cuda(res, "Failed to get DMA BUF fd")?;
+        check_cuda(res, "cuMemGetHandleForAddressRange")?;
 
         Ok(GpuBuffer {
             dptr,
@@ -163,7 +167,7 @@ pub struct GpuAllocator {
 }
 
 impl GpuAllocator {
-    pub fn new(device_number: i32) -> Result<Self, String> {
+    pub fn new(device_number: i32) -> Result<Self, FeroceError> {
         let ctx = CudaContext::new(device_number)?;
         Ok(GpuAllocator { _ctx: ctx })
     }
@@ -176,7 +180,7 @@ impl BufferAllocator for GpuAllocator {
         &self,
         pd: &ProtectionDomain,
         size: usize,
-    ) -> Result<(Self::Storage, MemoryRegion, u64), String> {
+    ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError> {
         let buff = GpuBuffer::alloc(size)?;
         let base_addr = buff.dptr;
 

@@ -1,8 +1,20 @@
 use log::{debug, info};
 
 use super::ffi;
+use crate::FeroceError;
 use crate::protocol::QpConnectionInfo;
 use std::sync::Arc;
+
+fn rdma_err(call: &'static str) -> FeroceError {
+    FeroceError::Rdma {
+        call,
+        errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    }
+}
+
+fn rdma_err_code(call: &'static str, errno: i32) -> FeroceError {
+    FeroceError::Rdma { call, errno }
+}
 
 pub struct DeviceList {
     list: *mut *mut ffi::ibv_device,
@@ -10,12 +22,12 @@ pub struct DeviceList {
 }
 
 impl DeviceList {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, FeroceError> {
         let mut count: i32 = 0;
         let list = unsafe { ffi::ibv_get_device_list(&mut count) };
 
         if list.is_null() {
-            Err("failed to get rdma device list".to_string())
+            return Err(rdma_err("ibv_get_device_list"));
         } else {
             debug!("Found {} rdma devices", count);
             Ok(DeviceList { list, count })
@@ -66,34 +78,39 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn open(name: &str) -> Result<Self, String> {
+    pub fn open(name: &str) -> Result<Self, FeroceError> {
         let devices = DeviceList::new()?;
 
         for i in 0..devices.len() {
             if devices.device_name(i) == Some(name) {
-                let device_ptr = devices.raw_device(i).ok_or("unable to get device")?;
+                let device_ptr = devices
+                    .raw_device(i)
+                    .ok_or(FeroceError::InvalidArg("unable to get device".to_string()))?;
                 let context = unsafe { ffi::ibv_open_device(device_ptr) };
                 if context.is_null() {
-                    return Err(format!("failed to open device {}", name));
+                    return Err(rdma_err("ibv_open_device"));
                 } else {
                     debug!("Opened device {}", name);
                     return Ok(Device { context });
                 }
             }
         }
-        Err(format!("device '{}' not found", name))
+        Err(FeroceError::InvalidArg(format!(
+            "device '{}' not found",
+            name
+        )))
     }
 
-    pub fn alloc_pd(&self) -> Result<ProtectionDomain, String> {
+    pub fn alloc_pd(&self) -> Result<ProtectionDomain, FeroceError> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.context) };
         if pd.is_null() {
-            Err("failed to alloc protection domain".to_string())
+            Err(rdma_err("ibv_alloc_pd"))
         } else {
             Ok(ProtectionDomain { pd })
         }
     }
 
-    pub fn create_cq(&self, cqe: i32) -> Result<CompletionQueue, String> {
+    pub fn create_cq(&self, cqe: i32) -> Result<CompletionQueue, FeroceError> {
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.context,
@@ -105,7 +122,7 @@ impl Device {
         };
 
         if cq.is_null() {
-            Err("failed to create completion queue".to_string())
+            Err(rdma_err("ibv_create_cq"))
         } else {
             Ok(CompletionQueue { cq })
         }
@@ -115,7 +132,7 @@ impl Device {
         &self,
         cqe: i32,
         comp_channel: &CompletionChannel,
-    ) -> Result<CompletionQueue, String> {
+    ) -> Result<CompletionQueue, FeroceError> {
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.context,
@@ -127,36 +144,36 @@ impl Device {
         };
 
         if cq.is_null() {
-            Err("failed to create completion queue with channel".to_string())
+            Err(rdma_err("ibv_create_cq"))
         } else {
             Ok(CompletionQueue { cq })
         }
     }
 
-    pub fn query_gid(&self, port_num: u8, gid_index: i32) -> Result<ffi::ibv_gid, String> {
+    pub fn query_gid(&self, port_num: u8, gid_index: i32) -> Result<ffi::ibv_gid, FeroceError> {
         let mut gid = ffi::ibv_gid::default();
         let ret = unsafe { ffi::ibv_query_gid(self.context, port_num, gid_index, &mut gid) };
 
         if ret != 0 {
-            Err(format!("failed to query GID: {}", ret))
+            Err(rdma_err_code("ibv_create_cq", ret))
         } else {
             Ok(gid)
         }
     }
 
-    pub fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr, String> {
+    pub fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr, FeroceError> {
         let mut attr = ffi::ibv_port_attr::default();
 
         let ret = unsafe { ffi::ibv_query_port_compact(self.context, port_num, &mut attr) };
 
         if ret != 0 {
-            Err(format!("failed to query port {}: {}", port_num, ret))
+            Err(rdma_err_code("ibv_query_port_compact", ret))
         } else {
             Ok(attr)
         }
     }
 
-    pub fn query_gid_table(&self) -> Result<Vec<ffi::ibv_gid_entry>, String> {
+    pub fn query_gid_table(&self) -> Result<Vec<ffi::ibv_gid_entry>, FeroceError> {
         let max_entries = 64;
         let mut entries = Vec::with_capacity(max_entries);
         let ret = unsafe {
@@ -170,7 +187,7 @@ impl Device {
         };
 
         if ret < 0 {
-            Err(format!("failed to query GID table: {}", ret))
+            Err(rdma_err_code("ibv_query_gid_table", ret as i32))
         } else {
             unsafe {
                 entries.set_len(ret as usize);
@@ -183,7 +200,7 @@ impl Device {
         &self,
         port_num: u8,
         gid_index: i32,
-    ) -> Result<Option<ffi::ibv_mtu>, String> {
+    ) -> Result<Option<ffi::ibv_mtu>, FeroceError> {
         let port_attr = self.query_port(port_num)?;
         let gid_entries = self.query_gid_table()?;
 
@@ -221,26 +238,23 @@ unsafe impl Send for CompletionChannel {}
 unsafe impl Sync for CompletionChannel {}
 
 impl CompletionChannel {
-    pub fn create(device: &Device) -> Result<Self, String> {
+    pub fn create(device: &Device) -> Result<Self, FeroceError> {
         let ch = unsafe { ffi::ibv_create_comp_channel(device.context) };
         if ch.is_null() {
-            Err(format!(
-                "failed to create completion channel: errno {}",
-                std::io::Error::last_os_error()
-            ))
+            Err(rdma_err("ibv_create_comp_channel"))
         } else {
             Ok(CompletionChannel { channel: ch })
         }
     }
 
-    pub fn get_cq_event(&self) -> Result<(), String> {
+    pub fn get_cq_event(&self) -> Result<(), FeroceError> {
         let mut cq: *mut ffi::ibv_cq = std::ptr::null_mut();
         let mut cq_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
 
         let ret = unsafe { ffi::ibv_get_cq_event(self.channel, &mut cq, &mut cq_ctx) };
 
         if ret != 0 {
-            Err("failed to get completion event".to_string())
+            Err(rdma_err_code("ibv_get_cq_event", ret))
         } else {
             Ok(())
         }
@@ -250,7 +264,7 @@ impl CompletionChannel {
     // Checks if data is available on comp channel fd using poll().
     // If a valid event is available in the fd we can call get_cq_event
     // and get the event, which we know that it won't be blocking.
-    pub fn try_get_cq_event(&self, timeout_ms: i32) -> Result<bool, String> {
+    pub fn try_get_cq_event(&self, timeout_ms: i32) -> Result<bool, FeroceError> {
         let fd = unsafe { (*self.channel).fd };
 
         // we want to monitor only the comp channel fd
@@ -269,7 +283,7 @@ impl CompletionChannel {
                     // interrupted by a signal
                     return Ok(false);
                 }
-                return Err(format!("poll failed: {}", err));
+                return Err(rdma_err("poll"));
             }
             0 => return Ok(false), // timeout
             _ => {}                // proceed, data are available
@@ -323,26 +337,26 @@ impl CompletionQueue {
         self.cq
     }
 
-    pub fn poll(&self, completions: &mut [ffi::ibv_wc]) -> Result<usize, String> {
+    pub fn poll(&self, completions: &mut [ffi::ibv_wc]) -> Result<usize, FeroceError> {
         let ctx = unsafe { (*self.cq).context };
         let poll_fn = unsafe { (*ctx).ops.poll_cq.unwrap() };
         let num_completions =
             unsafe { poll_fn(self.cq, completions.len() as i32, completions.as_mut_ptr()) };
 
         if num_completions < 0 {
-            Err(format!("failed polling cq: {}", num_completions))
+            Err(rdma_err_code("ibv_poll_cq", num_completions))
         } else {
             Ok(num_completions as usize)
         }
     }
 
-    pub fn req_notify_cq(&self, solicited: bool) -> Result<(), String> {
+    pub fn req_notify_cq(&self, solicited: bool) -> Result<(), FeroceError> {
         let ctx = unsafe { (*self.cq).context };
         let req_notify_cq_fn = unsafe { (*ctx).ops.req_notify_cq.unwrap() };
         let ret = unsafe { req_notify_cq_fn(self.cq, solicited as i32) };
 
         if ret != 0 {
-            Err("failed to request completion notification for cq".to_string())
+            Err(rdma_err_code("ibv_req_notify_cq", ret))
         } else {
             Ok(())
         }
@@ -391,7 +405,7 @@ impl QueuePair {
         max_wr: u32,
         max_sge: u32,
         qp_type: ffi::ibv_qp_type,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, FeroceError> {
         let mut init_attr = ffi::ibv_qp_init_attr {
             qp_context: std::ptr::null_mut(),
             send_cq: cq.raw(),
@@ -410,10 +424,7 @@ impl QueuePair {
 
         let qp = unsafe { ffi::ibv_create_qp(pd.raw(), &mut init_attr) };
         if qp.is_null() {
-            Err(format!(
-                "failed to create QP: errno {}",
-                std::io::Error::last_os_error()
-            ))
+            Err(rdma_err("ibv_create_qp"))
         } else {
             debug!(
                 "Created QP {}, max WR={}, max SGE={}",
@@ -433,7 +444,7 @@ impl QueuePair {
         unsafe { (*self.qp).qp_num }
     }
 
-    pub fn modify_to_init(&self, port_num: u8) -> Result<(), String> {
+    pub fn modify_to_init(&self, port_num: u8) -> Result<(), FeroceError> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
             port_num,
@@ -446,7 +457,7 @@ impl QueuePair {
 
         let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
         if ret != 0 {
-            Err(format!("Failed to modify QP to INIT: error {}", ret))
+            Err(rdma_err_code("ibv_modify_qp[INIT]", ret))
         } else {
             debug!("QP {} modified from RESET to INIT", self.qp_num());
             Ok(())
@@ -459,7 +470,7 @@ impl QueuePair {
         gid_index: u8,
         port_num: u8,
         mtu: ffi::ibv_mtu,
-    ) -> Result<(), String> {
+    ) -> Result<(), FeroceError> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
             path_mtu: mtu,
@@ -494,7 +505,7 @@ impl QueuePair {
         let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
 
         if ret != 0 {
-            Err(format!("Failed to modify QP to RTR: error {}", ret))
+            Err(rdma_err_code("ibv_modify_qp[RTR]", ret))
         } else {
             debug!(
                 "QP {} modified from INIT to RTR. Local GID Index={}. Remote QPN={}, PSN={}, GID={:?}",
@@ -508,7 +519,7 @@ impl QueuePair {
         }
     }
 
-    pub fn modify_to_rts(&self, sq_psn: u32) -> Result<(), String> {
+    pub fn modify_to_rts(&self, sq_psn: u32) -> Result<(), FeroceError> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
             timeout: 14,
@@ -529,7 +540,7 @@ impl QueuePair {
         let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
 
         if ret != 0 {
-            Err(format!("Failed to modify QP to RTS: error {}", ret))
+            Err(rdma_err_code("ibv_modify_qp[RTS]", ret))
         } else {
             debug!(
                 "QP {} modified from RTR to RTS. Set local psn to {}",
@@ -540,7 +551,7 @@ impl QueuePair {
         }
     }
 
-    pub fn modify_to_error(&self) -> Result<(), String> {
+    pub fn modify_to_error(&self) -> Result<(), FeroceError> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_ERR,
             ..Default::default()
@@ -550,34 +561,34 @@ impl QueuePair {
         let ret = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr, mask.0 as i32) };
 
         if ret != 0 {
-            Err(format!("Failed to modify QP ERROR: error {}", ret))
+            Err(rdma_err_code("ibv_modify_qp[ERR]", ret))
         } else {
             debug!("QP {} modify to ERROR", self.qp_num());
             Ok(())
         }
     }
 
-    pub fn post_recv(&self, wr: &mut ffi::ibv_recv_wr) -> Result<(), String> {
+    pub fn post_recv(&self, wr: &mut ffi::ibv_recv_wr) -> Result<(), FeroceError> {
         let mut bad_wr: *mut ffi::ibv_recv_wr = std::ptr::null_mut();
         let ctx = unsafe { (*self.qp).context };
         let post_recv_fn = unsafe { (*ctx).ops.post_recv.unwrap() };
         let ret = unsafe { post_recv_fn(self.qp, wr, &mut bad_wr) };
 
         if ret != 0 {
-            Err(format!("post_recv failed: {}", ret))
+            Err(rdma_err_code("ibv_post_recv", ret))
         } else {
             Ok(())
         }
     }
     // usefull for building wr and posting in one call
-    pub fn post_send(&self, wr: &mut ffi::ibv_send_wr) -> Result<(), String> {
+    pub fn post_send(&self, wr: &mut ffi::ibv_send_wr) -> Result<(), FeroceError> {
         let mut bad_wr: *mut ffi::ibv_send_wr = std::ptr::null_mut();
         let ctx = unsafe { (*self.qp).context };
         let post_send_fn = unsafe { (*ctx).ops.post_send.unwrap() };
         let ret = unsafe { post_send_fn(self.qp, wr, &mut bad_wr) };
 
         if ret != 0 {
-            Err(format!("post_send failed: {}", ret))
+            Err(rdma_err_code("ibv_post_send", ret))
         } else {
             Ok(())
         }
@@ -664,7 +675,7 @@ impl MemoryRegion {
         pd: &ProtectionDomain,
         buffer: &mut [u8],
         access: ffi::ibv_access_flags,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, FeroceError> {
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 pd.raw(),
@@ -675,10 +686,7 @@ impl MemoryRegion {
         };
 
         if mr.is_null() {
-            Err(format!(
-                "failed to register MR: errno {}",
-                std::io::Error::last_os_error()
-            ))
+            Err(rdma_err("ibv_reg_mr"))
         } else {
             debug!(
                 "Registered MR: addr={:#x}, len={}",
@@ -697,16 +705,13 @@ impl MemoryRegion {
         iova: u64,
         dmabuf_fd: i32,
         access: ffi::ibv_access_flags,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, FeroceError> {
         let mr = unsafe {
             ffi::ibv_reg_dmabuf_mr(pd.raw(), offset, length, iova, dmabuf_fd, access.0 as i32)
         };
 
         if mr.is_null() {
-            Err(format!(
-                "failed to register DMA BUF MR: errno {}",
-                std::io::Error::last_os_error()
-            ))
+            Err(rdma_err("ibv_reg_dmabuf_mr"))
         } else {
             debug!(
                 "Registered DMA BUF MR: addr={:#x}, len={}",

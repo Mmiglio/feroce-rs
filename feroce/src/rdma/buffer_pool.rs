@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use log::debug;
 
+use crate::FeroceError;
 use crate::rdma::{self, device::MemoryRegion, device::ProtectionDomain};
 
 pub trait BufferAllocator: Send + 'static {
@@ -13,7 +14,7 @@ pub trait BufferAllocator: Send + 'static {
         &self,
         pd: &ProtectionDomain,
         size: usize,
-    ) -> Result<(Self::Storage, MemoryRegion, u64), String>;
+    ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError>;
 }
 
 pub struct CpuAllocator;
@@ -24,7 +25,7 @@ impl BufferAllocator for CpuAllocator {
         &self,
         pd: &ProtectionDomain,
         size: usize,
-    ) -> Result<(Self::Storage, MemoryRegion, u64), String> {
+    ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError> {
         let mut data = vec![0u8; size];
         let base_addr = data.as_ptr() as u64;
         let access_flags = rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
@@ -67,7 +68,7 @@ impl<A: BufferAllocator> BufferPool<A> {
         buf_size: usize,
         pd: &ProtectionDomain,
         allocator: &A,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, FeroceError> {
         let (storage, mr, base_addr) = allocator.alloc_and_register(pd, num_buf * buf_size)?;
 
         let free_bufs = VecDeque::from_iter(0..num_buf);
