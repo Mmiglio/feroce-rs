@@ -1,10 +1,11 @@
 # feroce-rs
 
-Rust library and CLI for the [FERoCE](https://github.com/Gabriele-bot/100G-verilog-RoCEv2-lite) (Front-End RoCE) FPGA network stack.
+Rust library and CLI for the [FERoCE](https://github.com/Gabriele-bot/100G-verilog-RoCEv2-lite) (Front-End RoCE) FPGA network stack. Licensed under [MPL-2.0](LICENSE).
 
 This Cargo workspace contains two crates:
 - **feroce**: library implementing the connection manager (CM) protocol, RDMA data path, and GPU bindings.
 - **feroce-cli**: sender/receiver application for testing and benchmarking.
+
 
 ### Requirements
 
