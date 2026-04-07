@@ -27,7 +27,7 @@ impl DeviceList {
         let list = unsafe { ffi::ibv_get_device_list(&mut count) };
 
         if list.is_null() {
-            Err(rdma_err("ibv_get_device_list"));
+            Err(rdma_err("ibv_get_device_list"))
         } else {
             debug!("Found {} rdma devices", count);
             Ok(DeviceList { list, count })
