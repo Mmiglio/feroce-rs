@@ -8,6 +8,7 @@ license = "MPL-2.0"
 default = []
 gpu = ["feroce/gpu"]
 rdma-test = ["feroce/rdma-test"]
+tui = ["ratatui"]
 
 [dependencies]
 clap = { version = "4.5.59", features = ["derive"] }
@@ -15,3 +16,4 @@ env_logger = "0.11.9"
 feroce = { path = "../feroce" }
 log = "0.4.29"
 signal-hook = "0.4.3"
+ratatui = { version = "0.30", optional = true }

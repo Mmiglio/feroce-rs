@@ -1,3 +1,7 @@
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::thread::sleep;
+use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 
 use feroce::rdma;
@@ -5,12 +9,15 @@ use feroce::rdma::buffer_pool::{BufferAllocator, CpuAllocator};
 use feroce::{BufferHandle, BufferPool, CompletionChannel, QueuePair, RdmaEndpoint};
 use log::{debug, error};
 
+#[cfg(feature = "tui")]
+use crate::tui;
 use crate::{CmOpts, RdmaOpts, SenderOpts, common::SessionRunner, stats::StreamStats};
 
 pub fn run(
     cm_opts: &CmOpts,
     rdma_opts: &RdmaOpts,
     send_opts: &SenderOpts,
+    log_buffer: Option<Arc<Mutex<VecDeque<String>>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
     let spawn_poller = |rdma_endpoint: RdmaEndpoint<CpuAllocator>, stream_id: u32| {
@@ -36,7 +43,41 @@ pub fn run(
         (handle, stats)
     };
 
-    let mut runner = SessionRunner::new(cm_opts, rdma_opts, CpuAllocator, spawn_poller)?;
+    // TUI handle — kept alive to call restore() after the runner finishes
+    #[cfg(feature = "tui")]
+    let tui_handle = if let Some(ref buffer) = log_buffer {
+        Some(Arc::new(Mutex::new(tui::Tui::new(Arc::clone(buffer))?)))
+    } else {
+        None
+    };
+
+    // monitoring closure
+    let monitor: Box<dyn FnMut(&[Arc<StreamStats>], Duration) -> bool> = {
+        #[cfg(feature = "tui")]
+        if let Some(ref tui) = tui_handle {
+            let tui_clone = Arc::clone(tui);
+            Box::new(move |stats: &[Arc<StreamStats>], elapsed: Duration| {
+                tui_clone.lock().unwrap().draw(stats, elapsed).unwrap()
+            })
+        } else {
+            Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
+                for s in stats {
+                    s.print_interval_metrics(elapsed);
+                }
+                false
+            })
+        }
+
+        #[cfg(not(feature = "tui"))]
+        Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
+            for s in stats {
+                s.print_interval_metrics(elapsed);
+            }
+            false
+        })
+    };
+
+    let mut runner = SessionRunner::new(cm_opts, rdma_opts, CpuAllocator, spawn_poller, monitor)?;
 
     if cm_opts.active {
         let remote_addr = SocketAddr::new(
@@ -46,6 +87,12 @@ pub fn run(
         runner.connect_and_run(remote_addr, cm_opts.num_streams)?;
     } else {
         runner.listen_and_run()?;
+    }
+
+    // restore terminal if TUI was active
+    #[cfg(feature = "tui")]
+    if let Some(tui) = tui_handle {
+        tui.lock().unwrap().restore()?;
     }
 
     Ok(())
@@ -58,6 +105,12 @@ fn poller_thread<A: BufferAllocator>(
     stats: Arc<StreamStats>,
     num_msgs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // TODO: Remove this
+    // Needed to give time to the receiver (in passive mode) post WR and be ready to receive.
+    // This would require to split session runner in receiver and sender, which is currently
+    // not needed as the sender is for testing purposes only.
+    sleep(Duration::from_secs(1));
+
     // metrics
     let mut total_bytes;
     let mut total_msgs;

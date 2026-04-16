@@ -35,10 +35,11 @@ struct QpContext {
     stats: Arc<StreamStats>,
 }
 
-pub struct SessionRunner<F, A>
+pub struct SessionRunner<F, A, M>
 where
     A: BufferAllocator,
     F: FnMut(RdmaEndpoint<A>, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     rdma_cfg: RdmaConfig,
     device: rdma::device::Device,
@@ -53,18 +54,22 @@ where
 
     // temporary, ideally we should get it from somewhere else
     next_stream_id: u32,
+
+    monitor: M,
 }
 
-impl<F, A> SessionRunner<F, A>
+impl<F, A, M> SessionRunner<F, A, M>
 where
     A: BufferAllocator,
     F: FnMut(RdmaEndpoint<A>, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     pub fn new(
         cm_opts: &CmOpts,
         rdma_opts: &RdmaOpts,
         allocator: A,
         spawn_poller: F,
+        monitor: M,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = Device::open(&rdma_opts.rdma_device)?;
         let active_path_mtu = device
@@ -89,6 +94,7 @@ where
             spawn_poller,
             shutdown,
             next_stream_id: 0,
+            monitor,
         })
     }
 
@@ -169,10 +175,17 @@ where
             }
 
             if last_print.elapsed() >= monitoring_interval {
-                for qp_ctx in self.qps.values() {
-                    qp_ctx.stats.print_interval_metrics(last_print.elapsed());
-                }
+                let stats: Vec<Arc<StreamStats>> = self
+                    .qps
+                    .values()
+                    .map(|ctx| Arc::clone(&ctx.stats))
+                    .collect();
+                let quit = (self.monitor)(&stats, last_print.elapsed());
                 last_print = Instant::now();
+                if quit {
+                    info!("Quit requested, shutting down...");
+                    break;
+                }
             }
         }
 
