@@ -20,8 +20,14 @@ pub fn run(
     log_buffer: Option<Arc<Mutex<VecDeque<String>>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller = |rdma_endpoint: RdmaEndpoint<CpuAllocator>, stream_id: u32| {
-        let stats = Arc::new(StreamStats::new(stream_id, rdma_endpoint.qp.qp_num()));
+    let spawn_poller = |rdma_endpoint: RdmaEndpoint<CpuAllocator>,
+                        stream_id: u32,
+                        remote_qpn: u32| {
+        let stats = Arc::new(StreamStats::new(
+            stream_id,
+            rdma_endpoint.qp.qp_num(),
+            remote_qpn,
+        ));
 
         let handle = std::thread::spawn({
             let num_msgs = send_opts.num_msgs;
@@ -43,7 +49,7 @@ pub fn run(
         (handle, stats)
     };
 
-    // TUI handle — kept alive to call restore() after the runner finishes
+    // TUI handle kept alive to call restore() after the test is done
     #[cfg(feature = "tui")]
     let tui_handle = if let Some(ref buffer) = log_buffer {
         Some(Arc::new(Mutex::new(tui::Tui::new(Arc::clone(buffer))?)))

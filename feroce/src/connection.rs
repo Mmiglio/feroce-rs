@@ -427,7 +427,7 @@ impl ConnectionManager {
         while retry_left > 0 {
             socket.send_to(&msg.pack(), dest)?;
 
-            let (reply_qp_message, _peer_addr) = match Self::recv_message(socket) {
+            let (reply_qp_message, peer_addr) = match Self::recv_message(socket) {
                 Ok((qp_msg, addr)) => (qp_msg, addr),
                 Err(err) => match err {
                     FeroceError::Timeout => {
@@ -441,14 +441,27 @@ impl ConnectionManager {
                 },
             };
 
+            // drop packets from unexpected sources
+            if peer_addr.ip() != dest.ip() {
+                warn!(
+                    "Discarding reply from unexpected source {} (expected {})",
+                    peer_addr.ip(),
+                    dest.ip()
+                );
+                continue;
+            }
+
             if validate(&reply_qp_message) {
                 socket.set_read_timeout(original_socket_timeout)?;
                 return Ok(reply_qp_message);
             } else {
                 retry_left -= 1;
                 warn!(
-                    "Received unexpected reply (flags={:#x}), {} retries left",
+                    "Received unexpected reply (flags={:#x}, loc_qpn={}, rem_qpn={}, rem_ip={:#x}), {} retries left",
                     reply_qp_message.flags.as_byte(),
+                    reply_qp_message.loc_qpn,
+                    reply_qp_message.rem_qpn,
+                    reply_qp_message.rem_ip,
                     retry_left
                 );
                 continue;

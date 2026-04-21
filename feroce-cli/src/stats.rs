@@ -7,6 +7,7 @@ use std::{
 pub struct StreamStats {
     pub id: u32,
     pub qpn: u32,
+    pub remote_qpn: u32,
     pub messages: AtomicU64,
     pub bytes: AtomicU64,
     // interval tracking
@@ -16,11 +17,12 @@ pub struct StreamStats {
 }
 
 impl StreamStats {
-    pub fn new(id: u32, qpn: u32) -> Self {
+    pub fn new(id: u32, qpn: u32, remote_qpn: u32) -> Self {
         let now = Instant::now();
         StreamStats {
             id,
             qpn,
+            remote_qpn,
             messages: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             prev_messages: AtomicU64::new(0),
@@ -48,9 +50,10 @@ impl StreamStats {
     pub fn print_interval_metrics(&self, interval: Duration) {
         let (msgs, bytes, msg_rate, gbps_rate) = self.interval_metrics(interval);
         println!(
-            "Stream {id} (qp {qpn}): {msgs} msgs, {bytes} bytes, {msg_rate:.1} msg/s, {gbps_rate:.2} Gbit/s",
+            "Stream {id} (qp {qpn} <-> {remote_qpn}): {msgs} msgs, {bytes} bytes, {msg_rate:.1} msg/s, {gbps_rate:.2} Gbit/s",
             id = self.id,
             qpn = self.qpn,
+            remote_qpn = self.remote_qpn,
         );
     }
 
@@ -61,9 +64,10 @@ impl StreamStats {
         self.prev_bytes.swap(0, Ordering::Relaxed);
 
         println!(
-            "Summary for stream {} (qp {}), total duration {}s",
+            "Summary for stream {} (qp {} <-> {}), total duration {}s",
             self.id,
             self.qpn,
+            self.remote_qpn,
             total_time.as_secs()
         );
         self.print_interval_metrics(total_time);

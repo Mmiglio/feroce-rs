@@ -1,7 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use feroce::rdma::buffer_pool::CpuAllocator;
+#[cfg(not(feature = "tui"))]
 use std::collections::VecDeque;
 use std::net::IpAddr;
+#[cfg(not(feature = "tui"))]
 use std::sync::{Arc, Mutex};
 
 mod common;

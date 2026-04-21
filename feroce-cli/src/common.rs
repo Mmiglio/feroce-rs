@@ -38,7 +38,7 @@ struct QpContext {
 pub struct SessionRunner<F, A, M>
 where
     A: BufferAllocator,
-    F: FnMut(RdmaEndpoint<A>, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    F: FnMut(RdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
     M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     rdma_cfg: RdmaConfig,
@@ -61,7 +61,7 @@ where
 impl<F, A, M> SessionRunner<F, A, M>
 where
     A: BufferAllocator,
-    F: FnMut(RdmaEndpoint<A>, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    F: FnMut(RdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
     M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     pub fn new(
@@ -120,7 +120,11 @@ where
             connect_endpoint(&rdma_endpoint, &remote_info, &self.rdma_cfg, self.path_mtu)?;
 
             // spawn the poller thread using the closure
-            let (poller_handle, stats) = (self.spawn_poller)(rdma_endpoint, self.next_stream_id);
+            let (poller_handle, stats) = (self.spawn_poller)(
+                rdma_endpoint,
+                self.next_stream_id,
+                remote_info.qp_num,
+            );
             self.next_stream_id += 1;
 
             self.qps.insert(
@@ -220,7 +224,7 @@ where
 
                 // spawn the poller thread
                 let (poller_handle, stats) =
-                    (self.spawn_poller)(rdma_endpoint, self.next_stream_id);
+                    (self.spawn_poller)(rdma_endpoint, self.next_stream_id, remote_qpn);
                 // TODO: maybe get stream id from somewhere? e.g. from the active side.
                 self.next_stream_id += 1;
 
