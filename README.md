@@ -65,7 +65,7 @@ cargo build --release --features tui
 
 Press `Ctrl+C` to quit. When the `--tui` is enabled, logs are written by default to `/tmp/feroce.log`.
 
-[](imgs/tui_example.png)
+![](imgs/tui_example.png)
 
 ## Tests
 
