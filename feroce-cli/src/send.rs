@@ -11,7 +11,11 @@ use log::{debug, error};
 
 #[cfg(feature = "tui")]
 use crate::tui;
-use crate::{CmOpts, RdmaOpts, SenderOpts, common::SessionRunner, stats::StreamStats};
+use crate::{
+    CmOpts, RdmaOpts, SenderOpts,
+    common::{Monitor, SessionRunner},
+    stats::StreamStats,
+};
 
 pub fn run(
     cm_opts: &CmOpts,
@@ -60,7 +64,7 @@ pub fn run(
     };
 
     // monitoring closure
-    let monitor: Box<dyn FnMut(&[Arc<StreamStats>], Duration) -> bool> = {
+    let monitor: Monitor = {
         #[cfg(feature = "tui")]
         if let Some(ref tui) = tui_handle {
             let tui_clone = Arc::clone(tui);

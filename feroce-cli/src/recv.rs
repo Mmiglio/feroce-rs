@@ -9,7 +9,11 @@ use std::{net::SocketAddr, sync::Arc};
 
 #[cfg(feature = "tui")]
 use crate::tui;
-use crate::{CmOpts, RdmaOpts, common::SessionRunner, stats::StreamStats};
+use crate::{
+    CmOpts, RdmaOpts,
+    common::{Monitor, SessionRunner},
+    stats::StreamStats,
+};
 
 pub fn run<A: BufferAllocator>(
     cm_opts: &CmOpts,
@@ -54,7 +58,7 @@ pub fn run<A: BufferAllocator>(
     };
 
     // monitoring closure
-    let monitor: Box<dyn FnMut(&[Arc<StreamStats>], Duration) -> bool> = {
+    let monitor: Monitor = {
         #[cfg(feature = "tui")]
         if let Some(ref tui) = tui_handle {
             let tui_clone = Arc::clone(tui);

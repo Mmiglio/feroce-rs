@@ -35,6 +35,10 @@ struct QpContext {
     stats: Arc<StreamStats>,
 }
 
+/// Callback invoked from the event loop once per monitoring tick.
+/// Returning `true` asks the event loop to shut down (e.g. pressed 'q' or ctrl+c).
+pub type Monitor = Box<dyn FnMut(&[Arc<StreamStats>], Duration) -> bool>;
+
 pub struct SessionRunner<F, A, M>
 where
     A: BufferAllocator,
@@ -120,11 +124,8 @@ where
             connect_endpoint(&rdma_endpoint, &remote_info, &self.rdma_cfg, self.path_mtu)?;
 
             // spawn the poller thread using the closure
-            let (poller_handle, stats) = (self.spawn_poller)(
-                rdma_endpoint,
-                self.next_stream_id,
-                remote_info.qp_num,
-            );
+            let (poller_handle, stats) =
+                (self.spawn_poller)(rdma_endpoint, self.next_stream_id, remote_info.qp_num);
             self.next_stream_id += 1;
 
             self.qps.insert(
