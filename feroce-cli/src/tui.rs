@@ -87,7 +87,13 @@ impl Tui {
 
         // render connections
         let header = Row::new([
-            "Stream", "QPN", "Remote QPN", "Messages", "Bytes", "msg/s", "Gbit/s",
+            "Stream",
+            "QPN",
+            "Remote QPN",
+            "Messages",
+            "Bytes",
+            "msg/s",
+            "Gbit/s",
         ])
         .style(Style::new().cyan().bold());
 
@@ -142,8 +148,8 @@ impl Tui {
             format!("{:.2} Gbit/s", total_gbps).bold().green(),
         ]);
 
-        let totals = Paragraph::new(totals_line)
-            .block(Block::bordered().title("Aggregated".cyan().bold()));
+        let totals =
+            Paragraph::new(totals_line).block(Block::bordered().title("Aggregated".cyan().bold()));
 
         frame.render_widget(totals, totals_area);
 

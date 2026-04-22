@@ -26,34 +26,33 @@ pub fn run(
     >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller = |rdma_endpoint: RdmaEndpoint<CpuAllocator>,
-                        stream_id: u32,
-                        remote_qpn: u32| {
-        let stats = Arc::new(StreamStats::new(
-            stream_id,
-            rdma_endpoint.qp.qp_num(),
-            remote_qpn,
-        ));
+    let spawn_poller =
+        |rdma_endpoint: RdmaEndpoint<CpuAllocator>, stream_id: u32, remote_qpn: u32| {
+            let stats = Arc::new(StreamStats::new(
+                stream_id,
+                rdma_endpoint.qp.qp_num(),
+                remote_qpn,
+            ));
 
-        let handle = std::thread::spawn({
-            let num_msgs = send_opts.num_msgs;
-            let qp = Arc::clone(&rdma_endpoint.qp);
-            let stats = Arc::clone(&stats);
-            move || {
-                if let Err(e) = poller_thread(
-                    qp,
-                    rdma_endpoint.buffer_pool,
-                    rdma_endpoint.comp_channel,
-                    stats,
-                    num_msgs,
-                ) {
-                    error!("poller thread error: {}", e);
+            let handle = std::thread::spawn({
+                let num_msgs = send_opts.num_msgs;
+                let qp = Arc::clone(&rdma_endpoint.qp);
+                let stats = Arc::clone(&stats);
+                move || {
+                    if let Err(e) = poller_thread(
+                        qp,
+                        rdma_endpoint.buffer_pool,
+                        rdma_endpoint.comp_channel,
+                        stats,
+                        num_msgs,
+                    ) {
+                        error!("poller thread error: {}", e);
+                    }
                 }
-            }
-        });
+            });
 
-        (handle, stats)
-    };
+            (handle, stats)
+        };
 
     // TUI handle kept alive to call restore() after the test is done
     #[cfg(feature = "tui")]
