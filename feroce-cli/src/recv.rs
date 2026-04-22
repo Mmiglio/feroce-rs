@@ -2,18 +2,34 @@ use feroce::rdma;
 use feroce::rdma::buffer_pool::BufferAllocator;
 use feroce::{BufferPool, CompletionChannel, QueuePair, RdmaEndpoint};
 use log::{debug, error};
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 
-use crate::{CmOpts, RdmaOpts, common::SessionRunner, stats::StreamStats};
+#[cfg(feature = "tui")]
+use crate::tui;
+use crate::{
+    CmOpts, RdmaOpts,
+    common::{Monitor, SessionRunner},
+    stats::StreamStats,
+};
 
 pub fn run<A: BufferAllocator>(
     cm_opts: &CmOpts,
     rdma_opts: &RdmaOpts,
     allocator: A,
+    #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_buffer: Option<
+        Arc<Mutex<VecDeque<String>>>,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller = |rdma_endpoint: RdmaEndpoint<A>, stream_id: u32| {
-        let stats = Arc::new(StreamStats::new(stream_id, rdma_endpoint.qp.qp_num()));
+    let spawn_poller = |rdma_endpoint: RdmaEndpoint<A>, stream_id: u32, remote_qpn: u32| {
+        let stats = Arc::new(StreamStats::new(
+            stream_id,
+            rdma_endpoint.qp.qp_num(),
+            remote_qpn,
+        ));
 
         let handle = std::thread::spawn({
             let qp = Arc::clone(&rdma_endpoint.qp);
@@ -33,7 +49,41 @@ pub fn run<A: BufferAllocator>(
         (handle, stats)
     };
 
-    let mut runner = SessionRunner::new(cm_opts, rdma_opts, allocator, spawn_poller)?;
+    // TUI handle kept alive to call restore() after the test is done
+    #[cfg(feature = "tui")]
+    let tui_handle = if let Some(ref buffer) = log_buffer {
+        Some(Arc::new(Mutex::new(tui::Tui::new(Arc::clone(buffer))?)))
+    } else {
+        None
+    };
+
+    // monitoring closure
+    let monitor: Monitor = {
+        #[cfg(feature = "tui")]
+        if let Some(ref tui) = tui_handle {
+            let tui_clone = Arc::clone(tui);
+            Box::new(move |stats: &[Arc<StreamStats>], elapsed: Duration| {
+                tui_clone.lock().unwrap().draw(stats, elapsed).unwrap()
+            })
+        } else {
+            Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
+                for s in stats {
+                    s.print_interval_metrics(elapsed);
+                }
+                false
+            })
+        }
+
+        #[cfg(not(feature = "tui"))]
+        Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
+            for s in stats {
+                s.print_interval_metrics(elapsed);
+            }
+            false
+        })
+    };
+
+    let mut runner = SessionRunner::new(cm_opts, rdma_opts, allocator, spawn_poller, monitor)?;
 
     if cm_opts.active {
         let remote_addr = SocketAddr::new(

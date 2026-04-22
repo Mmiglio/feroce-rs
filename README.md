@@ -54,7 +54,18 @@ cargo run -p feroce-cli -- recv --help
 cargo run -p feroce-cli -- send --help
 ```
 
+## TUI dashboard
 
+Build with the `tui` feature and pass `--tui` to enable a live dashboard: 
+
+```sh
+cargo build --release --features tui
+./target/release/feroce-cli --tui recv ...
+```
+
+Press `Ctrl+C` to quit. When the `--tui` is enabled, logs are written by default to `/tmp/feroce.log`.
+
+![](imgs/tui_example.png)
 
 ## Tests
 

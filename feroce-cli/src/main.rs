@@ -1,16 +1,28 @@
 use clap::{Args, Parser, Subcommand};
 use feroce::rdma::buffer_pool::CpuAllocator;
+use std::collections::VecDeque;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 
 mod common;
 mod recv;
 mod send;
 mod stats;
+#[cfg(feature = "tui")]
+mod tui;
+#[cfg(feature = "tui")]
+mod tui_logger;
+
+type LogBuffer = Option<Arc<Mutex<VecDeque<String>>>>;
 
 #[derive(Parser)]
 #[command(name = "feroce-cli")]
 #[command(about = "FEROCE connection manager cli")]
 struct Cli {
+    /// Enable TUI dashboard (requires building with --features tui)
+    #[arg(long)]
+    tui: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -101,10 +113,30 @@ fn parse_hex(s: &str) -> Result<u16, String> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+fn init_logging(tui: bool) -> Result<LogBuffer, Box<dyn std::error::Error>> {
+    #[cfg(feature = "tui")]
+    if tui {
+        let buff = tui_logger::init(
+            std::path::Path::new("/tmp/feroce.log"),
+            log::LevelFilter::Info,
+            100,
+        )?;
+        return Ok(Some(buff));
+    }
 
+    #[cfg(not(feature = "tui"))]
+    if tui {
+        eprintln!("warning: --tui requires building with --features tui; continuing without TUI");
+    }
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    Ok(None)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    let log_buffer = init_logging(cli.tui)?;
 
     match cli.command {
         Commands::Recv {
@@ -119,14 +151,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     use feroce::rdma::gpu::GpuAllocator;
 
                     let allocator = GpuAllocator::new(0)?;
-                    recv::run(&cm_opts, &rdma_opts, allocator)?;
+                    recv::run(&cm_opts, &rdma_opts, allocator, log_buffer)?;
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
                     return Err("--gpu requires building with --features gpu".into());
                 }
             } else {
-                recv::run(&cm_opts, &rdma_opts, CpuAllocator)?;
+                recv::run(&cm_opts, &rdma_opts, CpuAllocator, log_buffer)?;
             }
             Ok(())
         }
@@ -135,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rdma_opts,
             sender_opts,
         } => {
-            send::run(&cm_opts, &rdma_opts, &sender_opts)?;
+            send::run(&cm_opts, &rdma_opts, &sender_opts, log_buffer)?;
             Ok(())
         }
     }
