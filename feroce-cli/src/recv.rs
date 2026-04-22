@@ -15,7 +15,9 @@ pub fn run<A: BufferAllocator>(
     cm_opts: &CmOpts,
     rdma_opts: &RdmaOpts,
     allocator: A,
-    log_buffer: Option<Arc<Mutex<VecDeque<String>>>>,
+    #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_buffer: Option<
+        Arc<Mutex<VecDeque<String>>>,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
     let spawn_poller = |rdma_endpoint: RdmaEndpoint<A>, stream_id: u32, remote_qpn: u32| {
@@ -87,12 +89,6 @@ pub fn run<A: BufferAllocator>(
         runner.connect_and_run(remote_addr, cm_opts.num_streams)?;
     } else {
         runner.listen_and_run()?;
-    }
-
-    // restore terminal if TUI was active
-    #[cfg(feature = "tui")]
-    if let Some(tui) = tui_handle {
-        tui.lock().unwrap().restore()?;
     }
 
     Ok(())

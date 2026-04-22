@@ -1,9 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use feroce::rdma::buffer_pool::CpuAllocator;
-#[cfg(not(feature = "tui"))]
 use std::collections::VecDeque;
 use std::net::IpAddr;
-#[cfg(not(feature = "tui"))]
 use std::sync::{Arc, Mutex};
 
 mod common;
@@ -15,12 +13,13 @@ mod tui;
 #[cfg(feature = "tui")]
 mod tui_logger;
 
+type LogBuffer = Option<Arc<Mutex<VecDeque<String>>>>;
+
 #[derive(Parser)]
 #[command(name = "feroce-cli")]
 #[command(about = "FEROCE connection manager cli")]
 struct Cli {
-    /// Enable TUI dashboard
-    #[cfg(feature = "tui")]
+    /// Enable TUI dashboard (requires building with --features tui)
     #[arg(long)]
     tui: bool,
 
@@ -114,27 +113,30 @@ fn parse_hex(s: &str) -> Result<u16, String> {
     }
 }
 
+fn init_logging(tui: bool) -> Result<LogBuffer, Box<dyn std::error::Error>> {
+    #[cfg(feature = "tui")]
+    if tui {
+        let buff = tui_logger::init(
+            std::path::Path::new("/tmp/feroce.log"),
+            log::LevelFilter::Info,
+            100,
+        )?;
+        return Ok(Some(buff));
+    }
+
+    #[cfg(not(feature = "tui"))]
+    if tui {
+        eprintln!("warning: --tui requires building with --features tui; continuing without TUI");
+    }
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    Ok(None)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // start the TUI
-    #[cfg(feature = "tui")]
-    let log_buffer = if cli.tui {
-        use std::path::Path;
-
-        let buff = tui_logger::init(Path::new("/tmp/feroce.log"), log::LevelFilter::Info, 100)?;
-        Some(buff)
-    } else {
-        // configure the standard env logger
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-        None
-    };
-
-    #[cfg(not(feature = "tui"))]
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    #[cfg(not(feature = "tui"))]
-    let log_buffer: Option<Arc<Mutex<VecDeque<String>>>> = None;
+    let log_buffer = init_logging(cli.tui)?;
 
     match cli.command {
         Commands::Recv {

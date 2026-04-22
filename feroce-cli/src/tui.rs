@@ -177,13 +177,6 @@ impl Tui {
         frame.render_widget(log_panel, bottom);
     }
 
-    pub fn restore(&mut self) -> Result<(), Box<dyn Error>> {
-        ratatui::crossterm::execute!(stdout(), LeaveAlternateScreen)?;
-        disable_raw_mode()?;
-
-        Ok(())
-    }
-
     fn format_bytes(b: u64) -> String {
         let units = ["B", "KB", "MB", "GB", "TB"];
         let mut val = b as f64;
@@ -194,5 +187,12 @@ impl Tui {
         }
 
         format!("{:.2} {}", val, units[unit_idx])
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::execute!(stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
     }
 }

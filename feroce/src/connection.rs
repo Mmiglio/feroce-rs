@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::protocol::{
     AckType, QP_MESSAGE_SIZE, QpConnectionInfo, QpFlags, QpMessage, RequestType, gid_from_ipv4,
@@ -11,6 +11,9 @@ use crate::protocol::{
 };
 
 use crate::FeroceError;
+
+// throttle re-ACKs for duplicate OpenQP requests. Helps to avoid req storms.
+const REACK_INTERVAL: Duration = Duration::from_millis(100);
 
 // Pending connection request, consumed when handshake finishes
 enum PendingQp {
@@ -41,11 +44,16 @@ struct QpContext {
 struct ActiveQp {
     phase: QpPhase,
     ctx: QpContext,
+    last_ack_sent: Instant,
 }
 
 impl ActiveQp {
     fn new(phase: QpPhase, ctx: QpContext) -> Self {
-        ActiveQp { phase, ctx }
+        ActiveQp {
+            phase,
+            ctx,
+            last_ack_sent: Instant::now(),
+        }
     }
 
     fn transition_to_running(&mut self) -> Result<(), FeroceError> {
@@ -199,12 +207,20 @@ impl ConnectionManager {
         );
 
         // check if the QP already exists (duplicate open / retransmission)
-        let duplicate = self.qps.values().find(|active_qp| {
+        let duplicate = self.qps.values_mut().find(|active_qp| {
             active_qp.ctx.remote_info.qp_num == qp_msg.loc_qpn
                 && ipv4_from_gid(&active_qp.ctx.remote_info.gid) == qp_msg.loc_ip
         });
 
         if let Some(active_qp) = duplicate {
+            if active_qp.last_ack_sent.elapsed() < REACK_INTERVAL {
+                debug!(
+                    "Suppressing duplicate OpenQP for remote QPN {} from {} (rate-limited)",
+                    remote_info.qp_num, peer_addr
+                );
+                return Ok(None);
+            }
+
             warn!(
                 "Remote QPN {} from {} already connected. Sending new ACK",
                 remote_info.qp_num, peer_addr
@@ -216,6 +232,7 @@ impl ConnectionManager {
                 QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
                 SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
             )?;
+            active_qp.last_ack_sent = Instant::now();
 
             Ok(None)
         } else {
@@ -993,7 +1010,7 @@ mod test {
         let cm_handle = thread::spawn(move || {
             let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
 
-            // first (real connection)
+            // first real connection
             let event1 = cm.process_next().unwrap();
             match event1 {
                 CmEvent::NewConnection {
@@ -1038,6 +1055,9 @@ mod test {
         let ack1 = QpMessage::unpack(&buf).unwrap();
         assert_eq!(ack1.flags.ack_type().unwrap(), AckType::Ack);
 
+        // wait past the re-ACK rate limit
+        thread::sleep(REACK_INTERVAL + Duration::from_millis(50));
+
         sender
             .send_to(&msg1.pack(), format!("127.0.0.1:{}", cm_port))
             .unwrap();
@@ -1071,6 +1091,78 @@ mod test {
                 panic!("unexpected request");
             }
         }
+    }
+
+    #[test]
+    fn duplicate_open_qp_rate_limits_acks() {
+        // Duplicates arriving within REACK_INTERVAL are suppressed silently
+        let cm_port = 0x4328 as u16;
+
+        let (_, receiver_info) = make_test_infos();
+
+        let cm_handle = thread::spawn(move || {
+            let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
+
+            // first real connection, completes handshake
+            let event1 = cm.process_next().unwrap();
+            match event1 {
+                CmEvent::NewConnection {
+                    peer_ip,
+                    remote_qpn,
+                    ..
+                } => {
+                    cm.set_local_info(peer_ip, remote_qpn, &receiver_info)
+                        .unwrap();
+                }
+                _ => panic!("unexpected request"),
+            }
+
+            // duplicate arrives within the rate-limit window -> no event, no ACK
+            cm.set_read_timeout(Duration::from_millis(200)).unwrap();
+            let result = cm.try_process_next().unwrap();
+            assert!(result.is_none());
+
+            cm
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let sender_port = sender.local_addr().unwrap().port();
+        let mut buf = [0u8; QP_MESSAGE_SIZE];
+
+        let msg = QpMessage {
+            flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
+            loc_qpn: 42,
+            loc_psn: 1234,
+            loc_rkey: 0xDEAD,
+            loc_base_addr: 0xDEADBEEF,
+            loc_ip: 0x7F000001,
+            udp_port: sender_port,
+            ..Default::default()
+        };
+
+        sender
+            .send_to(&msg.pack(), format!("127.0.0.1:{}", cm_port))
+            .unwrap();
+        sender.recv_from(&mut buf).unwrap();
+        let ack1 = QpMessage::unpack(&buf).unwrap();
+        assert_eq!(ack1.flags.ack_type().unwrap(), AckType::Ack);
+
+        // duplicate immediately after -> should be rate-limited, no ACK
+        sender
+            .send_to(&msg.pack(), format!("127.0.0.1:{}", cm_port))
+            .unwrap();
+        let res = sender.recv_from(&mut buf);
+        assert!(
+            res.is_err(),
+            "expected recv timeout (duplicate should be rate-limited)"
+        );
+
+        cm_handle.join().unwrap();
     }
 
     #[test]
