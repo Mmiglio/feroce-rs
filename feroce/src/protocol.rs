@@ -95,6 +95,62 @@ impl QpFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TxType {
+    Send = 0,
+    Write = 1,
+}
+
+// tx_meta_flags byte layout:
+// bit 0:     valid
+// bits 1:    start (trigger the generator)
+// bit 2:     immediate (RDMA immediate transfer)
+// bits 3:    tx_type (0=send, 1=write)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxMetaFlags {
+    raw_byte: u8,
+}
+
+impl TxMetaFlags {
+    pub fn new(start: bool, immediate: bool, tx_type: TxType) -> Self {
+        TxMetaFlags {
+            raw_byte: 0x1
+                | ((start as u8) << 1)
+                | ((immediate as u8) << 2)
+                | ((tx_type as u8) << 3),
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Self {
+        TxMetaFlags { raw_byte: byte }
+    }
+
+    pub fn as_byte(&self) -> u8 {
+        self.raw_byte
+    }
+
+    pub fn valid(&self) -> bool {
+        (self.raw_byte & 0x1) == 1
+    }
+
+    pub fn start(&self) -> bool {
+        ((self.raw_byte >> 1) & 0x1) == 1
+    }
+
+    pub fn immediate(&self) -> bool {
+        ((self.raw_byte >> 2) & 0x1) == 1
+    }
+
+    pub fn tx_type(&self) -> TxType {
+        match (self.raw_byte >> 3) & 0x1 {
+            0 => TxType::Send,
+            1 => TxType::Write,
+            _ => unreachable!(),
+        }
+    }
+}
+
 pub const QP_MESSAGE_SIZE: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QpMessage {
@@ -403,6 +459,27 @@ mod test {
         assert_eq!(flags.request_type(), Ok(RequestType::SendQpInfo));
         assert_eq!(flags.ack_type(), Ok(AckType::Ack));
         assert_eq!(flags.ack_valid(), true);
+    }
+
+    #[test]
+    fn tx_meta_flags_encode_decode() {
+        let f = TxMetaFlags::new(true, false, TxType::Write);
+        assert_eq!(f.valid(), true);
+        assert_eq!(f.start(), true);
+        assert_eq!(f.immediate(), false);
+        assert_eq!(f.tx_type(), TxType::Write);
+        // 0x1 | (1<<1) | (0<<2) | (1<<3) = 0x0B
+        assert_eq!(f.as_byte(), 0x0B);
+    }
+
+    #[test]
+    fn tx_meta_flags_from_byte() {
+        // 0x1 | (1<<1) | (0<<2) | (1<<3) = 0x0B
+        let tx_flags = TxMetaFlags::from_byte(0x0B);
+        assert_eq!(tx_flags.valid(), true);
+        assert_eq!(tx_flags.start(), true);
+        assert_eq!(tx_flags.immediate(), false);
+        assert_eq!(tx_flags.tx_type(), TxType::Write);
     }
 
     #[test]

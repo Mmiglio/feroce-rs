@@ -468,6 +468,23 @@ impl ConnectionManager {
                 continue;
             }
 
+            // peer signaled a rejet (No available qps, other errors), exit
+            if reply_qp_message.flags.ack_valid() {
+                match reply_qp_message.flags.ack_type() {
+                    Ok(AckType::NoQp) => {
+                        warn!("Peer has no QP resources available");
+                        socket.set_read_timeout(original_socket_timeout)?;
+                        return Err(FeroceError::PeerNoResources);
+                    }
+                    Ok(AckType::AckError) => {
+                        warn!("Peer replied with error ack");
+                        socket.set_read_timeout(original_socket_timeout)?;
+                        return Err(FeroceError::PeerAckError);
+                    }
+                    _ => {}
+                }
+            }
+
             if validate(&reply_qp_message) {
                 socket.set_read_timeout(original_socket_timeout)?;
                 return Ok(reply_qp_message);

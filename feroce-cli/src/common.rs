@@ -14,7 +14,7 @@ use feroce::{
     CmEvent, ConnectionManager, Device, FeroceError, QueuePair, RdmaConfig, RdmaEndpoint,
     connect_endpoint, setup_endpoint,
 };
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::{CmOpts, RdmaOpts, stats::StreamStats};
 
@@ -194,14 +194,21 @@ where
             }
         }
 
-        // event loop has been interrupted, clean up resources
-        for (qpn, qp_ctx) in self.qps.drain() {
-            qp_ctx.qp.modify_to_error()?;
+        // event loop has been interrupted, clean up remaining resources
+        // best-effort: a failing close_qp must not prevent the rest from being cleaned up
+        let qpns: Vec<u32> = self.qps.keys().copied().collect();
+        for qpn in qpns {
+            let qp_ctx = self.qps.remove(&qpn).unwrap();
+            if let Err(e) = qp_ctx.qp.modify_to_error() {
+                warn!("Failed to transition QP {qpn} to error: {e}");
+            }
             let _ = qp_ctx.poller_handle.join();
             println!("[Done] Summary:");
             qp_ctx.stats.print_summary();
 
-            self.cm.close_qp(qpn, Duration::from_secs(2), 2)?;
+            if let Err(e) = self.cm.close_qp(qpn, Duration::from_secs(2), 2) {
+                warn!("Failed to close QP {qpn}: {e}");
+            }
         }
 
         Ok(())
@@ -276,15 +283,43 @@ where
             .map(|(qpn, _)| *qpn)
             .collect();
 
+        // best-effort: a failing close on one stream must not abort the others
         for qpn in finished {
             let ctx = self.qps.remove(&qpn).unwrap();
-            ctx.qp.modify_to_error()?;
+            if let Err(e) = ctx.qp.modify_to_error() {
+                warn!("Failed to transition QP {qpn} to error: {e}");
+            }
             let _ = ctx.poller_handle.join();
             println!("[Done] Summary:");
             ctx.stats.print_summary();
-            self.cm.close_qp(qpn, Duration::from_secs(2), 2)?;
+            if let Err(e) = self.cm.close_qp(qpn, Duration::from_secs(2), 2) {
+                warn!("Failed to close QP {qpn}: {e}");
+            }
         }
 
         Ok(())
+    }
+}
+
+impl<F, A, M> Drop for SessionRunner<F, A, M>
+where
+    A: BufferAllocator,
+    F: FnMut(RdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
+{
+    fn drop(&mut self) {
+        if self.qps.is_empty() {
+            return;
+        }
+        info!("Cleaning up {} open QP(s) on shutdown", self.qps.len());
+        for (qpn, qp_ctx) in self.qps.drain() {
+            if let Err(e) = qp_ctx.qp.modify_to_error() {
+                warn!("Failed to transition QP {qpn} to error: {e}");
+            }
+            let _ = qp_ctx.poller_handle.join();
+            if let Err(e) = self.cm.close_qp(qpn, Duration::from_millis(500), 1) {
+                warn!("Failed to close QP {qpn}: {e}");
+            }
+        }
     }
 }
