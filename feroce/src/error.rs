@@ -8,6 +8,10 @@ pub enum FeroceError {
     Protocol(String),
     /// CM timeout
     Timeout,
+    /// Peer rejected the connection (no QP resources available)
+    PeerNoResources,
+    /// Peer signaled an error in its ack
+    PeerAckError,
     /// Invalid argument
     InvalidArg(String),
     /// RDMA verbs failures
@@ -31,6 +35,8 @@ impl std::fmt::Display for FeroceError {
             FeroceError::Io(e) => write!(f, "IO error: {}", e),
             FeroceError::Protocol(msg) => write!(f, "Protocol error: {}", msg),
             FeroceError::Timeout => write!(f, "Timeout"),
+            FeroceError::PeerNoResources => write!(f, "Peer rejected: no QP resources available"),
+            FeroceError::PeerAckError => write!(f, "Peer replied with error ack"),
             FeroceError::InvalidArg(msg) => write!(f, "Invalid argument: {}", msg),
             FeroceError::Rdma { call, errno } => write!(f, "{call} failed (errno {errno})"),
             #[cfg(feature = "gpu")]

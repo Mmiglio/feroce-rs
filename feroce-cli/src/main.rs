@@ -4,7 +4,10 @@ use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use crate::ctrl::{run_close_qp, run_txmeta};
+
 mod common;
+mod ctrl;
 mod recv;
 mod send;
 mod stats;
@@ -19,10 +22,6 @@ type LogBuffer = Option<Arc<Mutex<VecDeque<String>>>>;
 #[command(name = "feroce-cli")]
 #[command(about = "FEROCE connection manager cli")]
 struct Cli {
-    /// Enable TUI dashboard (requires building with --features tui)
-    #[arg(long)]
-    tui: bool,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -73,6 +72,9 @@ struct SenderOpts {
     /// Number of messages sent per stream
     #[arg(long, default_value = "100")]
     num_msgs: u64,
+    /// Enable TUI dashboard (requires building with --features tui)
+    #[arg(long)]
+    tui: bool,
 }
 
 #[derive(Args)]
@@ -80,6 +82,71 @@ struct ReceiverOpts {
     /// Receive on GPU memory
     #[arg(long)]
     gpu: bool,
+    /// Enable TUI dashboard (requires building with --features tui)
+    #[arg(long)]
+    tui: bool,
+}
+
+#[derive(Args)]
+struct CtrlOpts {
+    /// IP address to bind the CM to
+    #[arg(long, default_value = "0.0.0.0")]
+    bind_addr: IpAddr,
+    /// Local CM port
+    #[arg(long, default_value = "0xbeef", value_parser = parse_hex)]
+    cm_port: u16,
+    /// Remote CM address (Required for the active side)
+    #[arg(long)]
+    remote_addr: IpAddr,
+    /// Remote CM port (Required for the active side)
+    #[arg(long, value_parser = parse_hex)]
+    remote_port: u16,
+}
+
+#[derive(Args)]
+struct TxMetaOpts {
+    /// remote QP number
+    #[arg(long, default_value = "0x100", value_parser = parse_hex_u32)]
+    rem_qpn: u32,
+    /// message size in bytes
+    #[arg(long, default_value = "4096")]
+    length: u32,
+    /// message rate in hz (0 = max rate)
+    #[arg(long, default_value = "0")]
+    msg_rate_hz: u32,
+    /// number of transfers
+    #[arg(long, default_value = "1")]
+    n_transfers: u32,
+    /// data generator clock in hz
+    #[arg(long, default_value = "322265000")]
+    clock: u32,
+    /// send/write with immediate data
+    #[arg(long)]
+    immediate: bool,
+    /// use RDMA WRITE (default is SEND)
+    #[arg(long)]
+    write: bool,
+}
+
+#[derive(Args)]
+struct CloseQpOpts {
+    /// remote QP number to close
+    #[arg(long, value_parser = parse_hex_u32)]
+    rem_qpn: u32,
+    /// per-attempt reply timeout
+    #[arg(long, default_value = "1000")]
+    timeout_ms: u64,
+    /// number of send attempts before giving up
+    #[arg(long, default_value = "3")]
+    retries: u32,
+}
+
+#[derive(Subcommand)]
+enum CtrlCommand {
+    /// Send TX meta to configure/start the firmware data generator
+    TxMeta(TxMetaOpts),
+    /// Ask the peer to close a QP
+    CloseQp(CloseQpOpts),
 }
 
 #[derive(Subcommand)]
@@ -103,6 +170,13 @@ enum Commands {
         #[command(flatten)]
         sender_opts: SenderOpts,
     },
+    /// Firmware data generator control
+    Ctrl {
+        #[command(flatten)]
+        ctrl_opts: CtrlOpts,
+        #[command(subcommand)]
+        command: CtrlCommand,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u16, String> {
@@ -110,6 +184,14 @@ fn parse_hex(s: &str) -> Result<u16, String> {
         u16::from_str_radix(hex, 16).map_err(|e| e.to_string())
     } else {
         s.parse::<u16>().map_err(|e| e.to_string())
+    }
+}
+
+fn parse_hex_u32(s: &str) -> Result<u32, String> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else {
+        s.parse::<u32>().map_err(|e| e.to_string())
     }
 }
 
@@ -136,14 +218,13 @@ fn init_logging(tui: bool) -> Result<LogBuffer, Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let log_buffer = init_logging(cli.tui)?;
-
     match cli.command {
         Commands::Recv {
             cm_opts,
             rdma_opts,
             receiver_opts,
         } => {
+            let log_buffer = init_logging(receiver_opts.tui)?;
             // pick the selected allocator
             if receiver_opts.gpu {
                 #[cfg(feature = "gpu")]
@@ -167,8 +248,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rdma_opts,
             sender_opts,
         } => {
+            let log_buffer = init_logging(sender_opts.tui)?;
             send::run(&cm_opts, &rdma_opts, &sender_opts, log_buffer)?;
             Ok(())
+        }
+        Commands::Ctrl { ctrl_opts, command } => {
+            init_logging(false)?;
+            match command {
+                CtrlCommand::TxMeta(opts) => Ok(run_txmeta(&ctrl_opts, &opts)?),
+                CtrlCommand::CloseQp(opts) => Ok(run_close_qp(&ctrl_opts, &opts)?),
+            }
         }
     }
 }

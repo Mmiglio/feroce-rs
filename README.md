@@ -18,54 +18,95 @@ This Cargo workspace contains two crates:
 
 ### Build
 
-```bash
-cargo build --release
+Optional features (can be combine as needed):
 
-# with GPUDirect support
-cargo build --release --features gpu
-```
-## Usage
-Start the receiver (passive mode, waits for connections):
 ```bash
-cargo run -p feroce-cli --release -- recv \
+cargo build --release --features gpu       # GPUDirect support
+cargo build --release --features tui       # TUI dashboard
+cargo build --release --features gpu,tui   # both
+```
+
+The binary is produced at `./target/release/feroce-cli`.
+
+## Usage
+
+Start the receiver (passive mode, waits for connections):
+
+```bash
+./target/release/feroce-cli recv \
       --rdma-device mlx5_0 --gid-index 3 \
       --buf-size 16384 --num-buf 128
 ```
 
 Then the sender (active side, initiates the connection):
+
 ```bash
-cargo run -p feroce-cli --release -- send \
+./target/release/feroce-cli send \
       --rdma-device mlx5_0 --gid-index 3 \
       --buf-size 16384 --num-buf 128 \
       --active --remote-addr 192.168.1.1 --remote-port 0x4321 \
       --num-msgs 100000
 ```
 
-For GPUDirect, add the `gpu` feature to the receiver (sender settings stay the same):
+For GPUDirect, build with `--features gpu` and pass `--gpu` to the receiver (sender settings stay the same):
+
 ```bash
-cargo run -p feroce-cli --release --features gpu -- recv \
+./target/release/feroce-cli recv \
       --rdma-device mlx5_0 --gid-index 3 \
       --buf-size 16384 --num-buf 128 --gpu
 ```
 
 See all available options with:
+
 ```bash
-cargo run -p feroce-cli -- recv --help
-cargo run -p feroce-cli -- send --help
+./target/release/feroce-cli recv --help
+./target/release/feroce-cli send --help
 ```
 
 ## TUI dashboard
 
-Build with the `tui` feature and pass `--tui` to enable a live dashboard: 
+Build with the `tui` feature and pass `--tui` to the `recv` or `send` subcommand to enable a live dashboard:
 
-```sh
-cargo build --release --features tui
-./target/release/feroce-cli --tui recv ...
+```bash
+./target/release/feroce-cli recv --tui ...
 ```
 
-Press `Ctrl+C` to quit. When the `--tui` is enabled, logs are written by default to `/tmp/feroce.log`.
+Press `Ctrl+C` to quit. When `--tui` is enabled, logs are written by default to `/tmp/feroce.log`.
 
 ![](imgs/tui_example.png)
+
+## Control commands (test firmware only)
+
+The `ctrl` subcommand sends UDP control messages to the data generator present in the test firmware. It is **not** part of the normal data flow — `send`/`recv` handle their own connection lifecycle, including QP cleanup on shutdown. Use `ctrl` only when interacting with the test-firmware data generator or when a stale QP needs to be closed manually after an unclean exit.
+
+### Start a transfer (`tx-meta`)
+
+Configure and trigger the firmware data generator:
+
+```bash
+./target/release/feroce-cli ctrl \
+      --remote-addr 22.1.212.10 --remote-port 0x4321 \
+      tx-meta --rem-qpn 0x100 --length 16384 --n-transfers 10000
+```
+
+### Close a remote QP (`close-qp`)
+
+```bash
+./target/release/feroce-cli ctrl \
+      --remote-addr 22.1.212.10 --remote-port 0x4321 \
+      close-qp --rem-qpn 256
+```
+
+On success the log shows `CloseQP acknowledged`.
+
+> Normally you don't need to run `close-qp` manually — `feroce-cli recv` closes all open QPs on shutdown (including Ctrl+C, errors, and partial-setup failures). This command exists for the rare case where the application exits without cleaning up.
+
+All available options can be viewed with:
+
+```bash
+./target/release/feroce-cli ctrl tx-meta --help
+./target/release/feroce-cli ctrl close-qp --help
+```
 
 ## Tests
 
