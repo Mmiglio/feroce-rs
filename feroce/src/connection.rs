@@ -149,11 +149,25 @@ impl ConnectionManager {
 
     pub fn process_next(&mut self) -> Result<CmEvent, FeroceError> {
         loop {
-            let (qp_msg, peer_addr) = Self::recv_message(&self.socket)?;
+            let (qp_msg, peer_addr) = match Self::recv_message(&self.socket) {
+                Ok(v) => v,
+                Err(FeroceError::Protocol(msg)) => {
+                    warn!("Discarding malformed CM packet: {}", msg);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
-            let request_type = qp_msg.flags.request_type().map_err(|val| {
-                FeroceError::Protocol(format!("Received unknown request value {}", val))
-            })?;
+            let request_type = match qp_msg.flags.request_type() {
+                Ok(rt) => rt,
+                Err(val) => {
+                    warn!(
+                        "Discarding CM packet from {} with unknown request type {}",
+                        peer_addr, val
+                    );
+                    continue;
+                }
+            };
 
             match request_type {
                 RequestType::OpenQp => {
@@ -173,8 +187,12 @@ impl ConnectionManager {
                         continue;
                     }
                 }
-                _ => {
-                    return Err(FeroceError::Protocol("Invalid request".to_string()));
+                other => {
+                    warn!(
+                        "Discarding CM packet from {} with unexpected request type {:?}",
+                        peer_addr, other
+                    );
+                    continue;
                 }
             }
         }
@@ -797,9 +815,13 @@ mod test {
 
     #[test]
     fn connection_manager_binds_to_port() {
-        let cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 17170).unwrap();
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-        let cm_bad = ConnectionManager::new("127.0.0.1".parse().unwrap(), 17170);
+        let cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), port).unwrap();
+
+        let cm_bad = ConnectionManager::new("127.0.0.1".parse().unwrap(), port);
         assert!(cm_bad.is_err());
 
         drop(cm);
@@ -807,14 +829,12 @@ mod test {
 
     #[test]
     fn process_next_handles_open_qp() {
-        let cm_port = 0x4321 as u16;
-
         let (sender_info, _) = make_test_infos();
 
-        let cm_handle = thread::spawn(move || {
-            let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
-            cm.process_next().unwrap()
-        });
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let cm_port = cm.cm_port().unwrap();
+
+        let cm_handle = thread::spawn(move || cm.process_next().unwrap());
 
         thread::sleep(Duration::from_millis(50));
 
@@ -840,13 +860,13 @@ mod test {
 
     #[test]
     fn receiver_handshake_open_qp() {
-        let cm_port = 0x4322 as u16;
-
         let (sender_info, receiver_info) = make_test_infos();
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let cm_port = cm.cm_port().unwrap();
 
         // receiver thread
         let cm_handle = thread::spawn(move || {
-            let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
             let event = cm.process_next().unwrap();
 
             match event {
@@ -909,9 +929,7 @@ mod test {
 
     #[test]
     fn invalid_set_local_info() {
-        let cm_port = 0x4323 as u16;
-
-        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
 
         let (sender_info, receiver_info) = make_test_infos();
 
@@ -924,39 +942,81 @@ mod test {
     }
 
     #[test]
-    fn invalid_qp_message() {
-        let cm_port = 0x4324 as u16;
+    fn malformed_packet_is_discarded() {
+        // malformed datagram should be logged and dropped, leaving the CM ready to process
+        // the next good message.
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        // Short read timeout so try_process_next returns Ok(None) once the
+        // recv_from call times out, confirming the CM is still alive.
+        cm.set_read_timeout(Duration::from_millis(200)).unwrap();
+        let cm_port = cm.cm_port().unwrap();
 
-        let cm_handle = thread::spawn(move || {
-            let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
-            cm.process_next()
-        });
+        let cm_handle = thread::spawn(move || cm.try_process_next());
 
         thread::sleep(Duration::from_millis(50));
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let buf = [0u8; QP_MESSAGE_SIZE + 1]; //send a larger message
-
+        let buf = [0u8; QP_MESSAGE_SIZE + 1]; // oversized
         sender_socket
             .send_to(&buf, format!("127.0.0.1:{}", cm_port))
             .unwrap();
 
         let res = cm_handle.join().unwrap();
-        assert!(matches!(res, Err(FeroceError::Protocol(_))));
+        assert!(
+            matches!(res, Ok(None)),
+            "expected CM to survive malformed packet (Ok(None)), got something else"
+        );
+    }
+
+    #[test]
+    fn malformed_then_valid_packet_is_processed() {
+        // malformed_packet_is_discarded and the next one is processed 
+        let (sender_info, _) = make_test_infos();
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let cm_port = cm.cm_port().unwrap();
+
+        let cm_handle = thread::spawn(move || cm.process_next().unwrap());
+
+        thread::sleep(Duration::from_millis(50));
+
+        // garbage packet
+        let noise_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let garbage = [0xAAu8; QP_MESSAGE_SIZE + 7];
+        noise_socket
+            .send_to(&garbage, format!("127.0.0.1:{}", cm_port))
+            .unwrap();
+
+        //OpenQP from a different sender socket
+        thread::sleep(Duration::from_millis(20));
+        let _sender = send_open_qp(cm_port, sender_info.qp_num, sender_info.psn);
+
+        let event = cm_handle.join().unwrap();
+        match event {
+            CmEvent::NewConnection {
+                peer_ip,
+                remote_qpn,
+                remote_info,
+            } => {
+                assert_eq!(peer_ip.to_string(), "127.0.0.1");
+                assert_eq!(remote_qpn, sender_info.qp_num);
+                validate_qp_connection_info(&remote_info, &sender_info);
+            }
+            _ => panic!("expected NewConnection after discarding garbage packet"),
+        }
     }
 
     #[test]
     fn sender_receiver_handshake_open_qp() {
-        let receiver_cm_port = 0x4325 as u16;
-        let sender_cm_port = 0x4326 as u16;
-
         let (sender_info, receiver_info) = make_test_infos();
+
+        let mut receiver_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let receiver_cm_port = receiver_cm.cm_port().unwrap();
+        let mut sender_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
 
         // receiver thread
         let receiver_cm_handle = thread::spawn(move || {
-            let mut cm =
-                ConnectionManager::new("127.0.0.1".parse().unwrap(), receiver_cm_port).unwrap();
-            let event = cm.process_next().unwrap();
+            let event = receiver_cm.process_next().unwrap();
 
             match event {
                 CmEvent::NewConnection {
@@ -966,7 +1026,8 @@ mod test {
                 } => {
                     // simulate open new QP
 
-                    cm.set_local_info(peer_ip, remote_qpn, &receiver_info)
+                    receiver_cm
+                        .set_local_info(peer_ip, remote_qpn, &receiver_info)
                         .unwrap();
                 }
                 _ => {
@@ -974,17 +1035,14 @@ mod test {
                 }
             }
 
-            cm
+            receiver_cm
         });
 
         thread::sleep(Duration::from_millis(50));
 
         // sender thread
         let sender_cm_handle = thread::spawn(move || {
-            let mut cm =
-                ConnectionManager::new("127.0.0.1".parse().unwrap(), sender_cm_port).unwrap();
-
-            let _remote_info = cm
+            let _remote_info = sender_cm
                 .connect(
                     SocketAddr::new("127.0.0.1".parse().unwrap(), receiver_cm_port),
                     &sender_info,
@@ -993,7 +1051,7 @@ mod test {
                 )
                 .unwrap();
 
-            cm
+            sender_cm
         });
 
         let sender_cm = sender_cm_handle.join().unwrap();
@@ -1020,13 +1078,12 @@ mod test {
     #[test]
     fn duplicate_open_qp_resends_ack() {
         // Simulate loss of ACK and requesting to open new QP again
-        let cm_port = 0x4327 as u16;
-
         let (_, receiver_info) = make_test_infos();
 
-        let cm_handle = thread::spawn(move || {
-            let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let cm_port = cm.cm_port().unwrap();
 
+        let cm_handle = thread::spawn(move || {
             // first real connection
             let event1 = cm.process_next().unwrap();
             match event1 {
@@ -1113,13 +1170,12 @@ mod test {
     #[test]
     fn duplicate_open_qp_rate_limits_acks() {
         // Duplicates arriving within REACK_INTERVAL are suppressed silently
-        let cm_port = 0x4328 as u16;
-
         let (_, receiver_info) = make_test_infos();
 
-        let cm_handle = thread::spawn(move || {
-            let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), cm_port).unwrap();
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let cm_port = cm.cm_port().unwrap();
 
+        let cm_handle = thread::spawn(move || {
             // first real connection, completes handshake
             let event1 = cm.process_next().unwrap();
             match event1 {
