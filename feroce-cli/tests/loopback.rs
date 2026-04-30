@@ -4,9 +4,9 @@ mod rdma_tests {
     use std::net::UdpSocket;
     use std::process::{Command, Stdio};
     use std::time::Duration;
-    
-   // pick a free port
-   fn next_test_port() -> String {
+
+    // pick a free port
+    fn next_test_port() -> String {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
         let port = socket.local_addr().unwrap().port();
         drop(socket);

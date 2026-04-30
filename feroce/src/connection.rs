@@ -970,7 +970,7 @@ mod test {
 
     #[test]
     fn malformed_then_valid_packet_is_processed() {
-        // malformed_packet_is_discarded and the next one is processed 
+        // malformed_packet_is_discarded and the next one is processed
         let (sender_info, _) = make_test_infos();
 
         let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
