@@ -713,6 +713,30 @@ impl ConnectionManager {
     }
 }
 
+impl Drop for ConnectionManager {
+    fn drop(&mut self) {
+        if self.qps.is_empty() {
+            return;
+        }
+        info!(
+            "Dropping ConnectionManager with {} active QP(s); sending best-effort CloseQp",
+            self.qps.len()
+        );
+        let port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        for (local_qpn, aqp) in self.qps.iter() {
+            let msg = build_qp_message(
+                QpFlags::new(RequestType::CloseQp, AckType::Null, false),
+                &aqp.ctx.local_info,
+                &aqp.ctx.remote_info,
+                port,
+            );
+            if let Err(e) = self.socket.send_to(&msg.pack(), aqp.ctx.peer_addr) {
+                debug!("Best-effort CloseQp for local QPN={local_qpn} failed: {e}");
+            }
+        }
+    }
+}
+
 pub fn build_qp_message(
     qp_flags: QpFlags,
     local_info: &QpConnectionInfo,
@@ -842,6 +866,43 @@ mod test {
         assert!(cm_bad.is_err());
 
         drop(cm);
+    }
+
+    #[test]
+    fn drop_sends_best_effort_close_qp_for_each_active_qp() {
+        let (sender_info, receiver_info) = make_test_infos();
+
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer_socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        cm.qps.insert(
+            sender_info.qp_num,
+            ActiveQp::new(
+                QpPhase::Connected,
+                QpContext {
+                    peer_addr,
+                    local_info: sender_info,
+                    remote_info: receiver_info,
+                },
+            ),
+        );
+
+        drop(cm);
+
+        let mut buf = [0u8; QP_MESSAGE_SIZE];
+        let (n, _src) = peer_socket
+            .recv_from(&mut buf)
+            .expect("peer should receive CloseQp on drop");
+        assert_eq!(n, QP_MESSAGE_SIZE);
+
+        let msg = QpMessage::unpack(&buf).unwrap();
+        assert_eq!(msg.flags.request_type(), Ok(RequestType::CloseQp));
+        assert_eq!(msg.loc_qpn, sender_info.qp_num);
+        assert_eq!(msg.rem_qpn, receiver_info.qp_num);
     }
 
     #[test]
