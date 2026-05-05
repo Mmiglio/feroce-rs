@@ -105,7 +105,7 @@ pub fn run<A: BufferAllocator>(
 fn poller_thread<A: BufferAllocator>(
     qp: Arc<QueuePair>,
     buffer_pool: BufferPool<A>,
-    channel: CompletionChannel,
+    channel: Arc<CompletionChannel>,
     stats: Arc<StreamStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // metrics

@@ -133,6 +133,7 @@ impl Device {
             Ok(CompletionQueue {
                 cq,
                 _device: Arc::clone(self),
+                _channel: None,
             })
         }
     }
@@ -140,7 +141,7 @@ impl Device {
     pub fn create_cq_with_channel(
         self: &Arc<Self>,
         cqe: i32,
-        comp_channel: &CompletionChannel,
+        comp_channel: &Arc<CompletionChannel>,
     ) -> Result<CompletionQueue, FeroceError> {
         let cq = unsafe {
             ffi::ibv_create_cq(
@@ -158,6 +159,7 @@ impl Device {
             Ok(CompletionQueue {
                 cq,
                 _device: Arc::clone(self),
+                _channel: Some(Arc::clone(comp_channel)),
             })
         }
     }
@@ -348,6 +350,7 @@ impl Drop for ProtectionDomain {
 pub struct CompletionQueue {
     cq: *mut ffi::ibv_cq,
     _device: Arc<Device>,
+    _channel: Option<Arc<CompletionChannel>>,
 }
 
 unsafe impl Send for CompletionQueue {}

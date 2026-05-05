@@ -258,7 +258,7 @@ mod test {
 
         // Sender side uses a CPU buffer
         let pd_send = Arc::new(device.alloc_pd().expect("pd_send"));
-        let channel_send = CompletionChannel::create(&device).expect("channel_send");
+        let channel_send = Arc::new(CompletionChannel::create(&device).expect("channel_send"));
         let cq_send = Arc::new(
             device
                 .create_cq_with_channel(16, &channel_send)
@@ -283,7 +283,7 @@ mod test {
         // Receiver side with GPU buffer
         let allocator = GpuAllocator::new(0).expect("GpuAllocator");
         let pd_recv = Arc::new(device.alloc_pd().expect("pd_recv"));
-        let channel_recv = CompletionChannel::create(&device).expect("channel_recv");
+        let channel_recv = Arc::new(CompletionChannel::create(&device).expect("channel_recv"));
         let cq_recv = Arc::new(
             device
                 .create_cq_with_channel(16, &channel_recv)

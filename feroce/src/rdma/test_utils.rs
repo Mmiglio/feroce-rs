@@ -15,17 +15,18 @@ pub fn create_loopback_qp(
     buf_size: usize,
 ) -> (
     QueuePair,
-    CompletionChannel,
+    Arc<CompletionChannel>,
     MemoryRegion,
     Vec<u8>,
     QueuePair,
-    CompletionChannel,
+    Arc<CompletionChannel>,
     MemoryRegion,
     Vec<u8>,
 ) {
     // register receiver
-    let channel_recv =
-        CompletionChannel::create(device).expect("failed to create recv completion channel");
+    let channel_recv = Arc::new(
+        CompletionChannel::create(device).expect("failed to create recv completion channel"),
+    );
     let pd_recv = Arc::new(device.alloc_pd().expect("pd_recv"));
     let cq_recv = Arc::new(
         device
@@ -50,8 +51,9 @@ pub fn create_loopback_qp(
     .expect("qp receiver");
 
     // register sender
-    let channel_send =
-        CompletionChannel::create(device).expect("failed to create send completion channel");
+    let channel_send = Arc::new(
+        CompletionChannel::create(device).expect("failed to create send completion channel"),
+    );
     let pd_send = Arc::new(device.alloc_pd().expect("pd_send"));
     let cq_send = Arc::new(
         device
