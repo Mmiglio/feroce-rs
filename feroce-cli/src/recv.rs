@@ -63,7 +63,11 @@ pub fn run<A: BufferAllocator>(
         if let Some(ref tui) = tui_handle {
             let tui_clone = Arc::clone(tui);
             Box::new(move |stats: &[Arc<StreamStats>], elapsed: Duration| {
-                tui_clone.lock().unwrap().draw(stats, elapsed).unwrap()
+                tui_clone
+                    .lock()
+                    .unwrap()
+                    .draw(stats, elapsed)
+                    .unwrap_or(false)
             })
         } else {
             Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
