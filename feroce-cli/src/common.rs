@@ -86,7 +86,13 @@ where
         let cm = ConnectionManager::new(cm_opts.bind_addr, cm_opts.cm_port)?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
+        for sig in [
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGHUP,
+        ] {
+            signal_hook::flag::register(sig, Arc::clone(&shutdown))?;
+        }
 
         Ok(SessionRunner {
             rdma_cfg: RdmaConfig::from(rdma_opts),
@@ -170,7 +176,7 @@ where
 
             // monitoring, signal interrupts etc
             if self.shutdown.load(Ordering::Relaxed) {
-                info!("Ctrl+C received, shutting down...");
+                info!("Shutdown signal received, shutting down...");
                 break;
             }
 
