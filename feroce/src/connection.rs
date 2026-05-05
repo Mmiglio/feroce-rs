@@ -665,14 +665,25 @@ impl ConnectionManager {
                 && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
         };
 
-        Self::send_and_wait_for_ack(
+        // A NoQp reply to a CloseQp means the peer has already removed its entry
+        // or doesn't have it anymore
+        match Self::send_and_wait_for_ack(
             &self.socket,
             &close_qp_msg,
             peer_addr,
             validate_ack,
             request_timeout,
             max_retries,
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(FeroceError::PeerNoResources) => {
+                info!(
+                    "Peer reports no QP for local QPN={}; treating as already-closed",
+                    local_qpn
+                );
+            }
+            Err(e) => return Err(e),
+        }
 
         self.qps.remove(&local_qpn);
         info!("Closed remote QPN={}", remote_info.qp_num);
@@ -831,6 +842,54 @@ mod test {
         assert!(cm_bad.is_err());
 
         drop(cm);
+    }
+
+    #[test]
+    fn close_qp_treats_peer_no_qp_as_success() {
+        let (sender_info, receiver_info) = make_test_infos();
+
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        cm.qps.insert(
+            sender_info.qp_num,
+            ActiveQp::new(
+                QpPhase::Connected,
+                QpContext {
+                    peer_addr,
+                    local_info: sender_info,
+                    remote_info: receiver_info,
+                },
+            ),
+        );
+
+        // peer: respond to the first incoming CloseQp with a NoQp code
+        let peer_handle = thread::spawn(move || {
+            let mut buf = [0u8; QP_MESSAGE_SIZE];
+            let (_n, src) = peer_socket.recv_from(&mut buf).unwrap();
+            let req = QpMessage::unpack(&buf).unwrap();
+            let reply = QpMessage {
+                flags: QpFlags::new(RequestType::CloseQp, AckType::NoQp, true),
+                rem_qpn: req.loc_qpn,
+                rem_ip: req.loc_ip,
+                ..Default::default()
+            };
+            peer_socket.send_to(&reply.pack(), src).unwrap();
+        });
+
+        let res = cm.close_qp(sender_info.qp_num, Duration::from_millis(500), 1);
+        peer_handle.join().unwrap();
+
+        assert!(
+            res.is_ok(),
+            "close_qp should succeed when peer reports NoQp; got {:?}",
+            res
+        );
+        assert!(
+            cm.qps.is_empty(),
+            "local entry should be removed after a successful close"
+        );
     }
 
     #[test]
