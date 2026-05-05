@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::{debug, error, info};
 
 use super::ffi;
 use crate::FeroceError;
@@ -155,7 +155,7 @@ impl Device {
         let ret = unsafe { ffi::ibv_query_gid(self.context, port_num, gid_index, &mut gid) };
 
         if ret != 0 {
-            Err(rdma_err_code("ibv_create_cq", ret))
+            Err(rdma_err_code("ibv_query_gid", ret))
         } else {
             Ok(gid)
         }
@@ -224,8 +224,9 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        unsafe {
-            ffi::ibv_close_device(self.context);
+        let ret = unsafe { ffi::ibv_close_device(self.context) };
+        if ret != 0 {
+            error!("ibv_close_device failed: errno={}", ret);
         }
     }
 }
@@ -298,8 +299,9 @@ impl CompletionChannel {
 
 impl Drop for CompletionChannel {
     fn drop(&mut self) {
-        unsafe {
-            ffi::ibv_destroy_comp_channel(self.channel);
+        let ret = unsafe { ffi::ibv_destroy_comp_channel(self.channel) };
+        if ret != 0 {
+            error!("ibv_destroy_comp_channel failed: errno={}", ret);
         }
     }
 }
@@ -319,8 +321,9 @@ impl ProtectionDomain {
 
 impl Drop for ProtectionDomain {
     fn drop(&mut self) {
-        unsafe {
-            ffi::ibv_dealloc_pd(self.pd);
+        let ret = unsafe { ffi::ibv_dealloc_pd(self.pd) };
+        if ret != 0 {
+            error!("ibv_dealloc_pd failed: errno={}", ret);
         }
     }
 }
@@ -371,7 +374,10 @@ impl CompletionQueue {
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
-        unsafe { ffi::ibv_destroy_cq(self.cq) };
+        let ret = unsafe { ffi::ibv_destroy_cq(self.cq) };
+        if ret != 0 {
+            error!("ibv_destroy_cq failed: errno={}", ret);
+        }
     }
 }
 
@@ -662,7 +668,10 @@ impl QueuePair {
 
 impl Drop for QueuePair {
     fn drop(&mut self) {
-        unsafe { ffi::ibv_destroy_qp(self.qp) };
+        let ret = unsafe { ffi::ibv_destroy_qp(self.qp) };
+        if ret != 0 {
+            error!("ibv_destroy_qp failed: errno={}", ret);
+        }
     }
 }
 
@@ -741,7 +750,10 @@ impl MemoryRegion {
 
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
-        unsafe { ffi::ibv_dereg_mr(self.mr) };
+        let ret = unsafe { ffi::ibv_dereg_mr(self.mr) };
+        if ret != 0 {
+            error!("ibv_dereg_mr failed: errno={}", ret);
+        }
     }
 }
 

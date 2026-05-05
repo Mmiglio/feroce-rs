@@ -50,8 +50,9 @@ impl log::Log for TuiLogger {
     }
 
     fn flush(&self) {
-        let mut guard = self.file.lock().unwrap();
-        guard.flush().unwrap();
+        if let Ok(mut guard) = self.file.lock() {
+            let _ = guard.flush();
+        }
     }
 }
 

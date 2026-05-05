@@ -1,4 +1,4 @@
-use log::warn;
+use log::{error, warn};
 
 use crate::FeroceError;
 use crate::rdma::{
@@ -100,8 +100,9 @@ impl CudaContext {
 
 impl Drop for CudaContext {
     fn drop(&mut self) {
-        unsafe {
-            cuCtxDestroy_v2(self.ctx);
+        let res = unsafe { cuCtxDestroy_v2(self.ctx) };
+        if res != CUDA_SUCCESS {
+            error!("cuCtxDestroy_v2 failed: code={}", res);
         }
     }
 }
@@ -157,8 +158,17 @@ impl GpuBuffer {
 
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
-        unsafe { cuMemFree_v2(self.dptr) };
-        unsafe { libc::close(self.dmabuf_fd) };
+        let res = unsafe { cuMemFree_v2(self.dptr) };
+        if res != CUDA_SUCCESS {
+            error!("cuMemFree_v2 failed: code={}", res);
+        }
+        let ret = unsafe { libc::close(self.dmabuf_fd) };
+        if ret != 0 {
+            error!(
+                "close(dmabuf_fd) failed: errno={}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            );
+        }
     }
 }
 
