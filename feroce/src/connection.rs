@@ -571,14 +571,20 @@ impl ConnectionManager {
                 && (reply.rem_qpn == local_info.qp_num)
                 && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
         };
-        let reply_qp_message = Self::send_and_wait_for_ack(
+        let reply_qp_message = match Self::send_and_wait_for_ack(
             &self.socket,
             &open_qp_message,
             remote_addr,
             validate_ack,
             request_timeout,
             max_retries,
-        )?;
+        ) {
+            Ok(reply) => reply,
+            Err(e) => {
+                self.pending.remove(&(remote_addr.ip(), local_info.qp_num));
+                return Err(e);
+            }
+        };
 
         let remote_info = QpConnectionInfo {
             qp_num: reply_qp_message.loc_qpn,
@@ -825,6 +831,27 @@ mod test {
         assert!(cm_bad.is_err());
 
         drop(cm);
+    }
+
+    #[test]
+    fn connect_timeout_clears_pending() {
+        let (sender_info, _) = make_test_infos();
+
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let dead_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), dead_port);
+
+        let res = cm.connect(dead_addr, &sender_info, Duration::from_millis(50), 1);
+
+        assert!(res.is_err(), "expected connect to fail, got {:?}", res);
+        assert!(
+            cm.pending.is_empty(),
+            "pending should be cleared after a failed connect, found {} entries",
+            cm.pending.len()
+        );
     }
 
     #[test]
