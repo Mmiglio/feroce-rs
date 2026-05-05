@@ -26,7 +26,7 @@ pub struct RdmaEndpoint<A: BufferAllocator> {
 
 // Create and init resources for a qp/data stream
 pub fn setup_endpoint<A: BufferAllocator>(
-    device: &Device,
+    device: &Arc<Device>,
     rdma_cfg: &RdmaConfig,
     allocator: &A,
 ) -> Result<RdmaEndpoint<A>, FeroceError> {

@@ -8,7 +8,7 @@ use crate::{
 use super::device::*;
 
 pub fn create_loopback_qp(
-    device: &Device,
+    device: &Arc<Device>,
     port: u8,
     gid_index: i32,
     path_mtu: ffi::ibv_mtu,
@@ -25,7 +25,7 @@ pub fn create_loopback_qp(
 ) {
     // register receiver
     let channel_recv =
-        CompletionChannel::create(&device).expect("failed to create recv completion channel");
+        CompletionChannel::create(device).expect("failed to create recv completion channel");
     let pd_recv = Arc::new(device.alloc_pd().expect("pd_recv"));
     let cq_recv = Arc::new(
         device
@@ -51,7 +51,7 @@ pub fn create_loopback_qp(
 
     // register sender
     let channel_send =
-        CompletionChannel::create(&device).expect("failed to create send completion channel");
+        CompletionChannel::create(device).expect("failed to create send completion channel");
     let pd_send = Arc::new(device.alloc_pd().expect("pd_send"));
     let cq_send = Arc::new(
         device
