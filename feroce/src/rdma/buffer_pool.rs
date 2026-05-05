@@ -152,7 +152,8 @@ mod test {
     fn basic_functionalities() {
         let devices = rdma::device::DeviceList::new().expect("no RDMA devices found");
         let name = devices.device_name(0).expect("no devices");
-        let device = rdma::device::Device::open(name).expect("failed to open device");
+        let device =
+            std::sync::Arc::new(rdma::device::Device::open(name).expect("failed to open device"));
 
         let pd = device.alloc_pd().expect("failed to allocate PD");
 

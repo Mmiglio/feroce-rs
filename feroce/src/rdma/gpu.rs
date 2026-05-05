@@ -237,7 +237,7 @@ mod test {
 
         let devices = rdma::device::DeviceList::new().expect("no RDMA devices");
         let name = devices.device_name(0).expect("no devices");
-        let device = rdma::device::Device::open(name).expect("failed to open");
+        let device = Arc::new(rdma::device::Device::open(name).expect("failed to open"));
         let pd = device.alloc_pd().expect("failed to allocate PD");
 
         let (buffer, mr, _base_addr) = allocator.alloc_and_register(&pd, 4096).unwrap();

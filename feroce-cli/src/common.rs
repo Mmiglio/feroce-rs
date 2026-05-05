@@ -46,7 +46,7 @@ where
     M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     rdma_cfg: RdmaConfig,
-    device: rdma::device::Device,
+    device: Arc<rdma::device::Device>,
     path_mtu: rdma::ibv_mtu,
     allocator: A,
 
@@ -75,7 +75,7 @@ where
         spawn_poller: F,
         monitor: M,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let device = Device::open(&rdma_opts.rdma_device)?;
+        let device = Arc::new(Device::open(&rdma_opts.rdma_device)?);
         let active_path_mtu = device
             .query_rocev2_mtu(rdma_opts.port_num, rdma_opts.gid_index)?
             .ok_or(format!(

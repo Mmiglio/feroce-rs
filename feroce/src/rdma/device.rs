@@ -77,6 +77,9 @@ pub struct Device {
     context: *mut ffi::ibv_context,
 }
 
+unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
+
 impl Device {
     pub fn open(name: &str) -> Result<Self, FeroceError> {
         let devices = DeviceList::new()?;
@@ -101,16 +104,19 @@ impl Device {
         )))
     }
 
-    pub fn alloc_pd(&self) -> Result<ProtectionDomain, FeroceError> {
+    pub fn alloc_pd(self: &Arc<Self>) -> Result<ProtectionDomain, FeroceError> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.context) };
         if pd.is_null() {
             Err(rdma_err("ibv_alloc_pd"))
         } else {
-            Ok(ProtectionDomain { pd })
+            Ok(ProtectionDomain {
+                pd,
+                _device: Arc::clone(self),
+            })
         }
     }
 
-    pub fn create_cq(&self, cqe: i32) -> Result<CompletionQueue, FeroceError> {
+    pub fn create_cq(self: &Arc<Self>, cqe: i32) -> Result<CompletionQueue, FeroceError> {
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.context,
@@ -124,12 +130,15 @@ impl Device {
         if cq.is_null() {
             Err(rdma_err("ibv_create_cq"))
         } else {
-            Ok(CompletionQueue { cq })
+            Ok(CompletionQueue {
+                cq,
+                _device: Arc::clone(self),
+            })
         }
     }
 
     pub fn create_cq_with_channel(
-        &self,
+        self: &Arc<Self>,
         cqe: i32,
         comp_channel: &CompletionChannel,
     ) -> Result<CompletionQueue, FeroceError> {
@@ -146,7 +155,10 @@ impl Device {
         if cq.is_null() {
             Err(rdma_err("ibv_create_cq"))
         } else {
-            Ok(CompletionQueue { cq })
+            Ok(CompletionQueue {
+                cq,
+                _device: Arc::clone(self),
+            })
         }
     }
 
@@ -233,18 +245,22 @@ impl Drop for Device {
 
 pub struct CompletionChannel {
     channel: *mut ffi::ibv_comp_channel,
+    _device: Arc<Device>,
 }
 
 unsafe impl Send for CompletionChannel {}
 unsafe impl Sync for CompletionChannel {}
 
 impl CompletionChannel {
-    pub fn create(device: &Device) -> Result<Self, FeroceError> {
+    pub fn create(device: &Arc<Device>) -> Result<Self, FeroceError> {
         let ch = unsafe { ffi::ibv_create_comp_channel(device.context) };
         if ch.is_null() {
             Err(rdma_err("ibv_create_comp_channel"))
         } else {
-            Ok(CompletionChannel { channel: ch })
+            Ok(CompletionChannel {
+                channel: ch,
+                _device: Arc::clone(device),
+            })
         }
     }
 
@@ -308,6 +324,7 @@ impl Drop for CompletionChannel {
 
 pub struct ProtectionDomain {
     pd: *mut ffi::ibv_pd,
+    _device: Arc<Device>,
 }
 
 unsafe impl Send for ProtectionDomain {}
@@ -330,6 +347,7 @@ impl Drop for ProtectionDomain {
 
 pub struct CompletionQueue {
     cq: *mut ffi::ibv_cq,
+    _device: Arc<Device>,
 }
 
 unsafe impl Send for CompletionQueue {}
@@ -758,7 +776,7 @@ impl Drop for MemoryRegion {
 }
 
 // Find one available roce device, returns the device, port number, gid_index and mtu.
-pub fn find_roce_device() -> Option<(String, Device, u8, i32, ffi::ibv_mtu)> {
+pub fn find_roce_device() -> Option<(String, Arc<Device>, u8, i32, ffi::ibv_mtu)> {
     let devices = DeviceList::new().ok()?;
     for i in 0..devices.len() {
         let name = devices.device_name(i)?;
@@ -779,7 +797,7 @@ pub fn find_roce_device() -> Option<(String, Device, u8, i32, ffi::ibv_mtu)> {
                     );
                     return Some((
                         name.to_string(),
-                        device,
+                        Arc::new(device),
                         port,
                         entry.gid_index as i32,
                         port_attr.active_mtu,
@@ -820,7 +838,7 @@ mod test {
     fn alloc_pd_and_cq() {
         let devices = DeviceList::new().expect("no RDMA devices found");
         let name = devices.device_name(0).expect("no devices");
-        let device = Device::open(name).expect("failed to open device");
+        let device = Arc::new(Device::open(name).expect("failed to open device"));
 
         let _pd = device.alloc_pd().expect("failed to allocate PD");
         let _cq = device.create_cq(128).expect("failed to create CQ");
