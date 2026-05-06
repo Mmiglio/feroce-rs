@@ -19,7 +19,7 @@ pub struct RdmaConfig {
 
 pub struct RdmaEndpoint<A: BufferAllocator> {
     pub qp: Arc<QueuePair>,
-    pub comp_channel: CompletionChannel,
+    pub comp_channel: Arc<CompletionChannel>,
     pub buffer_pool: BufferPool<A>,
     pub local_info: QpConnectionInfo,
 }
@@ -30,7 +30,7 @@ pub fn setup_endpoint<A: BufferAllocator>(
     rdma_cfg: &RdmaConfig,
     allocator: &A,
 ) -> Result<RdmaEndpoint<A>, FeroceError> {
-    let comp_channel = CompletionChannel::create(device)?;
+    let comp_channel = Arc::new(CompletionChannel::create(device)?);
 
     // create local QP
     let pd = Arc::new(device.alloc_pd()?);

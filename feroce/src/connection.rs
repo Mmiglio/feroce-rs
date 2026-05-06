@@ -571,14 +571,20 @@ impl ConnectionManager {
                 && (reply.rem_qpn == local_info.qp_num)
                 && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
         };
-        let reply_qp_message = Self::send_and_wait_for_ack(
+        let reply_qp_message = match Self::send_and_wait_for_ack(
             &self.socket,
             &open_qp_message,
             remote_addr,
             validate_ack,
             request_timeout,
             max_retries,
-        )?;
+        ) {
+            Ok(reply) => reply,
+            Err(e) => {
+                self.pending.remove(&(remote_addr.ip(), local_info.qp_num));
+                return Err(e);
+            }
+        };
 
         let remote_info = QpConnectionInfo {
             qp_num: reply_qp_message.loc_qpn,
@@ -659,14 +665,25 @@ impl ConnectionManager {
                 && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
         };
 
-        Self::send_and_wait_for_ack(
+        // A NoQp reply to a CloseQp means the peer has already removed its entry
+        // or doesn't have it anymore
+        match Self::send_and_wait_for_ack(
             &self.socket,
             &close_qp_msg,
             peer_addr,
             validate_ack,
             request_timeout,
             max_retries,
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(FeroceError::PeerNoResources) => {
+                info!(
+                    "Peer reports no QP for local QPN={}; treating as already-closed",
+                    local_qpn
+                );
+            }
+            Err(e) => return Err(e),
+        }
 
         self.qps.remove(&local_qpn);
         info!("Closed remote QPN={}", remote_info.qp_num);
@@ -693,6 +710,30 @@ impl ConnectionManager {
         };
 
         (local_info, remote_info)
+    }
+}
+
+impl Drop for ConnectionManager {
+    fn drop(&mut self) {
+        if self.qps.is_empty() {
+            return;
+        }
+        info!(
+            "Dropping ConnectionManager with {} active QP(s); sending best-effort CloseQp",
+            self.qps.len()
+        );
+        let port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        for (local_qpn, aqp) in self.qps.iter() {
+            let msg = build_qp_message(
+                QpFlags::new(RequestType::CloseQp, AckType::Null, false),
+                &aqp.ctx.local_info,
+                &aqp.ctx.remote_info,
+                port,
+            );
+            if let Err(e) = self.socket.send_to(&msg.pack(), aqp.ctx.peer_addr) {
+                debug!("Best-effort CloseQp for local QPN={local_qpn} failed: {e}");
+            }
+        }
     }
 }
 
@@ -825,6 +866,112 @@ mod test {
         assert!(cm_bad.is_err());
 
         drop(cm);
+    }
+
+    #[test]
+    fn drop_sends_best_effort_close_qp_for_each_active_qp() {
+        let (sender_info, receiver_info) = make_test_infos();
+
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer_socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        cm.qps.insert(
+            sender_info.qp_num,
+            ActiveQp::new(
+                QpPhase::Connected,
+                QpContext {
+                    peer_addr,
+                    local_info: sender_info,
+                    remote_info: receiver_info,
+                },
+            ),
+        );
+
+        drop(cm);
+
+        let mut buf = [0u8; QP_MESSAGE_SIZE];
+        let (n, _src) = peer_socket
+            .recv_from(&mut buf)
+            .expect("peer should receive CloseQp on drop");
+        assert_eq!(n, QP_MESSAGE_SIZE);
+
+        let msg = QpMessage::unpack(&buf).unwrap();
+        assert_eq!(msg.flags.request_type(), Ok(RequestType::CloseQp));
+        assert_eq!(msg.loc_qpn, sender_info.qp_num);
+        assert_eq!(msg.rem_qpn, receiver_info.qp_num);
+    }
+
+    #[test]
+    fn close_qp_treats_peer_no_qp_as_success() {
+        let (sender_info, receiver_info) = make_test_infos();
+
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        cm.qps.insert(
+            sender_info.qp_num,
+            ActiveQp::new(
+                QpPhase::Connected,
+                QpContext {
+                    peer_addr,
+                    local_info: sender_info,
+                    remote_info: receiver_info,
+                },
+            ),
+        );
+
+        // peer: respond to the first incoming CloseQp with a NoQp code
+        let peer_handle = thread::spawn(move || {
+            let mut buf = [0u8; QP_MESSAGE_SIZE];
+            let (_n, src) = peer_socket.recv_from(&mut buf).unwrap();
+            let req = QpMessage::unpack(&buf).unwrap();
+            let reply = QpMessage {
+                flags: QpFlags::new(RequestType::CloseQp, AckType::NoQp, true),
+                rem_qpn: req.loc_qpn,
+                rem_ip: req.loc_ip,
+                ..Default::default()
+            };
+            peer_socket.send_to(&reply.pack(), src).unwrap();
+        });
+
+        let res = cm.close_qp(sender_info.qp_num, Duration::from_millis(500), 1);
+        peer_handle.join().unwrap();
+
+        assert!(
+            res.is_ok(),
+            "close_qp should succeed when peer reports NoQp; got {:?}",
+            res
+        );
+        assert!(
+            cm.qps.is_empty(),
+            "local entry should be removed after a successful close"
+        );
+    }
+
+    #[test]
+    fn connect_timeout_clears_pending() {
+        let (sender_info, _) = make_test_infos();
+
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let dead_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), dead_port);
+
+        let res = cm.connect(dead_addr, &sender_info, Duration::from_millis(50), 1);
+
+        assert!(res.is_err(), "expected connect to fail, got {:?}", res);
+        assert!(
+            cm.pending.is_empty(),
+            "pending should be cleared after a failed connect, found {} entries",
+            cm.pending.len()
+        );
     }
 
     #[test]
