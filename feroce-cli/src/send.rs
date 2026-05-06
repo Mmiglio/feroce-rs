@@ -6,7 +6,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use feroce::rdma;
 use feroce::rdma::buffer_pool::{BufferAllocator, CpuAllocator};
-use feroce::{BufferHandle, BufferPool, CompletionChannel, QueuePair, RdmaEndpoint};
+use feroce::{BufferHandle, BufferPool, CompletionChannel, ConnectedRdmaEndpoint, QueuePair};
 use log::{debug, error};
 
 #[cfg(feature = "tui")]
@@ -27,7 +27,7 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
     let spawn_poller =
-        |rdma_endpoint: RdmaEndpoint<CpuAllocator>, stream_id: u32, remote_qpn: u32| {
+        |rdma_endpoint: ConnectedRdmaEndpoint<CpuAllocator>, stream_id: u32, remote_qpn: u32| {
             let stats = Arc::new(StreamStats::new(
                 stream_id,
                 rdma_endpoint.qp.qp_num(),
@@ -171,7 +171,7 @@ fn poller_thread<A: BufferAllocator>(
     }
 
     // request notification from completion channel for every event
-    qp.cq().req_notify_cq(false)?;
+    qp.send_cq().req_notify_cq(false)?;
 
     let mut poller_done = false;
     while !poller_done {
@@ -180,14 +180,14 @@ fn poller_thread<A: BufferAllocator>(
 
         // rearm the notification
         if got_event {
-            qp.cq().req_notify_cq(false)?;
+            qp.send_cq().req_notify_cq(false)?;
         }
 
         // poll the CQ (we do it regardless the presence of an event, to avoid race conditions)
-        let num_wce = qp.cq().poll(&mut wc_list)?;
+        let num_wce = qp.send_cq().poll(&mut wc_list)?;
 
         if got_event {
-            qp.cq().ack_cq_events(1);
+            qp.send_cq().ack_cq_events(1);
         }
 
         // process work completion, if any

@@ -9,9 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use feroce::rdma::{self, buffer_pool::BufferAllocator};
+use feroce::rdma::{self, buffer_pool::BufferAllocator, device::LocalLink};
 use feroce::{
-    CmEvent, ConnectionManager, Device, FeroceError, QueuePair, RdmaConfig, RdmaEndpoint,
+    CmEvent, ConnectedRdmaEndpoint, ConnectionManager, Device, FeroceError, QueuePair, RdmaConfig,
     connect_endpoint, setup_endpoint,
 };
 use log::{error, info, warn};
@@ -21,8 +21,6 @@ use crate::{CmOpts, RdmaOpts, stats::StreamStats};
 impl From<&RdmaOpts> for RdmaConfig {
     fn from(opts: &RdmaOpts) -> Self {
         RdmaConfig {
-            port_num: opts.port_num,
-            gid_index: opts.gid_index,
             num_buf: opts.num_buf,
             buf_size: opts.buf_size,
         }
@@ -35,19 +33,19 @@ struct QpContext {
     stats: Arc<StreamStats>,
 }
 
-/// Callback invoked from the event loop once per monitoring tick.
-/// Returning `true` asks the event loop to shut down (e.g. pressed 'q' or ctrl+c).
+// Callback invoked from the event loop once per monitoring tick.
+// Returning `true` asks the event loop to shut down (e.g. pressed 'q' or ctrl+c).
 pub type Monitor = Box<dyn FnMut(&[Arc<StreamStats>], Duration) -> bool>;
 
 pub struct SessionRunner<F, A, M>
 where
     A: BufferAllocator,
-    F: FnMut(RdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    F: FnMut(ConnectedRdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
     M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     rdma_cfg: RdmaConfig,
     device: Arc<rdma::device::Device>,
-    path_mtu: rdma::ibv_mtu,
+    link: LocalLink,
     allocator: A,
 
     cm: ConnectionManager,
@@ -65,7 +63,7 @@ where
 impl<F, A, M> SessionRunner<F, A, M>
 where
     A: BufferAllocator,
-    F: FnMut(RdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    F: FnMut(ConnectedRdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
     M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     pub fn new(
@@ -76,10 +74,10 @@ where
         monitor: M,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = Arc::new(Device::open(&rdma_opts.rdma_device)?);
-        let active_path_mtu = device
-            .query_rocev2_mtu(rdma_opts.port_num, rdma_opts.gid_index)?
+        let link = device
+            .probe_link(rdma_opts.port_num, rdma_opts.gid_index as u8)?
             .ok_or(format!(
-                "{} GID index {} is not active RoCE v2",
+                "{} GID index {} is not an active RoCE v2 endpoint",
                 rdma_opts.rdma_device, rdma_opts.gid_index
             ))?;
 
@@ -97,7 +95,7 @@ where
         Ok(SessionRunner {
             rdma_cfg: RdmaConfig::from(rdma_opts),
             device,
-            path_mtu: active_path_mtu,
+            link,
             allocator,
             cm,
             qps: HashMap::new(),
@@ -115,23 +113,22 @@ where
         num_streams: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..num_streams {
-            let rdma_endpoint = setup_endpoint(&self.device, &self.rdma_cfg, &self.allocator)?;
-            // keep a reference, rdma_endpoint will be moved to the poller thread
-            let qp = Arc::clone(&rdma_endpoint.qp);
+            let prepared =
+                setup_endpoint(&self.device, self.link, &self.rdma_cfg, &self.allocator)?;
 
-            // connection request to remote side
-            let remote_info = self.cm.connect(
-                remote_addr,
-                &rdma_endpoint.local_info,
-                Duration::from_secs(2),
-                2,
-            )?;
+            // connection request to remote side (uses our local_info, no QP transition yet)
+            let remote_info =
+                self.cm
+                    .connect(remote_addr, &prepared.local_info, Duration::from_secs(2), 2)?;
 
-            connect_endpoint(&rdma_endpoint, &remote_info, &self.rdma_cfg, self.path_mtu)?;
+            // RTR + RTS with the remote info
+            let connected = connect_endpoint(prepared, &remote_info)?;
+            // keep a reference, connected will be moved to the poller thread
+            let qp = Arc::clone(&connected.qp);
 
             // spawn the poller thread using the closure
             let (poller_handle, stats) =
-                (self.spawn_poller)(rdma_endpoint, self.next_stream_id, remote_info.qp_num);
+                (self.spawn_poller)(connected, self.next_stream_id, remote_info.qp_num);
             self.next_stream_id += 1;
 
             self.qps.insert(
@@ -227,18 +224,22 @@ where
                 remote_qpn,
                 remote_info,
             } => {
-                let rdma_endpoint = setup_endpoint(&self.device, &self.rdma_cfg, &self.allocator)?;
-                let qp = Arc::clone(&rdma_endpoint.qp);
+                let prepared =
+                    setup_endpoint(&self.device, self.link, &self.rdma_cfg, &self.allocator)?;
 
-                // transition QP to RTS
-                connect_endpoint(&rdma_endpoint, &remote_info, &self.rdma_cfg, self.path_mtu)?;
+                // transition QP to RTS before replying to the peer. once
+                // set_local_info sends the ack the active side may start
+                // posting WRs against our QP.
+                let connected = connect_endpoint(prepared, &remote_info)?;
 
                 self.cm
-                    .set_local_info(peer_ip, remote_qpn, &rdma_endpoint.local_info)?;
+                    .set_local_info(peer_ip, remote_qpn, &connected.local_info)?;
+
+                let qp = Arc::clone(&connected.qp);
 
                 // spawn the poller thread
                 let (poller_handle, stats) =
-                    (self.spawn_poller)(rdma_endpoint, self.next_stream_id, remote_qpn);
+                    (self.spawn_poller)(connected, self.next_stream_id, remote_qpn);
                 // TODO: maybe get stream id from somewhere? e.g. from the active side.
                 self.next_stream_id += 1;
 
@@ -310,7 +311,7 @@ where
 impl<F, A, M> Drop for SessionRunner<F, A, M>
 where
     A: BufferAllocator,
-    F: FnMut(RdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
+    F: FnMut(ConnectedRdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
     M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     fn drop(&mut self) {

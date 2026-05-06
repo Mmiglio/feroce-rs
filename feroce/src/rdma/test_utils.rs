@@ -19,7 +19,19 @@ pub struct LoopbackPair {
     pub recv: LoopbackEndpoint,
 }
 
-fn build_endpoint(device: &Arc<Device>, buf_size: usize, label: &str) -> LoopbackEndpoint {
+struct PreparedLoopback {
+    qp: PreparedQueuePair,
+    channel: Arc<CompletionChannel>,
+    mr: MemoryRegion,
+    buf: Vec<u8>,
+}
+
+fn build_endpoint(
+    device: &Arc<Device>,
+    link: LocalLink,
+    buf_size: usize,
+    label: &str,
+) -> PreparedLoopback {
     let channel = Arc::new(
         CompletionChannel::create(device)
             .unwrap_or_else(|_| panic!("failed to create {} completion channel", label)),
@@ -38,16 +50,14 @@ fn build_endpoint(device: &Arc<Device>, buf_size: usize, label: &str) -> Loopbac
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
     )
     .unwrap_or_else(|_| panic!("mr_{}", label));
-    let qp = QueuePair::create_qp(
-        Arc::clone(&pd),
-        Arc::clone(&cq),
-        8,
-        1,
-        rdma::ibv_qp_type::IBV_QPT_RC,
-    )
-    .unwrap_or_else(|_| panic!("qp_{}", label));
 
-    LoopbackEndpoint {
+    let qp = pd
+        .create_qp(&cq, &cq, rdma::ibv_qp_type::IBV_QPT_RC, link)
+        .set_max_wr(8)
+        .build()
+        .unwrap_or_else(|_| panic!("qp_{}", label));
+
+    PreparedLoopback {
         qp,
         channel,
         mr,
@@ -55,53 +65,53 @@ fn build_endpoint(device: &Arc<Device>, buf_size: usize, label: &str) -> Loopbac
     }
 }
 
-pub fn create_loopback_qp(
-    device: &Arc<Device>,
-    port: u8,
-    gid_index: i32,
-    path_mtu: ffi::ibv_mtu,
-    buf_size: usize,
-) -> LoopbackPair {
-    let recv = build_endpoint(device, buf_size, "recv");
-    let send = build_endpoint(device, buf_size, "send");
+pub fn create_loopback_qp(device: &Arc<Device>, link: LocalLink, buf_size: usize) -> LoopbackPair {
+    let recv_p = build_endpoint(device, link, buf_size, "recv");
+    let send_p = build_endpoint(device, link, buf_size, "send");
 
-    let loc_gid = device.query_gid(port, gid_index).expect("gid");
+    let loc_gid = device
+        .query_gid(link.port_num, link.gid_index as i32)
+        .expect("gid");
 
-    recv.qp.modify_to_init(port).expect("recv init");
-    recv.qp
-        .modify_to_rtr(
-            &QpConnectionInfo {
-                qp_num: send.qp.qp_num(),
-                psn: 0,
-                rkey: recv.mr.rkey(),
-                addr: recv.mr.addr(),
-                gid: loc_gid.raw,
-            },
-            gid_index as u8,
-            port,
-            path_mtu,
-        )
-        .expect("recv rtr");
-    recv.qp.modify_to_rts(0).expect("recv rts");
+    let recv_qpn = recv_p.qp.qp_num();
+    let send_qpn = send_p.qp.qp_num();
 
-    send.qp.modify_to_init(port).expect("send init");
-    send.qp
-        .modify_to_rtr(
-            &QpConnectionInfo {
-                qp_num: recv.qp.qp_num(),
-                psn: 0,
-                rkey: send.mr.rkey(),
-                addr: send.mr.addr(),
-                gid: loc_gid.raw,
-            },
-            gid_index as u8,
-            port,
-            path_mtu,
-        )
-        .expect("send rtr");
-    send.qp.modify_to_rts(0).expect("send rts");
+    let recv_qp = recv_p
+        .qp
+        .handshake(&QpConnectionInfo {
+            qp_num: send_qpn,
+            psn: 0,
+            rkey: recv_p.mr.rkey(),
+            addr: recv_p.mr.addr(),
+            gid: loc_gid.raw,
+        })
+        .expect("recv handshake");
 
-    LoopbackPair { send, recv }
+    let send_qp = send_p
+        .qp
+        .handshake(&QpConnectionInfo {
+            qp_num: recv_qpn,
+            psn: 0,
+            rkey: send_p.mr.rkey(),
+            addr: send_p.mr.addr(),
+            gid: loc_gid.raw,
+        })
+        .expect("send handshake");
+
+    LoopbackPair {
+        recv: LoopbackEndpoint {
+            qp: recv_qp,
+            channel: recv_p.channel,
+            mr: recv_p.mr,
+            buf: recv_p.buf,
+        },
+        send: LoopbackEndpoint {
+            qp: send_qp,
+            channel: send_p.channel,
+            mr: send_p.mr,
+            buf: send_p.buf,
+        },
+    }
 }
 
 pub fn poll_cq_with_timeout(

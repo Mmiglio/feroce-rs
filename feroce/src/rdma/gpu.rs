@@ -253,8 +253,7 @@ mod test {
 
     #[test]
     fn gpu_direct_loopback() {
-        let (_name, device, port, gid_index, mtu) =
-            find_roce_device().expect("no RoCE device found");
+        let (_name, device, link) = find_roce_device().expect("no RoCE device found");
 
         // Sender side uses a CPU buffer
         let pd_send = Arc::new(device.alloc_pd().expect("pd_send"));
@@ -271,14 +270,11 @@ mod test {
             rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE,
         )
         .expect("mr_send");
-        let qp_send = QueuePair::create_qp(
-            Arc::clone(&pd_send),
-            Arc::clone(&cq_send),
-            8,
-            1,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )
-        .expect("qp_send");
+        let qp_send_prep = pd_send
+            .create_qp(&cq_send, &cq_send, rdma::ibv_qp_type::IBV_QPT_RC, link)
+            .set_max_wr(8)
+            .build()
+            .expect("qp_send build");
 
         // Receiver side with GPU buffer
         let allocator = GpuAllocator::new(0).expect("GpuAllocator");
@@ -292,51 +288,38 @@ mod test {
         let (gpu_buf, mr_recv, base_addr) = allocator
             .alloc_and_register(&pd_recv, 4096)
             .expect("gpu alloc");
-        let qp_recv = QueuePair::create_qp(
-            Arc::clone(&pd_recv),
-            Arc::clone(&cq_recv),
-            8,
-            1,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )
-        .expect("qp_recv");
+        let qp_recv_prep = pd_recv
+            .create_qp(&cq_recv, &cq_recv, rdma::ibv_qp_type::IBV_QPT_RC, link)
+            .set_max_wr(8)
+            .build()
+            .expect("qp_recv build");
 
         // Connect QPs in loopback
-        let loc_gid = device.query_gid(port, gid_index).expect("gid");
+        let loc_gid = device
+            .query_gid(link.port_num, link.gid_index as i32)
+            .expect("gid");
+        let send_qpn = qp_send_prep.qp_num();
+        let recv_qpn = qp_recv_prep.qp_num();
 
-        qp_recv.modify_to_init(port).expect("recv init");
-        qp_recv
-            .modify_to_rtr(
-                &QpConnectionInfo {
-                    qp_num: qp_send.qp_num(),
-                    psn: 0,
-                    rkey: mr_recv.rkey(),
-                    addr: base_addr,
-                    gid: loc_gid.raw,
-                },
-                gid_index as u8,
-                port,
-                mtu,
-            )
-            .expect("recv rtr");
-        qp_recv.modify_to_rts(0).expect("recv rts");
+        let qp_recv = qp_recv_prep
+            .handshake(&QpConnectionInfo {
+                qp_num: send_qpn,
+                psn: 0,
+                rkey: mr_recv.rkey(),
+                addr: base_addr,
+                gid: loc_gid.raw,
+            })
+            .expect("recv handshake");
 
-        qp_send.modify_to_init(port).expect("send init");
-        qp_send
-            .modify_to_rtr(
-                &QpConnectionInfo {
-                    qp_num: qp_recv.qp_num(),
-                    psn: 0,
-                    rkey: mr_send.rkey(),
-                    addr: mr_send.addr(),
-                    gid: loc_gid.raw,
-                },
-                gid_index as u8,
-                port,
-                mtu,
-            )
-            .expect("send rtr");
-        qp_send.modify_to_rts(0).expect("send rts");
+        let qp_send = qp_send_prep
+            .handshake(&QpConnectionInfo {
+                qp_num: recv_qpn,
+                psn: 0,
+                rkey: mr_send.rkey(),
+                addr: mr_send.addr(),
+                gid: loc_gid.raw,
+            })
+            .expect("send handshake");
 
         // Post recv on GPU buffer
         let mut sge_recv = ffi::ibv_sge {
