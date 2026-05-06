@@ -931,26 +931,27 @@ mod test {
         let (_name, device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let (qp_send, _cc_send, mr_send, mut buf_send, qp_recv, _cc_recv, mr_recv, mut buf_recv) =
-            create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+        let mut pair = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
 
         // post reveice wr
-        let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
+        let mut recv_sg_list = make_sge_list(1, &mut pair.recv.buf, pair.recv.mr.lkey());
 
         let mut recv_wr = QueuePair::build_recv_wr(2, &mut recv_sg_list);
-        qp_recv
+        pair.recv
+            .qp
             .post_recv(&mut recv_wr)
             .expect("failed to post recv wr");
 
         // post send wr
-        buf_send[0] = 0xff;
-        buf_send[1] = 0xde;
-        buf_send[2] = 0xad;
+        pair.send.buf[0] = 0xff;
+        pair.send.buf[1] = 0xde;
+        pair.send.buf[2] = 0xad;
 
-        let mut send_sg_list = make_sge_list(1, &mut buf_send, mr_send.lkey());
+        let mut send_sg_list = make_sge_list(1, &mut pair.send.buf, pair.send.mr.lkey());
 
         let mut send_wr = QueuePair::build_send_wr(2, &mut send_sg_list, SendOp::Send, true);
-        qp_send
+        pair.send
+            .qp
             .post_send(&mut send_wr)
             .expect("failed to post send wr");
 
@@ -961,7 +962,7 @@ mod test {
         });
 
         let _n_wce_recv = poll_cq_with_timeout(
-            &qp_recv.cq(),
+            &pair.recv.qp.cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -973,7 +974,7 @@ mod test {
         });
 
         let n_wce_send = poll_cq_with_timeout(
-            &qp_send.cq(),
+            &pair.send.qp.cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -983,7 +984,7 @@ mod test {
             ffi::ibv_wc_status::IBV_WC_SUCCESS
         ));
         assert_eq!(n_wce_send, 1);
-        assert_eq!(buf_recv, buf_send);
+        assert_eq!(pair.recv.buf, pair.send.buf);
         assert_eq!(recv_wc[0].byte_len, buf_size as u32);
     }
 
@@ -995,8 +996,7 @@ mod test {
         let (_name, device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let (qp_send, _cc_send, mr_send, mut buf_send, qp_recv, _cc_recv, mr_recv, buf_recv) =
-            create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+        let mut pair = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
 
         // post reveice wr
         let mut recv_wr_list = Vec::<rdma::ibv_recv_wr>::new();
@@ -1004,18 +1004,18 @@ mod test {
 
         recv_sg_list.push(vec![
             ffi::ibv_sge {
-                addr: mr_recv.addr() as u64,
+                addr: pair.recv.mr.addr() as u64,
                 length: half_buf_size,
-                lkey: mr_recv.lkey(),
+                lkey: pair.recv.mr.lkey(),
             };
             1
         ]);
 
         recv_sg_list.push(vec![
             ffi::ibv_sge {
-                addr: mr_recv.addr() + half_buf_size as u64,
+                addr: pair.recv.mr.addr() + half_buf_size as u64,
                 length: half_buf_size,
-                lkey: mr_recv.lkey(),
+                lkey: pair.recv.mr.lkey(),
             };
             1
         ]);
@@ -1026,23 +1026,24 @@ mod test {
 
         recv_wr_list[0].next = &mut recv_wr_list[1];
 
-        qp_recv
+        pair.recv
+            .qp
             .post_recv(&mut recv_wr_list[0])
             .expect("failed to post recv wr");
 
         // post send wr
-        buf_send[0] = 0xff;
-        buf_send[1] = 0xde;
-        buf_send[2] = 0xad;
+        pair.send.buf[0] = 0xff;
+        pair.send.buf[1] = 0xde;
+        pair.send.buf[2] = 0xad;
 
         let mut send_wr_list = Vec::<rdma::ibv_send_wr>::new();
         let mut send_sg_list = Vec::<Vec<rdma::ibv_sge>>::new();
 
         send_sg_list.push(vec![
             ffi::ibv_sge {
-                addr: mr_send.addr() as u64,
+                addr: pair.send.mr.addr() as u64,
                 length: half_buf_size,
-                lkey: mr_send.lkey(),
+                lkey: pair.send.mr.lkey(),
             };
             1
         ]);
@@ -1055,9 +1056,9 @@ mod test {
 
         send_sg_list.push(vec![
             ffi::ibv_sge {
-                addr: mr_send.addr() + half_buf_size as u64,
+                addr: pair.send.mr.addr() + half_buf_size as u64,
                 length: half_buf_size,
-                lkey: mr_send.lkey(),
+                lkey: pair.send.mr.lkey(),
             };
             1
         ]);
@@ -1071,7 +1072,8 @@ mod test {
 
         // link the two recv requests
         send_wr_list[0].next = &mut send_wr_list[1];
-        qp_send
+        pair.send
+            .qp
             .post_send(&mut send_wr_list[0])
             .expect("failed to post send wr");
 
@@ -1085,7 +1087,7 @@ mod test {
         });
 
         let _n_wce_recv = poll_cq_with_timeout(
-            &qp_recv.cq(),
+            &pair.recv.qp.cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1100,7 +1102,7 @@ mod test {
         });
 
         let n_wce_send = poll_cq_with_timeout(
-            &qp_send.cq(),
+            &pair.send.qp.cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1111,7 +1113,7 @@ mod test {
         ));
         assert_eq!(n_wce_send, 1);
         assert_eq!(send_wc[0].wr_id, 1);
-        assert_eq!(buf_recv, buf_send);
+        assert_eq!(pair.recv.buf, pair.send.buf);
         assert_eq!(recv_wc[0].byte_len, half_buf_size as u32);
     }
 
@@ -1122,19 +1124,20 @@ mod test {
         let (_name, device, port, gid_index, path_mtu) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let (_qp_send, _cc_send, _mr_send, _buf_send, qp_recv, _cc_recv, mr_recv, mut buf_recv) =
-            create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+        let mut pair = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
 
         // post reveice wr before transitioning to error
-        let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
+        let mut recv_sg_list = make_sge_list(1, &mut pair.recv.buf, pair.recv.mr.lkey());
 
         let mut recv_wr = QueuePair::build_recv_wr(1, &mut recv_sg_list);
-        qp_recv
+        pair.recv
+            .qp
             .post_recv(&mut recv_wr)
             .expect("failed to post recv wr");
 
         // transition the QP to error state
-        qp_recv
+        pair.recv
+            .qp
             .modify_to_error()
             .expect("Failed to transition to error");
 
@@ -1144,7 +1147,7 @@ mod test {
         });
 
         let _n = poll_cq_with_timeout(
-            &qp_recv.cq(),
+            &pair.recv.qp.cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1193,39 +1196,33 @@ mod test {
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let buf_size = 64;
-        let (
-            qp_send,
-            channel_send,
-            mr_send,
-            mut buf_send,
-            qp_recv,
-            _channel_recv,
-            mr_recv,
-            mut buf_recv,
-        ) = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+        let mut pair = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
 
-        // request notifications for cq of qp_send
-        qp_send
+        // request notifications for cq of pair.send.qp
+        pair.send
+            .qp
             .cq()
             .req_notify_cq(false)
             .expect("failed to request notification to cq");
 
         // post reveice wr
-        let mut recv_sg_list = make_sge_list(1, &mut buf_recv, mr_recv.lkey());
+        let mut recv_sg_list = make_sge_list(1, &mut pair.recv.buf, pair.recv.mr.lkey());
         let mut recv_wr = QueuePair::build_recv_wr(1, &mut recv_sg_list);
-        qp_recv
+        pair.recv
+            .qp
             .post_recv(&mut recv_wr)
             .expect("failed to post recv wr");
 
         // post send wr
-        buf_send[0] = 0xff;
-        buf_send[1] = 0xde;
-        buf_send[2] = 0xad;
+        pair.send.buf[0] = 0xff;
+        pair.send.buf[1] = 0xde;
+        pair.send.buf[2] = 0xad;
 
-        let mut send_sg_list = make_sge_list(1, &mut buf_send, mr_send.lkey());
+        let mut send_sg_list = make_sge_list(1, &mut pair.send.buf, pair.send.mr.lkey());
 
         let mut send_wr = QueuePair::build_send_wr(2, &mut send_sg_list, SendOp::Send, true);
-        qp_send
+        pair.send
+            .qp
             .post_send(&mut send_wr)
             .expect("faieled to post send wr");
 
@@ -1234,14 +1231,15 @@ mod test {
             ..Default::default()
         });
         let _n_wce_recv = poll_cq_with_timeout(
-            &qp_recv.cq(),
+            &pair.recv.qp.cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
 
         // wait for event in send channel
         // this should be blocking with a timeout...
-        channel_send
+        pair.send
+            .channel
             .get_cq_event()
             .expect("failed to get completion event!");
 
@@ -1251,7 +1249,9 @@ mod test {
             ..Default::default()
         });
 
-        let n_wce_send = qp_send
+        let n_wce_send = pair
+            .send
+            .qp
             .cq()
             .poll(&mut send_wc)
             .expect("failed to poll completion queue");
@@ -1263,6 +1263,6 @@ mod test {
         ));
 
         // ack the event
-        qp_send.cq().ack_cq_events(1);
+        pair.send.qp.cq().ack_cq_events(1);
     }
 }
