@@ -1,6 +1,6 @@
 use feroce::rdma;
 use feroce::rdma::buffer_pool::BufferAllocator;
-use feroce::{BufferPool, CompletionChannel, QueuePair, RdmaEndpoint};
+use feroce::{BufferPool, CompletionChannel, ConnectedRdmaEndpoint, QueuePair};
 use log::{debug, error};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -24,30 +24,31 @@ pub fn run<A: BufferAllocator>(
     >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller = |rdma_endpoint: RdmaEndpoint<A>, stream_id: u32, remote_qpn: u32| {
-        let stats = Arc::new(StreamStats::new(
-            stream_id,
-            rdma_endpoint.qp.qp_num(),
-            remote_qpn,
-        ));
+    let spawn_poller =
+        |rdma_endpoint: ConnectedRdmaEndpoint<A>, stream_id: u32, remote_qpn: u32| {
+            let stats = Arc::new(StreamStats::new(
+                stream_id,
+                rdma_endpoint.qp.qp_num(),
+                remote_qpn,
+            ));
 
-        let handle = std::thread::spawn({
-            let qp = Arc::clone(&rdma_endpoint.qp);
-            let stats = Arc::clone(&stats);
-            move || {
-                if let Err(e) = poller_thread(
-                    qp,
-                    rdma_endpoint.buffer_pool,
-                    rdma_endpoint.comp_channel,
-                    stats,
-                ) {
-                    error!("poller thread error: {}", e);
+            let handle = std::thread::spawn({
+                let qp = Arc::clone(&rdma_endpoint.qp);
+                let stats = Arc::clone(&stats);
+                move || {
+                    if let Err(e) = poller_thread(
+                        qp,
+                        rdma_endpoint.buffer_pool,
+                        rdma_endpoint.comp_channel,
+                        stats,
+                    ) {
+                        error!("poller thread error: {}", e);
+                    }
                 }
-            }
-        });
+            });
 
-        (handle, stats)
-    };
+            (handle, stats)
+        };
 
     // TUI handle kept alive to call restore() after the test is done
     #[cfg(feature = "tui")]
@@ -140,7 +141,7 @@ fn poller_thread<A: BufferAllocator>(
     ];
 
     // request notification from completion channel for every event
-    qp.cq().req_notify_cq(false)?;
+    qp.recv_cq().req_notify_cq(false)?;
 
     let mut poller_done = false;
     while !poller_done {
@@ -149,14 +150,14 @@ fn poller_thread<A: BufferAllocator>(
 
         // rearm the notification
         if got_event {
-            qp.cq().req_notify_cq(false)?;
+            qp.recv_cq().req_notify_cq(false)?;
         }
 
         // poll the CQ (we do it regardless the presence of an event, to avoid race conditions)
-        let num_wce = qp.cq().poll(&mut wc_list)?;
+        let num_wce = qp.recv_cq().poll(&mut wc_list)?;
 
         if got_event {
-            qp.cq().ack_cq_events(1);
+            qp.recv_cq().ack_cq_events(1);
         }
 
         // finally, process completions

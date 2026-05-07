@@ -17,8 +17,9 @@ mod rdma_tests {
     fn loopback_send_recv() {
         let bin = env!("CARGO_BIN_EXE_feroce-cli");
 
-        let (device_name, _device, port, gid_index, _mtu) =
-            find_roce_device().expect("no RoCE device found");
+        let (device_name, _device, link) = find_roce_device().expect("no RoCE device found");
+        let port = link.port_num;
+        let gid_index = link.gid_index;
 
         let receiver_port = next_test_port();
         let sender_port = next_test_port();
@@ -85,8 +86,9 @@ mod rdma_tests {
     fn loopback_gpu_direct() {
         let bin = env!("CARGO_BIN_EXE_feroce-cli");
 
-        let (device_name, _device, port, gid_index, _mtu) =
-            find_roce_device().expect("no RoCE device found");
+        let (device_name, _device, link) = find_roce_device().expect("no RoCE device found");
+        let port = link.port_num;
+        let gid_index = link.gid_index;
 
         let receiver_port = next_test_port();
         let sender_port = next_test_port();

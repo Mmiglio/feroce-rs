@@ -210,11 +210,13 @@ impl Device {
         }
     }
 
-    pub fn query_rocev2_mtu(
+    // Validate that the given (port, gid_index) refers to an active RoCEv2
+    // endpoint and return a localLink
+    pub fn probe_link(
         &self,
         port_num: u8,
-        gid_index: i32,
-    ) -> Result<Option<ffi::ibv_mtu>, FeroceError> {
+        gid_index: u8,
+    ) -> Result<Option<LocalLink>, FeroceError> {
         let port_attr = self.query_port(port_num)?;
         let gid_entries = self.query_gid_table()?;
 
@@ -228,12 +230,23 @@ impl Device {
                 && port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET as u8
                 && matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE)
             {
-                return Ok(Some(port_attr.active_mtu));
+                return Ok(Some(LocalLink {
+                    port_num,
+                    gid_index,
+                    mtu: port_attr.active_mtu,
+                }));
             }
         }
 
         Ok(None)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LocalLink {
+    pub port_num: u8,
+    pub gid_index: u8,
+    pub mtu: ffi::ibv_mtu,
 }
 
 impl Drop for Device {
@@ -336,6 +349,23 @@ impl ProtectionDomain {
     pub fn raw(&self) -> *mut ffi::ibv_pd {
         self.pd
     }
+
+    // start building a QP on this protection domain, creates a QpBuilder
+    pub fn create_qp(
+        self: &Arc<Self>,
+        send_cq: &Arc<CompletionQueue>,
+        recv_cq: &Arc<CompletionQueue>,
+        qp_type: ffi::ibv_qp_type,
+        link: LocalLink,
+    ) -> QpBuilder {
+        QpBuilder::new(
+            Arc::clone(self),
+            Arc::clone(send_cq),
+            Arc::clone(recv_cq),
+            qp_type,
+            link,
+        )
+    }
 }
 
 impl Drop for ProtectionDomain {
@@ -416,34 +446,74 @@ pub enum SendOp {
     },
 }
 
+pub(crate) struct RtrParams {
+    pub min_rnr_timer: u8,
+    pub max_dest_rd_atomic: u8,
+    pub hop_limit: u8,
+}
+
+impl Default for RtrParams {
+    fn default() -> Self {
+        Self {
+            min_rnr_timer: 8,
+            max_dest_rd_atomic: 1,
+            hop_limit: 1,
+        }
+    }
+}
+
+pub(crate) struct RtsParams {
+    pub timeout: u8,
+    pub retry_cnt: u8,
+    pub rnr_retry: u8,
+    pub max_rd_atomic: u8,
+}
+
+impl Default for RtsParams {
+    fn default() -> Self {
+        Self {
+            timeout: 14,
+            retry_cnt: 7,
+            rnr_retry: 7,
+            max_rd_atomic: 1,
+        }
+    }
+}
+
 pub struct QueuePair {
     qp: *mut ffi::ibv_qp,
     _pd: Arc<ProtectionDomain>,
-    _cq: Arc<CompletionQueue>,
+    _send_cq: Arc<CompletionQueue>,
+    _recv_cq: Arc<CompletionQueue>,
 }
 
 unsafe impl Send for QueuePair {}
 unsafe impl Sync for QueuePair {}
 
 impl QueuePair {
-    pub fn create_qp(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_qp(
         pd: Arc<ProtectionDomain>,
-        cq: Arc<CompletionQueue>,
-        max_wr: u32,
-        max_sge: u32,
+        send_cq: Arc<CompletionQueue>,
+        recv_cq: Arc<CompletionQueue>,
+        max_send_wr: u32,
+        max_recv_wr: u32,
+        max_send_sge: u32,
+        max_recv_sge: u32,
+        max_inline_data: u32,
         qp_type: ffi::ibv_qp_type,
     ) -> Result<Self, FeroceError> {
         let mut init_attr = ffi::ibv_qp_init_attr {
             qp_context: std::ptr::null_mut(),
-            send_cq: cq.raw(),
-            recv_cq: cq.raw(),
+            send_cq: send_cq.raw(),
+            recv_cq: recv_cq.raw(),
             srq: std::ptr::null_mut(),
             cap: ffi::ibv_qp_cap {
-                max_send_wr: max_wr,
-                max_recv_wr: max_wr,
-                max_send_sge: max_sge,
-                max_recv_sge: max_sge,
-                max_inline_data: 0,
+                max_send_wr,
+                max_recv_wr,
+                max_send_sge,
+                max_recv_sge,
+                max_inline_data,
             },
             qp_type,
             sq_sig_all: 0,
@@ -454,15 +524,18 @@ impl QueuePair {
             Err(rdma_err("ibv_create_qp"))
         } else {
             debug!(
-                "Created QP {}, max WR={}, max SGE={}",
+                "Created QP {}, max send WR={}, max recv WR={}, max send SGE={}, max recv SGE={}",
                 unsafe { (*qp).qp_num },
-                max_wr,
-                max_sge
+                max_send_wr,
+                max_recv_wr,
+                max_send_sge,
+                max_recv_sge
             );
             Ok(QueuePair {
                 qp,
                 _pd: pd,
-                _cq: cq,
+                _send_cq: send_cq,
+                _recv_cq: recv_cq,
             })
         }
     }
@@ -471,7 +544,7 @@ impl QueuePair {
         unsafe { (*self.qp).qp_num }
     }
 
-    pub fn modify_to_init(&self, port_num: u8) -> Result<(), FeroceError> {
+    pub(crate) fn modify_to_init(&self, port_num: u8) -> Result<(), FeroceError> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
             port_num,
@@ -491,26 +564,27 @@ impl QueuePair {
         }
     }
 
-    pub fn modify_to_rtr(
+    pub(crate) fn modify_to_rtr(
         &self,
         remote_info: &QpConnectionInfo,
         gid_index: u8,
         port_num: u8,
         mtu: ffi::ibv_mtu,
+        params: &RtrParams,
     ) -> Result<(), FeroceError> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
             path_mtu: mtu,
             dest_qp_num: remote_info.qp_num,
             rq_psn: remote_info.psn,
-            max_dest_rd_atomic: 1,
-            min_rnr_timer: 8,
+            max_dest_rd_atomic: params.max_dest_rd_atomic,
+            min_rnr_timer: params.min_rnr_timer,
             ah_attr: ffi::ibv_ah_attr {
                 is_global: 1,
                 port_num,
                 grh: ffi::ibv_global_route {
                     sgid_index: gid_index,
-                    hop_limit: 1,
+                    hop_limit: params.hop_limit,
                     dgid: ffi::ibv_gid {
                         raw: remote_info.gid,
                     },
@@ -546,14 +620,14 @@ impl QueuePair {
         }
     }
 
-    pub fn modify_to_rts(&self, sq_psn: u32) -> Result<(), FeroceError> {
+    pub(crate) fn modify_to_rts(&self, sq_psn: u32, params: &RtsParams) -> Result<(), FeroceError> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
-            timeout: 14,
-            retry_cnt: 7,
-            rnr_retry: 7,
+            timeout: params.timeout,
+            retry_cnt: params.retry_cnt,
+            rnr_retry: params.rnr_retry,
             sq_psn,
-            max_rd_atomic: 1,
+            max_rd_atomic: params.max_rd_atomic,
             ..Default::default()
         };
 
@@ -678,8 +752,12 @@ impl QueuePair {
         wr
     }
 
-    pub fn cq(&self) -> &CompletionQueue {
-        &self._cq
+    pub fn send_cq(&self) -> &CompletionQueue {
+        &self._send_cq
+    }
+
+    pub fn recv_cq(&self) -> &CompletionQueue {
+        &self._recv_cq
     }
 
     pub fn pd(&self) -> &ProtectionDomain {
@@ -693,6 +771,196 @@ impl Drop for QueuePair {
         if ret != 0 {
             error!("ibv_destroy_qp failed: errno={}", ret);
         }
+    }
+}
+
+pub struct QpBuilder {
+    pd: Arc<ProtectionDomain>,
+    send_cq: Arc<CompletionQueue>,
+    recv_cq: Arc<CompletionQueue>,
+    qp_type: ffi::ibv_qp_type,
+    link: LocalLink,
+
+    // create_qp knobs
+    max_send_wr: u32,
+    max_recv_wr: u32,
+    max_send_sge: u32,
+    max_recv_sge: u32,
+    max_inline_data: u32,
+
+    // RTR knobs
+    rtr: RtrParams,
+
+    // RTS knobs
+    rts: RtsParams,
+    sq_psn: u32,
+}
+
+impl QpBuilder {
+    fn new(
+        pd: Arc<ProtectionDomain>,
+        send_cq: Arc<CompletionQueue>,
+        recv_cq: Arc<CompletionQueue>,
+        qp_type: ffi::ibv_qp_type,
+        link: LocalLink,
+    ) -> Self {
+        Self {
+            pd,
+            send_cq,
+            recv_cq,
+            qp_type,
+            link,
+            max_send_wr: 128,
+            max_recv_wr: 128,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 0,
+            rtr: RtrParams::default(),
+            rts: RtsParams::default(),
+            sq_psn: 0,
+        }
+    }
+
+    pub fn set_max_wr(mut self, n: u32) -> Self {
+        self.max_send_wr = n;
+        self.max_recv_wr = n;
+        self
+    }
+
+    pub fn set_max_send_wr(mut self, n: u32) -> Self {
+        self.max_send_wr = n;
+        self
+    }
+
+    pub fn set_max_recv_wr(mut self, n: u32) -> Self {
+        self.max_recv_wr = n;
+        self
+    }
+    pub fn set_max_sge(mut self, n: u32) -> Self {
+        self.max_send_sge = n;
+        self.max_recv_sge = n;
+        self
+    }
+
+    pub fn set_max_send_sge(mut self, n: u32) -> Self {
+        self.max_send_sge = n;
+        self
+    }
+
+    pub fn set_max_recv_sge(mut self, n: u32) -> Self {
+        self.max_recv_sge = n;
+        self
+    }
+
+    pub fn set_max_inline_data(mut self, n: u32) -> Self {
+        self.max_inline_data = n;
+        self
+    }
+
+    pub fn set_min_rnr_timer(mut self, n: u8) -> Self {
+        self.rtr.min_rnr_timer = n;
+        self
+    }
+
+    pub fn set_max_dest_rd_atomic(mut self, n: u8) -> Self {
+        self.rtr.max_dest_rd_atomic = n;
+        self
+    }
+
+    pub fn set_hop_limit(mut self, n: u8) -> Self {
+        self.rtr.hop_limit = n;
+        self
+    }
+
+    pub fn set_timeout(mut self, n: u8) -> Self {
+        self.rts.timeout = n;
+        self
+    }
+
+    pub fn set_retry_cnt(mut self, n: u8) -> Self {
+        self.rts.retry_cnt = n;
+        self
+    }
+
+    pub fn set_rnr_retry(mut self, n: u8) -> Self {
+        self.rts.rnr_retry = n;
+        self
+    }
+
+    pub fn set_max_rd_atomic(mut self, n: u8) -> Self {
+        self.rts.max_rd_atomic = n;
+        self
+    }
+
+    pub fn set_sq_psn(mut self, sq_psn: u32) -> Self {
+        self.sq_psn = sq_psn;
+        self
+    }
+
+    pub fn build(self) -> Result<PreparedQueuePair, FeroceError> {
+        let qp = QueuePair::create_qp(
+            self.pd,
+            self.send_cq,
+            self.recv_cq,
+            self.max_send_wr,
+            self.max_recv_wr,
+            self.max_send_sge,
+            self.max_recv_sge,
+            self.max_inline_data,
+            self.qp_type,
+        )?;
+        qp.modify_to_init(self.link.port_num)?;
+        Ok(PreparedQueuePair {
+            qp,
+            link: self.link,
+            rtr: self.rtr,
+            rts: self.rts,
+            sq_psn: self.sq_psn,
+        })
+    }
+}
+
+pub struct PreparedQueuePair {
+    qp: QueuePair,
+    link: LocalLink,
+    rtr: RtrParams,
+    rts: RtsParams,
+    sq_psn: u32,
+}
+
+impl PreparedQueuePair {
+    pub fn qp_num(&self) -> u32 {
+        self.qp.qp_num()
+    }
+
+    pub fn send_cq(&self) -> &CompletionQueue {
+        self.qp.send_cq()
+    }
+
+    pub fn recv_cq(&self) -> &CompletionQueue {
+        self.qp.recv_cq()
+    }
+
+    pub fn pd(&self) -> &ProtectionDomain {
+        self.qp.pd()
+    }
+
+    pub fn link(&self) -> LocalLink {
+        self.link
+    }
+
+    // Transition the QP through RTR and RTS with the remote info,
+    // returning the connected QueuePair
+    pub fn handshake(self, remote_info: &QpConnectionInfo) -> Result<QueuePair, FeroceError> {
+        self.qp.modify_to_rtr(
+            remote_info,
+            self.link.gid_index,
+            self.link.port_num,
+            self.link.mtu,
+            &self.rtr,
+        )?;
+        self.qp.modify_to_rts(self.sq_psn, &self.rts)?;
+        Ok(self.qp)
     }
 }
 
@@ -778,8 +1046,10 @@ impl Drop for MemoryRegion {
     }
 }
 
-// Find one available roce device, returns the device, port number, gid_index and mtu.
-pub fn find_roce_device() -> Option<(String, Arc<Device>, u8, i32, ffi::ibv_mtu)> {
+/// Discover the first active RoCEv2 device on the host. Returns the device
+/// name, an [`Arc<Device>`], and the validated [`LocalLink`] (port + GID +
+/// active MTU).
+pub fn find_roce_device() -> Option<(String, Arc<Device>, LocalLink)> {
     let devices = DeviceList::new().ok()?;
     for i in 0..devices.len() {
         let name = devices.device_name(i)?;
@@ -798,13 +1068,12 @@ pub fn find_roce_device() -> Option<(String, Arc<Device>, u8, i32, ffi::ibv_mtu)
                         "Discovery: device={}, port={}, gid_index={}, mtu={:?}",
                         name, port, entry.gid_index, port_attr.active_mtu as u32
                     );
-                    return Some((
-                        name.to_string(),
-                        Arc::new(device),
-                        port,
-                        entry.gid_index as i32,
-                        port_attr.active_mtu,
-                    ));
+                    let link = LocalLink {
+                        port_num: port,
+                        gid_index: entry.gid_index as u8,
+                        mtu: port_attr.active_mtu,
+                    };
+                    return Some((name.to_string(), Arc::new(device), link));
                 }
             }
         }
@@ -849,62 +1118,56 @@ mod test {
 
     #[test]
     fn create_qp() {
-        let (_name, device, _port, _gid_index, _path_mtu) =
+        let (_name, device, link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
         let cq = Arc::new(device.create_cq(128).expect("failed to create CQ"));
 
-        let _qp = QueuePair::create_qp(
-            Arc::clone(&pd),
-            Arc::clone(&cq),
-            16,
-            4,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )
-        .expect("failed to create qp");
+        let _prepared = pd
+            .create_qp(&cq, &cq, rdma::ibv_qp_type::IBV_QPT_RC, link)
+            .set_max_wr(16)
+            .set_max_sge(4)
+            .build()
+            .expect("failed to create qp");
     }
 
     #[test]
     fn qp_state_transitions_rts() {
-        let (_name, device, port, gid_index, path_mtu) =
+        let (_name, device, link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
         let cq = Arc::new(device.create_cq(128).expect("failed to create CQ"));
 
-        let qp = QueuePair::create_qp(
-            Arc::clone(&pd),
-            Arc::clone(&cq),
-            16,
-            4,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )
-        .expect("failed to create qp");
+        let prepared = pd
+            .create_qp(&cq, &cq, rdma::ibv_qp_type::IBV_QPT_RC, link)
+            .set_max_wr(16)
+            .set_max_sge(4)
+            .set_sq_psn(4321)
+            .build()
+            .expect("failed to create qp");
 
         let loc_gid = device
-            .query_gid(port, gid_index)
-            .expect("failed to query fid");
-        let qp_num = qp.qp_num();
+            .query_gid(link.port_num, link.gid_index as i32)
+            .expect("failed to query gid");
 
         let fake_remote_info = QpConnectionInfo {
-            qp_num: qp_num,
+            qp_num: prepared.qp_num(),
             psn: 1234,
             rkey: 0xABCD,
             addr: 0x1234ABCD,
-            gid: loc_gid.raw, // gid_from_ipv4(Ipv4Addr::new(10, 0, 1, 120).into()),
+            gid: loc_gid.raw,
         };
 
-        qp.modify_to_init(port)
-            .expect("failed to modify qp to INIT");
-        qp.modify_to_rtr(&fake_remote_info, gid_index as u8, port, path_mtu)
-            .expect("failed to modify qp to RTR");
-        qp.modify_to_rts(4321).expect("failed to modify qp to RTS");
+        let _qp = prepared
+            .handshake(&fake_remote_info)
+            .expect("failed to handshake qp to RTS");
     }
 
     #[test]
     fn register_memory_region() {
-        let (_name, device, _port, _gid_index, _path_mtu) =
+        let (_name, device, _link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = device.alloc_pd().expect("failed to allocate PD");
@@ -928,10 +1191,10 @@ mod test {
     fn loopback_send_recv() {
         let buf_size = 64;
 
-        let (_name, device, port, gid_index, path_mtu) =
+        let (_name, device, link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let mut pair = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+        let mut pair = create_loopback_qp(&device, link, buf_size);
 
         // post reveice wr
         let mut recv_sg_list = make_sge_list(1, &mut pair.recv.buf, pair.recv.mr.lkey());
@@ -962,7 +1225,7 @@ mod test {
         });
 
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.cq(),
+            &pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -974,7 +1237,7 @@ mod test {
         });
 
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.cq(),
+            &pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -993,10 +1256,10 @@ mod test {
         let buf_size = 64;
         let half_buf_size = buf_size as u32 / 2;
 
-        let (_name, device, port, gid_index, path_mtu) =
+        let (_name, device, link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let mut pair = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+        let mut pair = create_loopback_qp(&device, link, buf_size);
 
         // post reveice wr
         let mut recv_wr_list = Vec::<rdma::ibv_recv_wr>::new();
@@ -1087,7 +1350,7 @@ mod test {
         });
 
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.cq(),
+            &pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1102,7 +1365,7 @@ mod test {
         });
 
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.cq(),
+            &pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1121,10 +1384,10 @@ mod test {
     fn loopback_send_recv_error_transition() {
         let buf_size = 64;
 
-        let (_name, device, port, gid_index, path_mtu) =
+        let (_name, device, link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let mut pair = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+        let mut pair = create_loopback_qp(&device, link, buf_size);
 
         // post reveice wr before transitioning to error
         let mut recv_sg_list = make_sge_list(1, &mut pair.recv.buf, pair.recv.mr.lkey());
@@ -1147,7 +1410,7 @@ mod test {
         });
 
         let _n = poll_cq_with_timeout(
-            &pair.recv.qp.cq(),
+            &pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1160,48 +1423,40 @@ mod test {
 
     #[test]
     fn two_qps_share_pd_and_cq() {
-        let (_name, device, port, _gid_index, _path_mtu) =
+        let (_name, device, link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let pd = Arc::new(device.alloc_pd().expect("failed to alloc pd"));
         let cq = Arc::new(device.create_cq(16).expect("failed to create cq"));
 
-        // create two qps sharing pd and cq
-        let qp1 = QueuePair::create_qp(
-            Arc::clone(&pd),
-            Arc::clone(&cq),
-            16,
-            1,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )
-        .expect("failed to create QP");
-        let qp2 = QueuePair::create_qp(
-            Arc::clone(&pd),
-            Arc::clone(&cq),
-            16,
-            1,
-            rdma::ibv_qp_type::IBV_QPT_RC,
-        )
-        .expect("failed to create QP");
+        // create two qps sharing pd and cq; build() also brings each to INIT
+        let qp1 = pd
+            .create_qp(&cq, &cq, rdma::ibv_qp_type::IBV_QPT_RC, link)
+            .set_max_wr(16)
+            .build()
+            .expect("failed to create QP");
+        let _qp2 = pd
+            .create_qp(&cq, &cq, rdma::ibv_qp_type::IBV_QPT_RC, link)
+            .set_max_wr(16)
+            .build()
+            .expect("failed to create QP");
 
         // drop one of the qps, the other should still be alive
         drop(qp1);
-        qp2.modify_to_init(port)
-            .expect("failed to modify qp to init");
     }
 
     #[test]
     fn completion_channel_firing() {
-        let (_name, device, port, gid_index, path_mtu) =
+        let (_name, device, link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
         let buf_size = 64;
-        let mut pair = create_loopback_qp(&device, port, gid_index, path_mtu, buf_size);
+        let mut pair = create_loopback_qp(&device, link, buf_size);
 
         // request notifications for cq of pair.send.qp
         pair.send
             .qp
-            .cq()
+            .send_cq()
             .req_notify_cq(false)
             .expect("failed to request notification to cq");
 
@@ -1231,7 +1486,7 @@ mod test {
             ..Default::default()
         });
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.cq(),
+            &pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1252,7 +1507,7 @@ mod test {
         let n_wce_send = pair
             .send
             .qp
-            .cq()
+            .send_cq()
             .poll(&mut send_wc)
             .expect("failed to poll completion queue");
 
@@ -1263,6 +1518,6 @@ mod test {
         ));
 
         // ack the event
-        pair.send.qp.cq().ack_cq_events(1);
+        pair.send.qp.send_cq().ack_cq_events(1);
     }
 }
