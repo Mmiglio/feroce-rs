@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use log::debug;
 
@@ -12,7 +13,7 @@ pub trait BufferAllocator: Send + 'static {
     /// allocate and register RDMA memory region
     fn alloc_and_register(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Arc<ProtectionDomain>,
         size: usize,
     ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError>;
 }
@@ -23,7 +24,7 @@ impl BufferAllocator for CpuAllocator {
 
     fn alloc_and_register(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Arc<ProtectionDomain>,
         size: usize,
     ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError> {
         let mut data = vec![0u8; size];
@@ -66,7 +67,7 @@ impl<A: BufferAllocator> BufferPool<A> {
     pub fn new(
         num_buf: usize,
         buf_size: usize,
-        pd: &ProtectionDomain,
+        pd: &Arc<ProtectionDomain>,
         allocator: &A,
     ) -> Result<Self, FeroceError> {
         let (storage, mr, base_addr) = allocator.alloc_and_register(pd, num_buf * buf_size)?;
@@ -152,10 +153,9 @@ mod test {
     fn basic_functionalities() {
         let devices = rdma::device::DeviceList::new().expect("no RDMA devices found");
         let name = devices.device_name(0).expect("no devices");
-        let device =
-            std::sync::Arc::new(rdma::device::Device::open(name).expect("failed to open device"));
+        let device = Arc::new(rdma::device::Device::open(name).expect("failed to open device"));
 
-        let pd = device.alloc_pd().expect("failed to allocate PD");
+        let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
 
         let allocator = CpuAllocator;
         let mut buf_pool =

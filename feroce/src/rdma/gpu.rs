@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use log::{error, warn};
 
 use crate::FeroceError;
@@ -188,7 +190,7 @@ impl BufferAllocator for GpuAllocator {
 
     fn alloc_and_register(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Arc<ProtectionDomain>,
         size: usize,
     ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError> {
         let buff = GpuBuffer::alloc(size)?;
@@ -238,7 +240,7 @@ mod test {
         let devices = rdma::device::DeviceList::new().expect("no RDMA devices");
         let name = devices.device_name(0).expect("no devices");
         let device = Arc::new(rdma::device::Device::open(name).expect("failed to open"));
-        let pd = device.alloc_pd().expect("failed to allocate PD");
+        let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
 
         let (buffer, mr, _base_addr) = allocator.alloc_and_register(&pd, 4096).unwrap();
         assert!(mr.lkey() != 0);
