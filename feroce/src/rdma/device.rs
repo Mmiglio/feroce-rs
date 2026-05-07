@@ -966,11 +966,12 @@ impl PreparedQueuePair {
 
 pub struct MemoryRegion {
     mr: *mut ffi::ibv_mr,
+    _pd: Arc<ProtectionDomain>,
 }
 
 impl MemoryRegion {
     pub fn register(
-        pd: &ProtectionDomain,
+        pd: &Arc<ProtectionDomain>,
         buffer: &mut [u8],
         access: ffi::ibv_access_flags,
     ) -> Result<Self, FeroceError> {
@@ -991,13 +992,16 @@ impl MemoryRegion {
                 unsafe { (*mr).addr as u64 },
                 unsafe { (*mr).length as u32 }
             );
-            Ok(MemoryRegion { mr })
+            Ok(MemoryRegion {
+                mr,
+                _pd: Arc::clone(pd),
+            })
         }
     }
 
     #[cfg(feature = "gpu")]
     pub fn register_dmabuf(
-        pd: &ProtectionDomain,
+        pd: &Arc<ProtectionDomain>,
         offset: u64,
         length: usize,
         iova: u64,
@@ -1016,7 +1020,10 @@ impl MemoryRegion {
                 unsafe { (*mr).addr as u64 },
                 unsafe { (*mr).length as u32 }
             );
-            Ok(MemoryRegion { mr })
+            Ok(MemoryRegion {
+                mr,
+                _pd: Arc::clone(pd),
+            })
         }
     }
 
@@ -1170,7 +1177,7 @@ mod test {
         let (_name, device, _link) =
             find_roce_device().expect("no active RoCE device found — skipping");
 
-        let pd = device.alloc_pd().expect("failed to allocate PD");
+        let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
 
         let mut buf = vec![0u8; 128];
 
