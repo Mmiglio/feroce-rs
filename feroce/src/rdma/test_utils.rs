@@ -33,8 +33,7 @@ fn build_endpoint(
     label: &str,
 ) -> PreparedLoopback {
     let channel = Arc::new(
-        CompletionChannel::create(device)
-            .unwrap_or_else(|e| panic!("channel_{}: {}", label, e)),
+        CompletionChannel::create(device).unwrap_or_else(|e| panic!("channel_{}: {}", label, e)),
     );
     let pd = Arc::new(
         device
