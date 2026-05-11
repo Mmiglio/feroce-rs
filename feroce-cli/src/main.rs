@@ -2,12 +2,14 @@ use clap::{Args, Parser, Subcommand};
 use feroce::rdma::buffer_pool::CpuAllocator;
 use std::collections::VecDeque;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::ctrl::{run_close_qp, run_txmeta};
 
 mod common;
 mod ctrl;
+mod dump;
 mod recv;
 mod send;
 mod stats;
@@ -85,6 +87,10 @@ struct ReceiverOpts {
     /// Enable TUI dashboard (requires building with --features tui)
     #[arg(long)]
     tui: bool,
+    /// Dump received payloads to <PATH> for debugging. With --num-streams > 1 each
+    /// stream writes to <stem>.NNN.<ext>
+    #[arg(long, value_name = "PATH")]
+    dump_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -225,21 +231,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             receiver_opts,
         } => {
             let log_buffer = init_logging(receiver_opts.tui)?;
+
+            // validate dump dir
+            if let Some(ref path) = receiver_opts.dump_file {
+                let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+                if let Some(p) = parent
+                    && !p.is_dir()
+                {
+                    return Err(format!(
+                        "--dump-file parent directory does not exist: {}",
+                        p.display()
+                    )
+                    .into());
+                }
+                if path.file_stem().is_none() {
+                    return Err("--dump-file path must have a filename".into());
+                }
+            }
+
             // pick the selected allocator
             if receiver_opts.gpu {
                 #[cfg(feature = "gpu")]
                 {
+                    use crate::dump::{GpuDumpFactory, NoDumpFactory};
                     use feroce::rdma::gpu::GpuAllocator;
 
                     let allocator = GpuAllocator::new(0)?;
-                    recv::run(&cm_opts, &rdma_opts, allocator, log_buffer)?;
+                    match receiver_opts.dump_file {
+                        None => {
+                            recv::run(&cm_opts, &rdma_opts, allocator, NoDumpFactory, log_buffer)?
+                        }
+                        Some(path) => recv::run(
+                            &cm_opts,
+                            &rdma_opts,
+                            allocator,
+                            GpuDumpFactory::new(path, rdma_opts.buf_size)?,
+                            log_buffer,
+                        )?,
+                    }
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
                     return Err("--gpu requires building with --features gpu".into());
                 }
             } else {
-                recv::run(&cm_opts, &rdma_opts, CpuAllocator, log_buffer)?;
+                use crate::dump::{CpuDumpFactory, NoDumpFactory};
+                match receiver_opts.dump_file {
+                    None => recv::run(
+                        &cm_opts,
+                        &rdma_opts,
+                        CpuAllocator,
+                        NoDumpFactory,
+                        log_buffer,
+                    )?,
+                    Some(path) => recv::run(
+                        &cm_opts,
+                        &rdma_opts,
+                        CpuAllocator,
+                        CpuDumpFactory::new(path),
+                        log_buffer,
+                    )?,
+                }
             }
             Ok(())
         }

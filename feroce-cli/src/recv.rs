@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 
+use crate::dump::{DumpSink, DumpSinkFactory};
 #[cfg(feature = "tui")]
 use crate::tui;
 use crate::{
@@ -15,14 +16,19 @@ use crate::{
     stats::StreamStats,
 };
 
-pub fn run<A: BufferAllocator>(
+pub fn run<A, S>(
     cm_opts: &CmOpts,
     rdma_opts: &RdmaOpts,
     allocator: A,
+    dump_factory: S,
     #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_buffer: Option<
         Arc<Mutex<VecDeque<String>>>,
     >,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: BufferAllocator,
+    S: DumpSinkFactory,
+{
     // spawn poller closure
     let spawn_poller =
         |rdma_endpoint: ConnectedRdmaEndpoint<A>, stream_id: u32, remote_qpn: u32| {
@@ -31,6 +37,10 @@ pub fn run<A: BufferAllocator>(
                 rdma_endpoint.qp.qp_num(),
                 remote_qpn,
             ));
+
+            let dump = dump_factory
+                .make(stream_id)
+                .expect("failed to open dump sink for stream");
 
             let handle = std::thread::spawn({
                 let qp = Arc::clone(&rdma_endpoint.qp);
@@ -41,6 +51,7 @@ pub fn run<A: BufferAllocator>(
                         rdma_endpoint.buffer_pool,
                         rdma_endpoint.comp_channel,
                         stats,
+                        dump,
                     ) {
                         error!("poller thread error: {}", e);
                     }
@@ -103,11 +114,12 @@ pub fn run<A: BufferAllocator>(
     Ok(())
 }
 
-fn poller_thread<A: BufferAllocator>(
+fn poller_thread<A: BufferAllocator, D: DumpSink>(
     qp: Arc<QueuePair>,
     buffer_pool: BufferPool<A>,
     channel: Arc<CompletionChannel>,
     stats: Arc<StreamStats>,
+    mut dump: D,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // metrics
     let mut total_bytes;
@@ -177,6 +189,10 @@ fn poller_thread<A: BufferAllocator>(
             // update metrics
             total_bytes += wce.byte_len as u64;
             total_msgs += 1;
+
+            // optional payload dump (no-op when DumpSink is NoDump; monomorphized away)
+            let buf_handle = buffer_pool.get_handle(wce.wr_id as usize);
+            dump.record(buf_handle.addr, wce.byte_len as usize)?;
 
             // immediately repost buffer
             qp.post_recv(&mut recv_wr_list[wce.wr_id as usize])?;

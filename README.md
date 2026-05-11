@@ -56,6 +56,8 @@ For GPUDirect, build with `--features gpu` and pass `--gpu` to the receiver (sen
       --buf-size 16384 --num-buf 128 --gpu
 ```
 
+To dump received payloads for inspection, pass `--dump-file <PATH>` to the receiver. With multiple streams each stream writes to `<stem>.NNN.<ext>`. Works for both CPU and GPU receive paths; intended for debugging, not high-rate runs.
+
 See all available options with:
 
 ```bash
