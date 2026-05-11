@@ -34,13 +34,17 @@ fn build_endpoint(
 ) -> PreparedLoopback {
     let channel = Arc::new(
         CompletionChannel::create(device)
-            .unwrap_or_else(|_| panic!("failed to create {} completion channel", label)),
+            .unwrap_or_else(|e| panic!("channel_{}: {}", label, e)),
     );
-    let pd = Arc::new(device.alloc_pd().unwrap_or_else(|_| panic!("pd_{}", label)));
+    let pd = Arc::new(
+        device
+            .alloc_pd()
+            .unwrap_or_else(|e| panic!("pd_{}: {}", label, e)),
+    );
     let cq = Arc::new(
         device
             .create_cq_with_channel(16, &channel)
-            .unwrap_or_else(|_| panic!("cq_{}", label)),
+            .unwrap_or_else(|e| panic!("cq_{}: {}", label, e)),
     );
     let mut buf = vec![0u8; buf_size];
     let mr = MemoryRegion::register(
@@ -49,13 +53,13 @@ fn build_endpoint(
         ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
     )
-    .unwrap_or_else(|_| panic!("mr_{}", label));
+    .unwrap_or_else(|e| panic!("mr_{}: {}", label, e));
 
     let qp = pd
         .create_qp(&cq, &cq, rdma::ibv_qp_type::IBV_QPT_RC, link)
         .set_max_wr(8)
         .build()
-        .unwrap_or_else(|_| panic!("qp_{}", label));
+        .unwrap_or_else(|e| panic!("qp_{}: {}", label, e));
 
     PreparedLoopback {
         qp,
