@@ -21,7 +21,8 @@ const CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD: i32 = 0x1;
 
 unsafe extern "C" {
     fn cuInit(flags: u32) -> CUresult;
-    //fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
+    fn cuCtxGetCurrent(pctx: *mut CUcontext) -> CUresult;
+    fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
     fn cuDeviceGet(device: *mut CUdevice, ordinal: i32) -> CUresult;
     fn cuCtxCreate_v2(pctx: *mut CUcontext, flags: u32, device: CUdevice) -> CUresult;
     fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
@@ -46,6 +47,35 @@ fn check_cuda(result: CUresult, call: &'static str) -> Result<(), FeroceError> {
         Err(FeroceError::Cuda { call, code: result })
     } else {
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct CudaCtxToken {
+    ctx: CUcontext,
+}
+
+unsafe impl Send for CudaCtxToken {}
+unsafe impl Sync for CudaCtxToken {}
+
+impl CudaCtxToken {
+    // Capture whatever CUDA context is currently bound to the calling thread.
+    // Returns `Cuda { code: 201 }` if no context is current.
+    pub fn current() -> Result<Self, FeroceError> {
+        let mut ctx: CUcontext = std::ptr::null_mut();
+        check_cuda(unsafe { cuCtxGetCurrent(&mut ctx) }, "cuCtxGetCurrent")?;
+        if ctx.is_null() {
+            return Err(FeroceError::Cuda {
+                call: "cuCtxGetCurrent",
+                code: 201, // CUDA_ERROR_INVALID_CONTEXT
+            });
+        }
+        Ok(Self { ctx })
+    }
+
+    /// Make this context current on the calling thread.
+    pub fn set_current(&self) -> Result<(), FeroceError> {
+        check_cuda(unsafe { cuCtxSetCurrent(self.ctx) }, "cuCtxSetCurrent")
     }
 }
 
