@@ -204,11 +204,13 @@ fn parse_hex_u32(s: &str) -> Result<u32, String> {
 fn init_logging(tui: bool) -> Result<LogBuffer, Box<dyn std::error::Error>> {
     #[cfg(feature = "tui")]
     if tui {
-        let buff = tui_logger::init(
-            std::path::Path::new("/tmp/feroce.log"),
-            log::LevelFilter::Info,
-            100,
-        )?;
+        use std::env;
+
+        let home = env::var("HOME").expect("Could not find HOME directory");
+        let mut log_path = PathBuf::from(home);
+        log_path.push("feroce.log");
+
+        let buff = tui_logger::init(std::path::Path::new(&log_path), log::LevelFilter::Info, 100)?;
         return Ok(Some(buff));
     }
 

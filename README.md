@@ -73,7 +73,7 @@ Build with the `tui` feature and pass `--tui` to the `recv` or `send` subcommand
 ./target/release/feroce-cli recv --tui ...
 ```
 
-Press `Ctrl+C` to quit. When `--tui` is enabled, logs are written by default to `/tmp/feroce.log`.
+Press `Ctrl+C` to quit. When `--tui` is enabled, logs are written by default to `$HOME/feroce.log`.
 
 ![](imgs/tui_example.png)
 
