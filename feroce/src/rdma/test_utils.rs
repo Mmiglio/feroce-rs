@@ -10,8 +10,7 @@ use super::device::*;
 pub struct LoopbackEndpoint {
     pub qp: QueuePair,
     pub channel: Arc<CompletionChannel>,
-    pub mr: MemoryRegion,
-    pub buf: Vec<u8>,
+    pub mr: MemoryRegion<Vec<u8>>,
 }
 
 pub struct LoopbackPair {
@@ -22,8 +21,7 @@ pub struct LoopbackPair {
 struct PreparedLoopback {
     qp: PreparedQueuePair,
     channel: Arc<CompletionChannel>,
-    mr: MemoryRegion,
-    buf: Vec<u8>,
+    mr: MemoryRegion<Vec<u8>>,
 }
 
 fn build_endpoint(
@@ -45,10 +43,10 @@ fn build_endpoint(
             .create_cq_with_channel(16, &channel)
             .unwrap_or_else(|e| panic!("cq_{}: {}", label, e)),
     );
-    let mut buf = vec![0u8; buf_size];
+    let buf = vec![0u8; buf_size];
     let mr = MemoryRegion::register(
         &pd,
-        &mut buf,
+        buf,
         ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
     )
@@ -60,12 +58,7 @@ fn build_endpoint(
         .build()
         .unwrap_or_else(|e| panic!("qp_{}: {}", label, e));
 
-    PreparedLoopback {
-        qp,
-        channel,
-        mr,
-        buf,
-    }
+    PreparedLoopback { qp, channel, mr }
 }
 
 pub fn create_loopback_qp(device: &Arc<Device>, link: LocalLink, buf_size: usize) -> LoopbackPair {
@@ -106,13 +99,11 @@ pub fn create_loopback_qp(device: &Arc<Device>, link: LocalLink, buf_size: usize
             qp: recv_qp,
             channel: recv_p.channel,
             mr: recv_p.mr,
-            buf: recv_p.buf,
         },
         send: LoopbackEndpoint {
             qp: send_qp,
             channel: send_p.channel,
             mr: send_p.mr,
-            buf: send_p.buf,
         },
     }
 }

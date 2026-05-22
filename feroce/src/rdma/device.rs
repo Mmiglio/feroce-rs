@@ -968,22 +968,27 @@ impl PreparedQueuePair {
     }
 }
 
-pub struct MemoryRegion {
+// NIC-registered memory region that owns the buffer it registered.
+// S is the backing storage (`Vec<u8>` for the CPU, a GPU buffer for the dmabuf)
+pub struct MemoryRegion<S> {
     mr: *mut ffi::ibv_mr,
     _pd: Arc<ProtectionDomain>,
+    storage: S,
 }
 
-impl MemoryRegion {
+unsafe impl<S: Send> Send for MemoryRegion<S> {}
+
+impl MemoryRegion<Vec<u8>> {
     pub fn register(
         pd: &Arc<ProtectionDomain>,
-        buffer: &mut [u8],
+        mut storage: Vec<u8>,
         access: ffi::ibv_access_flags,
     ) -> Result<Self, FeroceError> {
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 pd.raw(),
-                buffer.as_mut_ptr() as *mut std::ffi::c_void,
-                buffer.len(),
+                storage.as_mut_ptr() as *mut std::ffi::c_void,
+                storage.len(),
                 access.0 as i32,
             )
         };
@@ -999,10 +1004,13 @@ impl MemoryRegion {
             Ok(MemoryRegion {
                 mr,
                 _pd: Arc::clone(pd),
+                storage,
             })
         }
     }
+}
 
+impl<S> MemoryRegion<S> {
     #[cfg(feature = "gpu")]
     pub fn register_dmabuf(
         pd: &Arc<ProtectionDomain>,
@@ -1011,6 +1019,7 @@ impl MemoryRegion {
         iova: u64,
         dmabuf_fd: i32,
         access: ffi::ibv_access_flags,
+        storage: S,
     ) -> Result<Self, FeroceError> {
         let mr = unsafe {
             ffi::ibv_reg_dmabuf_mr(pd.raw(), offset, length, iova, dmabuf_fd, access.0 as i32)
@@ -1027,6 +1036,7 @@ impl MemoryRegion {
             Ok(MemoryRegion {
                 mr,
                 _pd: Arc::clone(pd),
+                storage,
             })
         }
     }
@@ -1046,10 +1056,22 @@ impl MemoryRegion {
     pub fn rkey(&self) -> u32 {
         unsafe { (*self.mr).rkey }
     }
+
+    // Shared access to the owned backing storage.
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    // Mutable access to the owned backing storage.
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.storage
+    }
 }
 
-impl Drop for MemoryRegion {
+impl<S> Drop for MemoryRegion<S> {
     fn drop(&mut self) {
+        // the NIC registration is always destroyed before
+        // storage frees the underlying memory.
         let ret = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if ret != 0 {
             error!("ibv_dereg_mr failed: errno={}", ret);
@@ -1057,9 +1079,9 @@ impl Drop for MemoryRegion {
     }
 }
 
-/// Discover the first active RoCEv2 device on the host. Returns the device
-/// name, an [`Arc<Device>`], and the validated [`LocalLink`] (port + GID +
-/// active MTU).
+// Discover the first active RoCEv2 device on the host. Returns the device
+// name, an Arc<Device>, and the validated LocalLink (port + GID +
+// active MTU).
 pub fn find_roce_device() -> Option<(String, Arc<Device>, LocalLink)> {
     let devices = DeviceList::new().ok()?;
     for i in 0..devices.len() {
@@ -1183,11 +1205,11 @@ mod test {
 
         let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
 
-        let mut buf = vec![0u8; 128];
+        let buf = vec![0u8; 128];
 
         let mr = MemoryRegion::register(
             &pd,
-            &mut buf,
+            buf,
             ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
                 | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
         )
@@ -1208,7 +1230,8 @@ mod test {
         let mut pair = create_loopback_qp(&device, link, buf_size);
 
         // post reveice wr
-        let mut recv_sg_list = make_sge_list(1, &mut pair.recv.buf, pair.recv.mr.lkey());
+        let recv_lkey = pair.recv.mr.lkey();
+        let mut recv_sg_list = make_sge_list(1, pair.recv.mr.storage_mut(), recv_lkey);
 
         let mut recv_wr = QueuePair::build_recv_wr(2, &mut recv_sg_list);
         pair.recv
@@ -1217,11 +1240,13 @@ mod test {
             .expect("failed to post recv wr");
 
         // post send wr
-        pair.send.buf[0] = 0xff;
-        pair.send.buf[1] = 0xde;
-        pair.send.buf[2] = 0xad;
+        let send_buf = pair.send.mr.storage_mut();
+        send_buf[0] = 0xff;
+        send_buf[1] = 0xde;
+        send_buf[2] = 0xad;
 
-        let mut send_sg_list = make_sge_list(1, &mut pair.send.buf, pair.send.mr.lkey());
+        let send_lkey = pair.send.mr.lkey();
+        let mut send_sg_list = make_sge_list(1, pair.send.mr.storage_mut(), send_lkey);
 
         let mut send_wr = QueuePair::build_send_wr(2, &mut send_sg_list, SendOp::Send, true);
         pair.send
@@ -1258,7 +1283,7 @@ mod test {
             ffi::ibv_wc_status::IBV_WC_SUCCESS
         ));
         assert_eq!(n_wce_send, 1);
-        assert_eq!(pair.recv.buf, pair.send.buf);
+        assert_eq!(pair.recv.mr.storage(), pair.send.mr.storage());
         assert_eq!(recv_wc[0].byte_len, buf_size as u32);
     }
 
@@ -1306,9 +1331,10 @@ mod test {
             .expect("failed to post recv wr");
 
         // post send wr
-        pair.send.buf[0] = 0xff;
-        pair.send.buf[1] = 0xde;
-        pair.send.buf[2] = 0xad;
+        let send_buf = pair.send.mr.storage_mut();
+        send_buf[0] = 0xff;
+        send_buf[1] = 0xde;
+        send_buf[2] = 0xad;
 
         let mut send_wr_list = Vec::<rdma::ibv_send_wr>::new();
         let mut send_sg_list = Vec::<Vec<rdma::ibv_sge>>::new();
@@ -1387,7 +1413,7 @@ mod test {
         ));
         assert_eq!(n_wce_send, 1);
         assert_eq!(send_wc[0].wr_id, 1);
-        assert_eq!(pair.recv.buf, pair.send.buf);
+        assert_eq!(pair.recv.mr.storage(), pair.send.mr.storage());
         assert_eq!(recv_wc[0].byte_len, half_buf_size as u32);
     }
 
@@ -1401,7 +1427,8 @@ mod test {
         let mut pair = create_loopback_qp(&device, link, buf_size);
 
         // post reveice wr before transitioning to error
-        let mut recv_sg_list = make_sge_list(1, &mut pair.recv.buf, pair.recv.mr.lkey());
+        let recv_lkey = pair.recv.mr.lkey();
+        let mut recv_sg_list = make_sge_list(1, pair.recv.mr.storage_mut(), recv_lkey);
 
         let mut recv_wr = QueuePair::build_recv_wr(1, &mut recv_sg_list);
         pair.recv
@@ -1472,7 +1499,8 @@ mod test {
             .expect("failed to request notification to cq");
 
         // post reveice wr
-        let mut recv_sg_list = make_sge_list(1, &mut pair.recv.buf, pair.recv.mr.lkey());
+        let recv_lkey = pair.recv.mr.lkey();
+        let mut recv_sg_list = make_sge_list(1, pair.recv.mr.storage_mut(), recv_lkey);
         let mut recv_wr = QueuePair::build_recv_wr(1, &mut recv_sg_list);
         pair.recv
             .qp
@@ -1480,11 +1508,13 @@ mod test {
             .expect("failed to post recv wr");
 
         // post send wr
-        pair.send.buf[0] = 0xff;
-        pair.send.buf[1] = 0xde;
-        pair.send.buf[2] = 0xad;
+        let send_buf = pair.send.mr.storage_mut();
+        send_buf[0] = 0xff;
+        send_buf[1] = 0xde;
+        send_buf[2] = 0xad;
 
-        let mut send_sg_list = make_sge_list(1, &mut pair.send.buf, pair.send.mr.lkey());
+        let send_lkey = pair.send.mr.lkey();
+        let mut send_sg_list = make_sge_list(1, pair.send.mr.storage_mut(), send_lkey);
 
         let mut send_wr = QueuePair::build_send_wr(2, &mut send_sg_list, SendOp::Send, true);
         pair.send

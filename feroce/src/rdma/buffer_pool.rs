@@ -15,7 +15,7 @@ pub trait BufferAllocator: Send + 'static {
         &self,
         pd: &Arc<ProtectionDomain>,
         size: usize,
-    ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError>;
+    ) -> Result<(MemoryRegion<Self::Storage>, u64), FeroceError>;
 }
 
 pub struct CpuAllocator;
@@ -26,15 +26,15 @@ impl BufferAllocator for CpuAllocator {
         &self,
         pd: &Arc<ProtectionDomain>,
         size: usize,
-    ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError> {
-        let mut data = vec![0u8; size];
+    ) -> Result<(MemoryRegion<Self::Storage>, u64), FeroceError> {
+        let data = vec![0u8; size];
         let base_addr = data.as_ptr() as u64;
         let access_flags = rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | rdma::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING;
-        let mr = MemoryRegion::register(pd, &mut data, access_flags)?;
+        let mr = MemoryRegion::register(pd, data, access_flags)?;
 
-        Ok((data, mr, base_addr))
+        Ok((mr, base_addr))
     }
 }
 
@@ -56,12 +56,10 @@ pub struct BufferPool<A: BufferAllocator> {
     buf_size: usize,
 
     base_addr: u64,
-    mr: MemoryRegion,
-    _storage: A::Storage,
+    // owns the registered memory; the pool hands out raw pointers into it
+    mr: MemoryRegion<A::Storage>,
     free_bufs: VecDeque<usize>,
 }
-
-unsafe impl<A: BufferAllocator> Send for BufferPool<A> {}
 
 impl<A: BufferAllocator> BufferPool<A> {
     pub fn new(
@@ -70,7 +68,7 @@ impl<A: BufferAllocator> BufferPool<A> {
         pd: &Arc<ProtectionDomain>,
         allocator: &A,
     ) -> Result<Self, FeroceError> {
-        let (storage, mr, base_addr) = allocator.alloc_and_register(pd, num_buf * buf_size)?;
+        let (mr, base_addr) = allocator.alloc_and_register(pd, num_buf * buf_size)?;
 
         let free_bufs = VecDeque::from_iter(0..num_buf);
 
@@ -87,7 +85,6 @@ impl<A: BufferAllocator> BufferPool<A> {
             buf_size,
             base_addr,
             mr,
-            _storage: storage,
             free_bufs,
         })
     }

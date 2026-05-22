@@ -222,9 +222,11 @@ impl BufferAllocator for GpuAllocator {
         &self,
         pd: &Arc<ProtectionDomain>,
         size: usize,
-    ) -> Result<(Self::Storage, MemoryRegion, u64), FeroceError> {
+    ) -> Result<(MemoryRegion<Self::Storage>, u64), FeroceError> {
         let buff = GpuBuffer::alloc(size)?;
         let base_addr = buff.dptr;
+        let dmabuf_size = buff.size;
+        let dmabuf_fd = buff.dmabuf_fd;
 
         let access_flags = rdma::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
@@ -232,13 +234,14 @@ impl BufferAllocator for GpuAllocator {
         let mr = MemoryRegion::register_dmabuf(
             pd,
             0,
-            buff.size,
-            buff.dptr,
-            buff.dmabuf_fd,
+            dmabuf_size,
+            base_addr,
+            dmabuf_fd,
             access_flags,
+            buff,
         )?;
 
-        Ok((buff, mr, base_addr))
+        Ok((mr, base_addr))
     }
 }
 
@@ -272,15 +275,14 @@ mod test {
         let device = Arc::new(rdma::device::Device::open(name).expect("failed to open"));
         let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
 
-        let (buffer, mr, _base_addr) = allocator.alloc_and_register(&pd, 4096).unwrap();
+        let (mr, base_addr) = allocator.alloc_and_register(&pd, 4096).unwrap();
         assert!(mr.lkey() != 0);
         println!(
             "dptr: {:#x}, mr.addr: {:#x}, mr.lkey: {}",
-            buffer.dptr,
+            base_addr,
             mr.addr(),
             mr.lkey()
         );
-        drop(buffer);
     }
 
     #[test]
@@ -295,10 +297,10 @@ mod test {
                 .create_cq_with_channel(16, &channel_send)
                 .expect("cq_send"),
         );
-        let mut buf_send = vec![0xABu8; 4096];
+        let buf_send = vec![0xABu8; 4096];
         let mr_send = MemoryRegion::register(
             &pd_send,
-            &mut buf_send,
+            buf_send,
             rdma::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE,
         )
         .expect("mr_send");
@@ -317,7 +319,7 @@ mod test {
                 .create_cq_with_channel(16, &channel_recv)
                 .expect("cq_recv"),
         );
-        let (gpu_buf, mr_recv, base_addr) = allocator
+        let (mr_recv, base_addr) = allocator
             .alloc_and_register(&pd_recv, 4096)
             .expect("gpu alloc");
         let qp_recv_prep = pd_recv
@@ -369,7 +371,7 @@ mod test {
         // Post send from CPU buffer
         let mut sge_send = vec![
             ffi::ibv_sge {
-                addr: buf_send.as_ptr() as u64,
+                addr: mr_send.addr(),
                 length: 4096,
                 lkey: mr_send.lkey(),
             };
@@ -394,7 +396,7 @@ mod test {
 
         // Copy data back to host
         let mut result = vec![0u8; 4096];
-        copy_device_to_host(&mut result, gpu_buf.dptr).expect("DtoH copy");
+        copy_device_to_host(&mut result, base_addr).expect("DtoH copy");
         assert_eq!(result, vec![0xABu8; 4096], "GPU buffer content mismatch");
     }
 }
