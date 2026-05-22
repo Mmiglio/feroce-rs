@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use crate::stats::StreamStats;
+use crate::stats::StreamSample;
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     log_buffer: Arc<Mutex<VecDeque<String>>>,
@@ -47,14 +47,10 @@ impl Tui {
         })
     }
 
-    pub fn draw(
-        &mut self,
-        stats: &[Arc<StreamStats>],
-        elapsed: Duration,
-    ) -> Result<bool, Box<dyn Error>> {
+    pub fn draw(&mut self, samples: &[StreamSample]) -> Result<bool, Box<dyn Error>> {
         let logs = self.log_buffer.lock().unwrap();
         self.terminal
-            .draw(|frame| Tui::draw_frame(frame, stats, &logs, elapsed))?;
+            .draw(|frame| Tui::draw_frame(frame, samples, &logs))?;
         drop(logs);
 
         // check for Ctrl+C or 'q' keypress
@@ -72,12 +68,7 @@ impl Tui {
         Ok(false)
     }
 
-    fn draw_frame(
-        frame: &mut Frame,
-        stats: &[Arc<StreamStats>],
-        logs: &VecDeque<String>,
-        elapsed: Duration,
-    ) {
+    fn draw_frame(frame: &mut Frame, samples: &[StreamSample], logs: &VecDeque<String>) {
         let [top, bottom] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(frame.area());
@@ -102,21 +93,20 @@ impl Tui {
         let mut total_msg_rate = 0.0;
         let mut total_gbps = 0.0;
 
-        let mut rows: Vec<Row> = Vec::with_capacity(stats.len());
-        for s in stats {
-            let (msgs, bytes, msg_rate, gbps) = s.interval_metrics(elapsed);
-            total_msgs += msgs;
-            total_bytes += bytes;
-            total_msg_rate += msg_rate;
-            total_gbps += gbps;
+        let mut rows: Vec<Row> = Vec::with_capacity(samples.len());
+        for s in samples {
+            total_msgs += s.messages;
+            total_bytes += s.bytes;
+            total_msg_rate += s.msg_rate;
+            total_gbps += s.gbps;
             rows.push(Row::new([
-                Cell::from(s.id.to_string()),
+                Cell::from(s.stream_id.to_string()),
                 Cell::from(s.qpn.to_string()),
                 Cell::from(s.remote_qpn.to_string()),
-                Cell::from(msgs.to_string()),
-                Cell::from(Tui::format_bytes(bytes)),
-                Cell::from(format!("{:.1}", msg_rate)),
-                Cell::from(format!("{:.2}", gbps)),
+                Cell::from(s.messages.to_string()),
+                Cell::from(Tui::format_bytes(s.bytes)),
+                Cell::from(format!("{:.1}", s.msg_rate)),
+                Cell::from(format!("{:.2}", s.gbps)),
             ]));
         }
 
