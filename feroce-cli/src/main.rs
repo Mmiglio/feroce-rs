@@ -77,6 +77,9 @@ struct SenderOpts {
     /// Enable TUI dashboard (requires building with --features tui)
     #[arg(long)]
     tui: bool,
+    /// Write per-tick, per-stream throughput rows to <PATH> as CSV.
+    #[arg(long, value_name = "PATH")]
+    stats_out: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -91,6 +94,9 @@ struct ReceiverOpts {
     /// stream writes to <stem>.NNN.<ext>
     #[arg(long, value_name = "PATH")]
     dump_file: Option<PathBuf>,
+    /// Write per-tick, per-stream throughput rows to <PATH> as CSV.
+    #[arg(long, value_name = "PATH")]
+    stats_out: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -251,6 +257,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            let stats_out = receiver_opts.stats_out.as_deref();
+
             // pick the selected allocator
             if receiver_opts.gpu {
                 #[cfg(feature = "gpu")]
@@ -260,14 +268,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let allocator = GpuAllocator::new(0)?;
                     match receiver_opts.dump_file {
-                        None => {
-                            recv::run(&cm_opts, &rdma_opts, allocator, NoDumpFactory, log_buffer)?
-                        }
+                        None => recv::run(
+                            &cm_opts,
+                            &rdma_opts,
+                            allocator,
+                            NoDumpFactory,
+                            stats_out,
+                            log_buffer,
+                        )?,
                         Some(path) => recv::run(
                             &cm_opts,
                             &rdma_opts,
                             allocator,
                             GpuDumpFactory::new(path, rdma_opts.buf_size)?,
+                            stats_out,
                             log_buffer,
                         )?,
                     }
@@ -284,6 +298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &rdma_opts,
                         CpuAllocator,
                         NoDumpFactory,
+                        stats_out,
                         log_buffer,
                     )?,
                     Some(path) => recv::run(
@@ -291,6 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &rdma_opts,
                         CpuAllocator,
                         CpuDumpFactory::new(path),
+                        stats_out,
                         log_buffer,
                     )?,
                 }
@@ -303,7 +319,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sender_opts,
         } => {
             let log_buffer = init_logging(sender_opts.tui)?;
-            send::run(&cm_opts, &rdma_opts, &sender_opts, log_buffer)?;
+            send::run(
+                &cm_opts,
+                &rdma_opts,
+                &sender_opts,
+                sender_opts.stats_out.as_deref(),
+                log_buffer,
+            )?;
             Ok(())
         }
         Commands::Ctrl { ctrl_opts, command } => {

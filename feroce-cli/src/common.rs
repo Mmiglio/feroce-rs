@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    io,
     net::SocketAddr,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,7 +18,15 @@ use feroce::{
 };
 use log::{error, info, warn};
 
-use crate::{CmOpts, RdmaOpts, stats::StreamStats};
+#[cfg(feature = "tui")]
+use std::sync::Mutex;
+
+#[cfg(feature = "tui")]
+use crate::tui::Tui;
+use crate::{
+    CmOpts, RdmaOpts,
+    stats::{StatsCsvWriter, StreamStats},
+};
 
 impl From<&RdmaOpts> for RdmaConfig {
     fn from(opts: &RdmaOpts) -> Self {
@@ -36,6 +46,38 @@ struct QpContext {
 // Callback invoked from the event loop once per monitoring tick.
 // Returning `true` asks the event loop to shut down (e.g. pressed 'q' or ctrl+c).
 pub type Monitor = Box<dyn FnMut(&[Arc<StreamStats>], Duration) -> bool>;
+
+// Build the monitor closure: sample each stream once per tick
+// then send the snapshots out to CSV, TUI, and/or stdout.
+pub fn make_monitor(
+    stats_out: Option<&Path>,
+    #[cfg(feature = "tui")] tui_handle: Option<Arc<Mutex<Tui>>>,
+) -> io::Result<Monitor> {
+    let mut csv_writer = match stats_out {
+        Some(path) => Some(StatsCsvWriter::create(path)?),
+        None => None,
+    };
+
+    Ok(Box::new(move |stats, elapsed| {
+        let samples: Vec<_> = stats.iter().map(|s| s.sample(elapsed)).collect();
+
+        if let Some(csv) = csv_writer.as_mut()
+            && let Err(e) = csv.write_tick(&samples, elapsed)
+        {
+            warn!("--stats-out write failed: {e}");
+        }
+
+        #[cfg(feature = "tui")]
+        if let Some(ref tui) = tui_handle {
+            return tui.lock().unwrap().draw(&samples).unwrap_or(false);
+        }
+
+        for s in &samples {
+            s.print();
+        }
+        false
+    }))
+}
 
 pub struct SessionRunner<F, A, M>
 where

@@ -3,8 +3,8 @@ use feroce::rdma::buffer_pool::BufferAllocator;
 use feroce::{BufferPool, CompletionChannel, ConnectedRdmaEndpoint, QueuePair};
 use log::{debug, error};
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
 
 use crate::dump::{DumpSink, DumpSinkFactory};
@@ -12,7 +12,7 @@ use crate::dump::{DumpSink, DumpSinkFactory};
 use crate::tui;
 use crate::{
     CmOpts, RdmaOpts,
-    common::{Monitor, SessionRunner},
+    common::{SessionRunner, make_monitor},
     stats::StreamStats,
 };
 
@@ -21,6 +21,7 @@ pub fn run<A, S>(
     rdma_opts: &RdmaOpts,
     allocator: A,
     dump_factory: S,
+    stats_out: Option<&Path>,
     #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_buffer: Option<
         Arc<Mutex<VecDeque<String>>>,
     >,
@@ -69,35 +70,11 @@ where
         None
     };
 
-    // monitoring closure
-    let monitor: Monitor = {
+    let monitor = make_monitor(
+        stats_out,
         #[cfg(feature = "tui")]
-        if let Some(ref tui) = tui_handle {
-            let tui_clone = Arc::clone(tui);
-            Box::new(move |stats: &[Arc<StreamStats>], elapsed: Duration| {
-                tui_clone
-                    .lock()
-                    .unwrap()
-                    .draw(stats, elapsed)
-                    .unwrap_or(false)
-            })
-        } else {
-            Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
-                for s in stats {
-                    s.print_interval_metrics(elapsed);
-                }
-                false
-            })
-        }
-
-        #[cfg(not(feature = "tui"))]
-        Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
-            for s in stats {
-                s.print_interval_metrics(elapsed);
-            }
-            false
-        })
-    };
+        tui_handle.clone(),
+    )?;
 
     let mut runner = SessionRunner::new(cm_opts, rdma_opts, allocator, spawn_poller, monitor)?;
 
@@ -190,7 +167,7 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
             total_bytes += wce.byte_len as u64;
             total_msgs += 1;
 
-            // optional payload dump (no-op when DumpSink is NoDump; monomorphized away)
+            // optional payload dump (no-op when DumpSink is NoDump)
             let buf_handle = buffer_pool.get_handle(wce.wr_id as usize);
             dump.record(buf_handle.addr, wce.byte_len as usize)?;
 

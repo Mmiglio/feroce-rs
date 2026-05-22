@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use log::{debug, error};
 use crate::tui;
 use crate::{
     CmOpts, RdmaOpts, SenderOpts,
-    common::{Monitor, SessionRunner},
+    common::{SessionRunner, make_monitor},
     stats::StreamStats,
 };
 
@@ -21,6 +22,7 @@ pub fn run(
     cm_opts: &CmOpts,
     rdma_opts: &RdmaOpts,
     send_opts: &SenderOpts,
+    stats_out: Option<&Path>,
     #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_buffer: Option<
         Arc<Mutex<VecDeque<String>>>,
     >,
@@ -62,35 +64,11 @@ pub fn run(
         None
     };
 
-    // monitoring closure
-    let monitor: Monitor = {
+    let monitor = make_monitor(
+        stats_out,
         #[cfg(feature = "tui")]
-        if let Some(ref tui) = tui_handle {
-            let tui_clone = Arc::clone(tui);
-            Box::new(move |stats: &[Arc<StreamStats>], elapsed: Duration| {
-                tui_clone
-                    .lock()
-                    .unwrap()
-                    .draw(stats, elapsed)
-                    .unwrap_or(false)
-            })
-        } else {
-            Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
-                for s in stats {
-                    s.print_interval_metrics(elapsed);
-                }
-                false
-            })
-        }
-
-        #[cfg(not(feature = "tui"))]
-        Box::new(|stats: &[Arc<StreamStats>], elapsed: Duration| {
-            for s in stats {
-                s.print_interval_metrics(elapsed);
-            }
-            false
-        })
-    };
+        tui_handle.clone(),
+    )?;
 
     let mut runner = SessionRunner::new(cm_opts, rdma_opts, CpuAllocator, spawn_poller, monitor)?;
 
