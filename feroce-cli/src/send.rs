@@ -153,20 +153,16 @@ fn poller_thread<A: BufferAllocator>(
 
     let mut poller_done = false;
     while !poller_done {
-        // wait for completion event, blocking with timout of 10 ms
-        let got_event = channel.try_get_cq_event(10)?;
+        // wait for completion event, blocking with timeout of 10 ms
+        let cq_event = channel.try_get_cq_event(10)?;
 
         // rearm the notification
-        if got_event {
+        if cq_event.is_some() {
             qp.send_cq().req_notify_cq(false)?;
         }
 
         // poll the CQ (we do it regardless the presence of an event, to avoid race conditions)
         let num_wce = qp.send_cq().poll(&mut wc_list)?;
-
-        if got_event {
-            qp.send_cq().ack_cq_events(1);
-        }
 
         // process work completion, if any
         total_bytes = 0;

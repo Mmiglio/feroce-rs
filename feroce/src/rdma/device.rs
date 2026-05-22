@@ -279,7 +279,9 @@ impl CompletionChannel {
         }
     }
 
-    pub fn get_cq_event(&self) -> Result<(), FeroceError> {
+    // Block until a completion event is available on the channel.
+    // Returns a CqEvent guard, dropping it acks the event
+    pub fn get_cq_event(&self) -> Result<CqEvent, FeroceError> {
         let mut cq: *mut ffi::ibv_cq = std::ptr::null_mut();
         let mut cq_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
 
@@ -288,15 +290,14 @@ impl CompletionChannel {
         if ret != 0 {
             Err(rdma_err_code("ibv_get_cq_event", ret))
         } else {
-            Ok(())
+            Ok(CqEvent { cq })
         }
     }
 
-    // Wrapper around ibv_get_cq_event() with a timeout.
-    // Checks if data is available on comp channel fd using poll().
-    // If a valid event is available in the fd we can call get_cq_event
-    // and get the event, which we know that it won't be blocking.
-    pub fn try_get_cq_event(&self, timeout_ms: i32) -> Result<bool, FeroceError> {
+    // Wrapper around get_cq_event() with a timeout.
+    // Checks if data is available on the comp channel fd using poll(),
+    // then calls get_cq_event(), which is therefore non-blocking.
+    pub fn try_get_cq_event(&self, timeout_ms: i32) -> Result<Option<CqEvent>, FeroceError> {
         let fd = unsafe { (*self.channel).fd };
 
         // we want to monitor only the comp channel fd
@@ -313,18 +314,27 @@ impl CompletionChannel {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     // interrupted by a signal
-                    return Ok(false);
+                    return Ok(None);
                 }
                 return Err(rdma_err("poll"));
             }
-            0 => return Ok(false), // timeout
-            _ => {}                // proceed, data are available
+            0 => return Ok(None), // timeout
+            _ => {}               // proceed, data are available
         }
 
-        // now get_cq_event won't block since poll flaged that there are data
-        self.get_cq_event()?;
+        // now get_cq_event won't block since poll flagged that there are data
+        Ok(Some(self.get_cq_event()?))
+    }
+}
 
-        Ok(true)
+// consumed completion-channel event that acks itself when dropped
+pub struct CqEvent {
+    cq: *mut ffi::ibv_cq,
+}
+
+impl Drop for CqEvent {
+    fn drop(&mut self) {
+        unsafe { ffi::ibv_ack_cq_events(self.cq, 1) };
     }
 }
 
@@ -414,12 +424,6 @@ impl CompletionQueue {
         } else {
             Ok(())
         }
-    }
-    pub fn ack_cq_events(&self, nevents: u32) {
-        // this actually doesn't return any value
-        unsafe {
-            ffi::ibv_ack_cq_events(self.cq, nevents);
-        };
     }
 }
 
@@ -1500,7 +1504,9 @@ mod test {
 
         // wait for event in send channel
         // this should be blocking with a timeout...
-        pair.send
+        // the returned guard acks the event when it drops at end of scope
+        let _cq_event = pair
+            .send
             .channel
             .get_cq_event()
             .expect("failed to get completion event!");
@@ -1524,7 +1530,6 @@ mod test {
             ffi::ibv_wc_status::IBV_WC_SUCCESS
         ));
 
-        // ack the event
-        pair.send.qp.send_cq().ack_cq_events(1);
+        // _cq_event acks the event here as it drops at end of scope
     }
 }
