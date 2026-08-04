@@ -1,31 +1,21 @@
-use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
-use std::{net::SocketAddr, sync::Arc};
 
 use feroce::rdma;
 use feroce::rdma::buffer_pool::{BufferAllocator, CpuAllocator};
 use feroce::{BufferHandle, BufferPool, CompletionChannel, ConnectedRdmaEndpoint, QueuePair};
 use log::{debug, error};
 
-#[cfg(feature = "tui")]
-use crate::tui;
-use crate::{
-    CmOpts, RdmaOpts, SenderOpts,
-    common::{SessionRunner, make_monitor},
-    stats::StreamStats,
-};
+use crate::{CmOpts, LogBuffer, RdmaOpts, SenderOpts, common::run_session, stats::StreamStats};
 
 pub fn run(
     cm_opts: &CmOpts,
     rdma_opts: &RdmaOpts,
     send_opts: &SenderOpts,
     stats_out: Option<&Path>,
-    #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_buffer: Option<
-        Arc<Mutex<VecDeque<String>>>,
-    >,
+    log_buffer: LogBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
     let spawn_poller =
@@ -56,33 +46,14 @@ pub fn run(
             (handle, stats)
         };
 
-    // TUI handle kept alive to call restore() after the test is done
-    #[cfg(feature = "tui")]
-    let tui_handle = if let Some(ref buffer) = log_buffer {
-        Some(Arc::new(Mutex::new(tui::Tui::new(Arc::clone(buffer))?)))
-    } else {
-        None
-    };
-
-    let monitor = make_monitor(
+    run_session(
+        cm_opts,
+        rdma_opts,
+        CpuAllocator,
+        spawn_poller,
         stats_out,
-        #[cfg(feature = "tui")]
-        tui_handle.clone(),
-    )?;
-
-    let mut runner = SessionRunner::new(cm_opts, rdma_opts, CpuAllocator, spawn_poller, monitor)?;
-
-    if cm_opts.active {
-        let remote_addr = SocketAddr::new(
-            cm_opts.remote_addr.ok_or("--remote-addr required")?,
-            cm_opts.remote_port.ok_or("--remote-port required")?,
-        );
-        runner.connect_and_run(remote_addr, cm_opts.num_streams)?;
-    } else {
-        runner.listen_and_run()?;
-    }
-
-    Ok(())
+        log_buffer,
+    )
 }
 
 fn poller_thread<A: BufferAllocator>(

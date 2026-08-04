@@ -192,11 +192,7 @@ enum Commands {
 }
 
 fn parse_hex(s: &str) -> Result<u16, String> {
-    if let Some(hex) = s.strip_prefix("0x") {
-        u16::from_str_radix(hex, 16).map_err(|e| e.to_string())
-    } else {
-        s.parse::<u16>().map_err(|e| e.to_string())
-    }
+    u16::try_from(parse_hex_u32(s)?).map_err(|e| e.to_string())
 }
 
 fn parse_hex_u32(s: &str) -> Result<u32, String> {
@@ -263,53 +259,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if receiver_opts.gpu {
                 #[cfg(feature = "gpu")]
                 {
-                    use crate::dump::{GpuDumpFactory, NoDumpFactory};
+                    use crate::dump::GpuDumpFactory;
                     use feroce::rdma::gpu::GpuAllocator;
 
                     let allocator = GpuAllocator::new(0)?;
-                    match receiver_opts.dump_file {
-                        None => recv::run(
-                            &cm_opts,
-                            &rdma_opts,
-                            allocator,
-                            NoDumpFactory,
-                            stats_out,
-                            log_buffer,
-                        )?,
-                        Some(path) => recv::run(
-                            &cm_opts,
-                            &rdma_opts,
-                            allocator,
-                            GpuDumpFactory::new(path, rdma_opts.buf_size)?,
-                            stats_out,
-                            log_buffer,
-                        )?,
-                    }
+                    let dump = receiver_opts
+                        .dump_file
+                        .map(|path| GpuDumpFactory::new(path, rdma_opts.buf_size))
+                        .transpose()?;
+                    recv::run(&cm_opts, &rdma_opts, allocator, dump, stats_out, log_buffer)?;
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
                     return Err("--gpu requires building with --features gpu".into());
                 }
             } else {
-                use crate::dump::{CpuDumpFactory, NoDumpFactory};
-                match receiver_opts.dump_file {
-                    None => recv::run(
-                        &cm_opts,
-                        &rdma_opts,
-                        CpuAllocator,
-                        NoDumpFactory,
-                        stats_out,
-                        log_buffer,
-                    )?,
-                    Some(path) => recv::run(
-                        &cm_opts,
-                        &rdma_opts,
-                        CpuAllocator,
-                        CpuDumpFactory::new(path),
-                        stats_out,
-                        log_buffer,
-                    )?,
-                }
+                use crate::dump::CpuDumpFactory;
+                let dump = receiver_opts.dump_file.map(CpuDumpFactory::new);
+                recv::run(
+                    &cm_opts,
+                    &rdma_opts,
+                    CpuAllocator,
+                    dump,
+                    stats_out,
+                    log_buffer,
+                )?;
             }
             Ok(())
         }

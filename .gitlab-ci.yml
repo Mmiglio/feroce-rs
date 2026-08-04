@@ -72,6 +72,7 @@ build:
   stage: build
   script:
     - cargo build
+    - cargo build --features tui
 
 test:
   stage: test
@@ -82,6 +83,7 @@ test-rdma:
   stage: test
   tags:
     - roce
+  # usefull for debugging when things go wrong
   before_script:
       - ibv_devinfo -v
       - rdma link show

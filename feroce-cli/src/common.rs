@@ -24,7 +24,7 @@ use std::sync::Mutex;
 #[cfg(feature = "tui")]
 use crate::tui::Tui;
 use crate::{
-    CmOpts, RdmaOpts,
+    CmOpts, LogBuffer, RdmaOpts,
     stats::{StatsCsvWriter, StreamStats},
 };
 
@@ -79,11 +79,52 @@ pub fn make_monitor(
     }))
 }
 
-pub struct SessionRunner<F, A, M>
+// Wire a poller to a CM session
+pub fn run_session<A, F>(
+    cm_opts: &CmOpts,
+    rdma_opts: &RdmaOpts,
+    allocator: A,
+    spawn_poller: F,
+    stats_out: Option<&Path>,
+    #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_buffer: LogBuffer,
+) -> Result<(), Box<dyn std::error::Error>>
 where
     A: BufferAllocator,
     F: FnMut(ConnectedRdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
-    M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
+{
+    // TUI handle kept alive to call restore() after the test is done
+    #[cfg(feature = "tui")]
+    let tui_handle = if let Some(ref buffer) = log_buffer {
+        Some(Arc::new(Mutex::new(Tui::new(Arc::clone(buffer))?)))
+    } else {
+        None
+    };
+
+    let monitor = make_monitor(
+        stats_out,
+        #[cfg(feature = "tui")]
+        tui_handle.clone(),
+    )?;
+
+    let mut runner = SessionRunner::new(cm_opts, rdma_opts, allocator, spawn_poller, monitor)?;
+
+    if cm_opts.active {
+        let remote_addr = SocketAddr::new(
+            cm_opts.remote_addr.ok_or("--remote-addr required")?,
+            cm_opts.remote_port.ok_or("--remote-port required")?,
+        );
+        runner.connect_and_run(remote_addr, cm_opts.num_streams)?;
+    } else {
+        runner.listen_and_run()?;
+    }
+
+    Ok(())
+}
+
+pub struct SessionRunner<F, A>
+where
+    A: BufferAllocator,
+    F: FnMut(ConnectedRdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
 {
     rdma_cfg: RdmaConfig,
     device: Arc<rdma::device::Device>,
@@ -99,21 +140,20 @@ where
     // temporary, ideally we should get it from somewhere else
     next_stream_id: u32,
 
-    monitor: M,
+    monitor: Monitor,
 }
 
-impl<F, A, M> SessionRunner<F, A, M>
+impl<F, A> SessionRunner<F, A>
 where
     A: BufferAllocator,
     F: FnMut(ConnectedRdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
-    M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     pub fn new(
         cm_opts: &CmOpts,
         rdma_opts: &RdmaOpts,
         allocator: A,
         spawn_poller: F,
-        monitor: M,
+        monitor: Monitor,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = Arc::new(Device::open(&rdma_opts.rdma_device)?);
         let link = device
@@ -240,20 +280,8 @@ where
         }
 
         // event loop has been interrupted, clean up remaining resources
-        // best-effort: a failing close_qp must not prevent the rest from being cleaned up
-        let qpns: Vec<u32> = self.qps.keys().copied().collect();
-        for qpn in qpns {
-            let qp_ctx = self.qps.remove(&qpn).unwrap();
-            if let Err(e) = qp_ctx.qp.modify_to_error() {
-                warn!("Failed to transition QP {qpn} to error: {e}");
-            }
-            let _ = qp_ctx.poller_handle.join();
-            println!("[Done] Summary:");
-            qp_ctx.stats.print_summary();
-
-            if let Err(e) = self.cm.close_qp(qpn, Duration::from_secs(2), 2) {
-                warn!("Failed to close QP {qpn}: {e}");
-            }
+        for (qpn, ctx) in std::mem::take(&mut self.qps) {
+            self.close_stream(qpn, ctx);
         }
 
         Ok(())
@@ -332,29 +360,32 @@ where
             .map(|(qpn, _)| *qpn)
             .collect();
 
-        // best-effort: a failing close on one stream must not abort the others
         for qpn in finished {
             let ctx = self.qps.remove(&qpn).unwrap();
-            if let Err(e) = ctx.qp.modify_to_error() {
-                warn!("Failed to transition QP {qpn} to error: {e}");
-            }
-            let _ = ctx.poller_handle.join();
-            println!("[Done] Summary:");
-            ctx.stats.print_summary();
-            if let Err(e) = self.cm.close_qp(qpn, Duration::from_secs(2), 2) {
-                warn!("Failed to close QP {qpn}: {e}");
-            }
+            self.close_stream(qpn, ctx);
         }
 
         Ok(())
     }
+
+    // best-effort: one failing stream must not stop the others being cleaned up
+    fn close_stream(&mut self, qpn: u32, ctx: QpContext) {
+        if let Err(e) = ctx.qp.modify_to_error() {
+            warn!("Failed to transition QP {qpn} to error: {e}");
+        }
+        let _ = ctx.poller_handle.join();
+        println!("[Done] Summary:");
+        ctx.stats.print_summary();
+        if let Err(e) = self.cm.close_qp(qpn, Duration::from_secs(2), 2) {
+            warn!("Failed to close QP {qpn}: {e}");
+        }
+    }
 }
 
-impl<F, A, M> Drop for SessionRunner<F, A, M>
+impl<F, A> Drop for SessionRunner<F, A>
 where
     A: BufferAllocator,
     F: FnMut(ConnectedRdmaEndpoint<A>, u32, u32) -> (JoinHandle<()>, Arc<StreamStats>),
-    M: FnMut(&[Arc<StreamStats>], Duration) -> bool,
 {
     fn drop(&mut self) {
         if self.qps.is_empty() {

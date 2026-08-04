@@ -16,15 +16,9 @@ use crate::FeroceError;
 const REACK_INTERVAL: Duration = Duration::from_millis(100);
 
 // Pending connection request, consumed when handshake finishes
-enum PendingQp {
-    Active {
-        _local_info: QpConnectionInfo,
-        _peer_addr: SocketAddr,
-    },
-    Passive {
-        remote_info: QpConnectionInfo,
-        reply_addr: SocketAddr,
-    },
+struct PendingQp {
+    remote_info: QpConnectionInfo,
+    reply_addr: SocketAddr,
 }
 
 // states of connected QP
@@ -254,7 +248,7 @@ impl ConnectionManager {
 
             Ok(None)
         } else {
-            let pending_qp = PendingQp::Passive {
+            let pending_qp = PendingQp {
                 remote_info,
                 reply_addr: SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
             };
@@ -294,14 +288,10 @@ impl ConnectionManager {
             ))
         })?;
 
-        // extract remote info from the pending passive QP
-        let PendingQp::Passive {
+        let PendingQp {
             remote_info,
             reply_addr,
-        } = pending
-        else {
-            return Err(FeroceError::Protocol("expected passive pending QP".into()));
-        };
+        } = pending;
 
         info!(
             "Completing connection handshake with {}. Remote QPN={}, local QPN={}",
@@ -426,21 +416,8 @@ impl ConnectionManager {
         qp_flags: QpFlags,
         dest: SocketAddr,
     ) -> Result<(), FeroceError> {
-        let reply_qp_msg = QpMessage {
-            flags: qp_flags,
-            loc_qpn: local_info.qp_num,
-            loc_psn: local_info.psn,
-            loc_rkey: local_info.rkey,
-            loc_base_addr: local_info.addr,
-            loc_ip: ipv4_from_gid(&local_info.gid),
-            rem_qpn: remote_info.qp_num,
-            rem_psn: remote_info.psn,
-            rem_rkey: remote_info.rkey,
-            rem_base_addr: remote_info.addr,
-            rem_ip: ipv4_from_gid(&remote_info.gid),
-            udp_port: socket.local_addr()?.port(),
-            ..Default::default()
-        };
+        let port = socket.local_addr()?.port();
+        let reply_qp_msg = build_qp_message(qp_flags, local_info, remote_info, port);
 
         socket.send_to(&reply_qp_msg.pack(), dest)?;
         Ok(())
@@ -543,22 +520,6 @@ impl ConnectionManager {
             ..Default::default()
         };
 
-        let pending_qp = PendingQp::Active {
-            _local_info: *local_info,
-            _peer_addr: remote_addr,
-        };
-        if self
-            .pending
-            .insert((remote_addr.ip(), local_info.qp_num), pending_qp)
-            .is_some()
-        {
-            warn!(
-                "Duplicated connection request: peer addr={}, local qpn={}",
-                remote_addr.ip(),
-                local_info.qp_num
-            );
-        }
-
         info!(
             "Sending OpenQP to {}, local QPN={}",
             remote_addr, local_info.qp_num
@@ -571,20 +532,14 @@ impl ConnectionManager {
                 && (reply.rem_qpn == local_info.qp_num)
                 && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
         };
-        let reply_qp_message = match Self::send_and_wait_for_ack(
+        let reply_qp_message = Self::send_and_wait_for_ack(
             &self.socket,
             &open_qp_message,
             remote_addr,
             validate_ack,
             request_timeout,
             max_retries,
-        ) {
-            Ok(reply) => reply,
-            Err(e) => {
-                self.pending.remove(&(remote_addr.ip(), local_info.qp_num));
-                return Err(e);
-            }
-        };
+        )?;
 
         let remote_info = QpConnectionInfo {
             qp_num: reply_qp_message.loc_qpn,
@@ -594,10 +549,7 @@ impl ConnectionManager {
             gid: gid_from_ipv4(reply_qp_message.loc_ip),
         };
 
-        // remove current qp from pending
-        self.pending.remove(&(remote_addr.ip(), local_info.qp_num));
-
-        // ... and create the new ActiveQP
+        // create the new ActiveQP
         self.qps.insert(
             local_info.qp_num,
             ActiveQp::new(
@@ -954,7 +906,7 @@ mod test {
     }
 
     #[test]
-    fn connect_timeout_clears_pending() {
+    fn connect_timeout_leaves_no_state() {
         let (sender_info, _) = make_test_infos();
 
         let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -968,9 +920,9 @@ mod test {
 
         assert!(res.is_err(), "expected connect to fail, got {:?}", res);
         assert!(
-            cm.pending.is_empty(),
-            "pending should be cleared after a failed connect, found {} entries",
-            cm.pending.len()
+            cm.qps.is_empty(),
+            "no QP should be registered after a failed connect, found {} entries",
+            cm.qps.len()
         );
     }
 

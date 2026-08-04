@@ -2,29 +2,19 @@ use feroce::rdma;
 use feroce::rdma::buffer_pool::BufferAllocator;
 use feroce::{BufferPool, CompletionChannel, ConnectedRdmaEndpoint, QueuePair};
 use log::{debug, error};
-use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Mutex;
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use crate::dump::{DumpSink, DumpSinkFactory};
-#[cfg(feature = "tui")]
-use crate::tui;
-use crate::{
-    CmOpts, RdmaOpts,
-    common::{SessionRunner, make_monitor},
-    stats::StreamStats,
-};
+use crate::{CmOpts, LogBuffer, RdmaOpts, common::run_session, stats::StreamStats};
 
 pub fn run<A, S>(
     cm_opts: &CmOpts,
     rdma_opts: &RdmaOpts,
     allocator: A,
-    dump_factory: S,
+    dump_factory: Option<S>,
     stats_out: Option<&Path>,
-    #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_buffer: Option<
-        Arc<Mutex<VecDeque<String>>>,
-    >,
+    log_buffer: LogBuffer,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     A: BufferAllocator,
@@ -39,9 +29,10 @@ where
                 remote_qpn,
             ));
 
-            let dump = dump_factory
-                .make(stream_id)
-                .expect("failed to open dump sink for stream");
+            let dump = dump_factory.as_ref().map(|f| {
+                f.make(stream_id)
+                    .expect("failed to open dump sink for stream")
+            });
 
             let handle = std::thread::spawn({
                 let qp = Arc::clone(&rdma_endpoint.qp);
@@ -62,33 +53,14 @@ where
             (handle, stats)
         };
 
-    // TUI handle kept alive to call restore() after the test is done
-    #[cfg(feature = "tui")]
-    let tui_handle = if let Some(ref buffer) = log_buffer {
-        Some(Arc::new(Mutex::new(tui::Tui::new(Arc::clone(buffer))?)))
-    } else {
-        None
-    };
-
-    let monitor = make_monitor(
+    run_session(
+        cm_opts,
+        rdma_opts,
+        allocator,
+        spawn_poller,
         stats_out,
-        #[cfg(feature = "tui")]
-        tui_handle.clone(),
-    )?;
-
-    let mut runner = SessionRunner::new(cm_opts, rdma_opts, allocator, spawn_poller, monitor)?;
-
-    if cm_opts.active {
-        let remote_addr = SocketAddr::new(
-            cm_opts.remote_addr.ok_or("--remote-addr required")?,
-            cm_opts.remote_port.ok_or("--remote-port required")?,
-        );
-        runner.connect_and_run(remote_addr, cm_opts.num_streams)?;
-    } else {
-        runner.listen_and_run()?;
-    }
-
-    Ok(())
+        log_buffer,
+    )
 }
 
 fn poller_thread<A: BufferAllocator, D: DumpSink>(
@@ -96,7 +68,7 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
     buffer_pool: BufferPool<A>,
     channel: Arc<CompletionChannel>,
     stats: Arc<StreamStats>,
-    mut dump: D,
+    mut dump: Option<D>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // metrics
     let mut total_bytes;
@@ -163,9 +135,11 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
             total_bytes += wce.byte_len as u64;
             total_msgs += 1;
 
-            // optional payload dump (no-op when DumpSink is NoDump)
-            let buf_handle = buffer_pool.get_handle(wce.wr_id as usize);
-            dump.record(buf_handle.addr, wce.byte_len as usize)?;
+            // optional payload dump
+            if let Some(dump) = dump.as_mut() {
+                let buf_handle = buffer_pool.get_handle(wce.wr_id as usize);
+                dump.record(buf_handle.addr, wce.byte_len as usize)?;
+            }
 
             // immediately repost buffer
             qp.post_recv(&mut recv_wr_list[wce.wr_id as usize])?;

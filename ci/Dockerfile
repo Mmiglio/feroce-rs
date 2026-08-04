@@ -1,4 +1,4 @@
-FROM rust:1.93
+FROM rust:1.95
 
 RUN apt-get update && apt-get install -y \
       libibverbs-dev \

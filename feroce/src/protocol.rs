@@ -58,7 +58,7 @@ impl TryFrom<u8> for AckType {
 // bits 1-3:  request_type
 // bit 4:     ack_valid
 // bits 5-7:  ack_type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QpFlags {
     raw_byte: u8,
 }
@@ -152,7 +152,7 @@ impl TxMetaFlags {
 }
 
 pub const QP_MESSAGE_SIZE: usize = 64;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QpMessage {
     pub flags: QpFlags,
 
@@ -174,29 +174,6 @@ pub struct QpMessage {
     pub dma_len: u32,
     pub n_transfers: u32,
     pub freq: u32,
-}
-
-impl Default for QpMessage {
-    fn default() -> Self {
-        QpMessage {
-            flags: QpFlags::from_byte(0),
-            loc_qpn: 0,
-            loc_psn: 0,
-            loc_rkey: 0,
-            loc_base_addr: 0,
-            loc_ip: 0,
-            rem_qpn: 0,
-            rem_psn: 0,
-            rem_rkey: 0,
-            rem_base_addr: 0,
-            rem_ip: 0,
-            udp_port: 0,
-            tx_meta_flags: 0,
-            dma_len: 0,
-            n_transfers: 0,
-            freq: 0,
-        }
-    }
 }
 
 impl QpMessage {
