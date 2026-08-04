@@ -15,24 +15,6 @@ pub trait DumpSinkFactory: Send {
     fn make(&self, stream_id: u32) -> Result<Self::Sink, FeroceError>;
 }
 
-pub struct NoDump;
-
-impl DumpSink for NoDump {
-    #[inline(always)]
-    fn record(&mut self, _addr: *mut u8, _byte_len: usize) -> Result<(), FeroceError> {
-        Ok(())
-    }
-}
-
-pub struct NoDumpFactory;
-
-impl DumpSinkFactory for NoDumpFactory {
-    type Sink = NoDump;
-    fn make(&self, _stream_id: u32) -> Result<NoDump, FeroceError> {
-        Ok(NoDump)
-    }
-}
-
 pub fn derive_stream_path(base: &Path, stream_id: u32) -> PathBuf {
     let parent = base.parent().unwrap_or_else(|| Path::new(""));
     let stem = base
@@ -167,12 +149,6 @@ mod tests {
 
     fn scratch_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("feroce-dump-{}-{}.bin", std::process::id(), tag))
-    }
-
-    #[test]
-    fn no_dump_is_noop() {
-        let mut sink = NoDump;
-        assert!(sink.record(std::ptr::null_mut(), 0).is_ok());
     }
 
     #[test]

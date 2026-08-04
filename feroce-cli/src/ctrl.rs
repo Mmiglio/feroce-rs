@@ -22,11 +22,7 @@ pub fn build_txmeta_message(opts: &TxMetaOpts) -> QpMessage {
     )
     .as_byte();
 
-    let clk_divider = if opts.msg_rate_hz == 0 {
-        0
-    } else {
-        opts.clock / opts.msg_rate_hz
-    };
+    let clk_divider = opts.clock.checked_div(opts.msg_rate_hz).unwrap_or(0);
 
     QpMessage {
         flags: QpFlags::new(RequestType::Null, AckType::Null, false),

@@ -3,7 +3,7 @@ pub mod device;
 mod ffi;
 #[cfg(feature = "gpu")]
 pub mod gpu;
-#[cfg(test)]
+#[cfg(all(test, any(feature = "rdma-test", feature = "gpu")))]
 pub(crate) mod test_utils;
 
 pub use ffi::ibv_access_flags;

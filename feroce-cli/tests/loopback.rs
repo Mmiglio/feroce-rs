@@ -2,8 +2,13 @@
 mod rdma_tests {
     use feroce::rdma::device::find_roce_device;
     use std::net::UdpSocket;
-    use std::process::{Command, Stdio};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
     use std::time::Duration;
+
+    const BUF_SIZE: &str = "128";
+    const NUM_BUF: &str = "2";
+    const NUM_MSGS: &str = "10";
 
     // pick a free port
     fn next_test_port() -> String {
@@ -13,355 +18,177 @@ mod rdma_tests {
         format!("0x{:x}", port)
     }
 
-    #[test]
-    fn loopback_send_recv() {
+    // Run a receiver/sender pair against the first active RoCE device
+    fn run_loopback(recv_extra: &[&str], send_extra: &[&str]) -> Output {
+        run_loopback_roles(true, recv_extra, send_extra)
+    }
+
+    // `send_active` picks which side dials. The passive side is started first, the
+    // active one gets --active plus the passive side's CM address
+    fn run_loopback_roles(send_active: bool, recv_extra: &[&str], send_extra: &[&str]) -> Output {
         let bin = env!("CARGO_BIN_EXE_feroce-cli");
 
         let (device_name, _device, link) = find_roce_device().expect("no RoCE device found");
-        let port = link.port_num;
-        let gid_index = link.gid_index;
+        let gid_index = link.gid_index.to_string();
+        let port_num = link.port_num.to_string();
 
         let receiver_port = next_test_port();
         let sender_port = next_test_port();
 
-        let receiver = Command::new(bin)
-            .args([
-                "recv",
+        let device_args = |cm_port: &str| {
+            [
                 "--cm-port",
-                &receiver_port,
+                cm_port,
                 "--rdma-device",
                 &device_name,
                 "--gid-index",
-                &gid_index.to_string(),
+                &gid_index,
                 "--port-num",
-                &port.to_string(),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start receiver");
+                &port_num,
+            ]
+            .map(str::to_string)
+        };
 
-        std::thread::sleep(Duration::from_millis(500));
-
-        let sender_output = Command::new(bin)
-            .args([
-                "send",
-                "--cm-port",
-                &sender_port,
-                "--rdma-device",
-                &device_name,
-                "--gid-index",
-                &gid_index.to_string(),
-                "--port-num",
-                &port.to_string(),
+        let dial_args = |peer_port: &str| {
+            [
                 "--active",
                 "--remote-addr",
                 "127.0.0.1",
                 "--remote-port",
-                &receiver_port,
-                "--num-msgs",
-                "100",
-            ])
+                peer_port,
+            ]
+            .map(str::to_string)
+        };
+
+        let mut recv_args = vec!["recv".to_string()];
+        recv_args.extend(device_args(&receiver_port));
+        recv_args.extend(recv_extra.iter().map(|s| s.to_string()));
+
+        let mut send_args = vec!["send".to_string()];
+        send_args.extend(device_args(&sender_port));
+        send_args.extend(send_extra.iter().map(|s| s.to_string()));
+
+        let (active_args, passive_args) = if send_active {
+            send_args.extend(dial_args(&receiver_port));
+            (&send_args, &recv_args)
+        } else {
+            recv_args.extend(dial_args(&sender_port));
+            (&recv_args, &send_args)
+        };
+
+        let passive = Command::new(bin)
+            .args(passive_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start passive side");
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let active_output = Command::new(bin)
+            .args(active_args)
             .output()
-            .expect("failed to start sender");
+            .expect("failed to start active side");
+        assert_exited_ok(&active_output, "active side");
 
-        assert!(
-            sender_output.status.success(),
-            "sender failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&sender_output.stdout),
-            String::from_utf8_lossy(&sender_output.stderr),
-        );
+        let passive_output = passive.wait_with_output().expect("passive side failed");
+        assert_exited_ok(&passive_output, "passive side");
 
-        let receiver_output = receiver.wait_with_output().expect("receiver failed");
+        if send_active {
+            passive_output
+        } else {
+            active_output
+        }
+    }
+
+    fn assert_exited_ok(output: &Output, who: &str) {
         assert!(
-            receiver_output.status.success(),
-            "receiver failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&receiver_output.stdout),
-            String::from_utf8_lossy(&receiver_output.stderr),
+            output.status.success(),
+            "{} failed:\nstdout: {}\nstderr: {}",
+            who,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    // Returns the --dump-file base path and the `<stem>.000.bin` the receiver
+    // actually writes for stream 0, clearing any leftover from a previous run.
+    fn dump_paths(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("feroce-{}-{}.bin", tag, std::process::id()));
+        let stream_path = base.with_file_name(format!(
+            "{}.000.bin",
+            base.file_stem().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&stream_path);
+        (base, stream_path)
+    }
+
+    // The sender writes each message's index as a big-endian u64 in the first 8 bytes.
+    fn assert_dump(path: &Path, receiver: &Output) {
+        let num_msgs: usize = NUM_MSGS.parse().unwrap();
+        let buf_size: usize = BUF_SIZE.parse().unwrap();
+
+        let dump = std::fs::read(path).expect("dump file missing");
+        assert_eq!(
+            dump.len(),
+            num_msgs * buf_size,
+            "dump file size should equal num_msgs * buf_size; receiver stderr:\n{}",
+            String::from_utf8_lossy(&receiver.stderr),
+        );
+        for i in 0..num_msgs {
+            let counter =
+                u64::from_be_bytes(dump[i * buf_size..i * buf_size + 8].try_into().unwrap());
+            assert_eq!(counter, i as u64, "dump message {} has wrong counter", i);
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn loopback_send_recv() {
+        run_loopback(&[], &["--num-msgs", "100"]);
+    }
+
+    // reversed roles: the receiver dials, the sender waits to be started
+    #[test]
+    fn loopback_recv_active() {
+        run_loopback_roles(false, &[], &["--num-msgs", "100"]);
     }
 
     #[test]
     fn loopback_send_recv_with_dump() {
-        let bin = env!("CARGO_BIN_EXE_feroce-cli");
+        let (base, dump_path) = dump_paths("loopback-dump");
+        let sizes = ["--buf-size", BUF_SIZE, "--num-buf", NUM_BUF];
 
-        let (device_name, _device, link) = find_roce_device().expect("no RoCE device found");
-        let port = link.port_num;
-        let gid_index = link.gid_index;
-
-        let receiver_port = next_test_port();
-        let sender_port = next_test_port();
-
-        let dump_base =
-            std::env::temp_dir().join(format!("feroce-loopback-dump-{}.bin", std::process::id()));
-        let dump_path = dump_base.with_file_name(format!(
-            "{}.000.bin",
-            dump_base.file_stem().unwrap().to_string_lossy()
-        ));
-        let _ = std::fs::remove_file(&dump_path);
-
-        let buf_size: usize = 128;
-        let num_buf: usize = 2;
-        let num_msgs: u64 = 10;
-
-        let receiver = Command::new(bin)
-            .args([
-                "recv",
-                "--cm-port",
-                &receiver_port,
-                "--rdma-device",
-                &device_name,
-                "--gid-index",
-                &gid_index.to_string(),
-                "--port-num",
-                &port.to_string(),
-                "--buf-size",
-                &buf_size.to_string(),
-                "--num-buf",
-                &num_buf.to_string(),
-                "--dump-file",
-                dump_base.to_str().unwrap(),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start receiver");
-
-        std::thread::sleep(Duration::from_millis(500));
-
-        let sender_output = Command::new(bin)
-            .args([
-                "send",
-                "--cm-port",
-                &sender_port,
-                "--rdma-device",
-                &device_name,
-                "--gid-index",
-                &gid_index.to_string(),
-                "--port-num",
-                &port.to_string(),
-                "--buf-size",
-                &buf_size.to_string(),
-                "--num-buf",
-                &num_buf.to_string(),
-                "--active",
-                "--remote-addr",
-                "127.0.0.1",
-                "--remote-port",
-                &receiver_port,
-                "--num-msgs",
-                &num_msgs.to_string(),
-            ])
-            .output()
-            .expect("failed to start sender");
-
-        assert!(
-            sender_output.status.success(),
-            "sender failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&sender_output.stdout),
-            String::from_utf8_lossy(&sender_output.stderr),
+        let receiver = run_loopback(
+            &[&sizes[..], &["--dump-file", base.to_str().unwrap()]].concat(),
+            &[&sizes[..], &["--num-msgs", NUM_MSGS]].concat(),
         );
 
-        let receiver_output = receiver.wait_with_output().expect("receiver failed");
-        assert!(
-            receiver_output.status.success(),
-            "receiver failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&receiver_output.stdout),
-            String::from_utf8_lossy(&receiver_output.stderr),
-        );
-
-        let dump = std::fs::read(&dump_path).expect("dump file missing");
-        assert_eq!(
-            dump.len(),
-            (num_msgs as usize) * buf_size,
-            "dump file size should equal num_msgs * buf_size",
-        );
-        for i in 0..(num_msgs as usize) {
-            let counter =
-                u64::from_be_bytes(dump[i * buf_size..i * buf_size + 8].try_into().unwrap());
-            assert_eq!(counter, i as u64, "dump message {} has wrong counter", i);
-        }
-
-        let _ = std::fs::remove_file(&dump_path);
-    }
-
-    #[test]
-    #[cfg(feature = "gpu")]
-    fn loopback_gpu_direct_with_dump() {
-        let bin = env!("CARGO_BIN_EXE_feroce-cli");
-
-        let (device_name, _device, link) = find_roce_device().expect("no RoCE device found");
-        let port = link.port_num;
-        let gid_index = link.gid_index;
-
-        let receiver_port = next_test_port();
-        let sender_port = next_test_port();
-
-        let dump_base = std::env::temp_dir().join(format!(
-            "feroce-loopback-gpu-dump-{}.bin",
-            std::process::id()
-        ));
-        let dump_path = dump_base.with_file_name(format!(
-            "{}.000.bin",
-            dump_base.file_stem().unwrap().to_string_lossy()
-        ));
-        let _ = std::fs::remove_file(&dump_path);
-
-        let buf_size: usize = 128;
-        let num_buf: usize = 2;
-        let num_msgs: u64 = 10;
-
-        let receiver = Command::new(bin)
-            .args([
-                "recv",
-                "--cm-port",
-                &receiver_port,
-                "--rdma-device",
-                &device_name,
-                "--gid-index",
-                &gid_index.to_string(),
-                "--port-num",
-                &port.to_string(),
-                "--buf-size",
-                &buf_size.to_string(),
-                "--num-buf",
-                &num_buf.to_string(),
-                "--gpu",
-                "--dump-file",
-                dump_base.to_str().unwrap(),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start receiver");
-
-        std::thread::sleep(Duration::from_millis(500));
-
-        let sender_output = Command::new(bin)
-            .args([
-                "send",
-                "--cm-port",
-                &sender_port,
-                "--rdma-device",
-                &device_name,
-                "--gid-index",
-                &gid_index.to_string(),
-                "--port-num",
-                &port.to_string(),
-                "--buf-size",
-                &buf_size.to_string(),
-                "--num-buf",
-                &num_buf.to_string(),
-                "--active",
-                "--remote-addr",
-                "127.0.0.1",
-                "--remote-port",
-                &receiver_port,
-                "--num-msgs",
-                &num_msgs.to_string(),
-            ])
-            .output()
-            .expect("failed to start sender");
-
-        assert!(
-            sender_output.status.success(),
-            "sender failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&sender_output.stdout),
-            String::from_utf8_lossy(&sender_output.stderr),
-        );
-
-        let receiver_output = receiver.wait_with_output().expect("receiver failed");
-        assert!(
-            receiver_output.status.success(),
-            "receiver failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&receiver_output.stdout),
-            String::from_utf8_lossy(&receiver_output.stderr),
-        );
-
-        let receiver_stderr = String::from_utf8_lossy(&receiver_output.stderr).into_owned();
-        let dump = std::fs::read(&dump_path).expect("dump file missing");
-        assert_eq!(
-            dump.len(),
-            (num_msgs as usize) * buf_size,
-            "dump file size should equal num_msgs * buf_size; receiver stderr:\n{}",
-            receiver_stderr,
-        );
-        for i in 0..(num_msgs as usize) {
-            let counter =
-                u64::from_be_bytes(dump[i * buf_size..i * buf_size + 8].try_into().unwrap());
-            assert_eq!(counter, i as u64, "dump message {} has wrong counter", i);
-        }
-
-        let _ = std::fs::remove_file(&dump_path);
+        assert_dump(&dump_path, &receiver);
     }
 
     #[test]
     #[cfg(feature = "gpu")]
     fn loopback_gpu_direct() {
-        let bin = env!("CARGO_BIN_EXE_feroce-cli");
+        run_loopback(&["--gpu"], &["--num-msgs", "100"]);
+    }
 
-        let (device_name, _device, link) = find_roce_device().expect("no RoCE device found");
-        let port = link.port_num;
-        let gid_index = link.gid_index;
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn loopback_gpu_direct_with_dump() {
+        let (base, dump_path) = dump_paths("loopback-gpu-dump");
+        let sizes = ["--buf-size", BUF_SIZE, "--num-buf", NUM_BUF];
 
-        let receiver_port = next_test_port();
-        let sender_port = next_test_port();
-
-        let receiver = Command::new(bin)
-            .args([
-                "recv",
-                "--cm-port",
-                &receiver_port,
-                "--rdma-device",
-                &device_name,
-                "--gid-index",
-                &gid_index.to_string(),
-                "--port-num",
-                &port.to_string(),
-                "--gpu",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start receiver");
-
-        std::thread::sleep(Duration::from_millis(500));
-
-        let sender_output = Command::new(bin)
-            .args([
-                "send",
-                "--cm-port",
-                &sender_port,
-                "--rdma-device",
-                &device_name,
-                "--gid-index",
-                &gid_index.to_string(),
-                "--port-num",
-                &port.to_string(),
-                "--active",
-                "--remote-addr",
-                "127.0.0.1",
-                "--remote-port",
-                &receiver_port,
-                "--num-msgs",
-                "100",
-            ])
-            .output()
-            .expect("failed to start sender");
-
-        assert!(
-            sender_output.status.success(),
-            "sender failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&sender_output.stdout),
-            String::from_utf8_lossy(&sender_output.stderr),
+        let receiver = run_loopback(
+            &[
+                &sizes[..],
+                &["--gpu", "--dump-file", base.to_str().unwrap()],
+            ]
+            .concat(),
+            &[&sizes[..], &["--num-msgs", NUM_MSGS]].concat(),
         );
 
-        let receiver_output = receiver.wait_with_output().expect("receiver failed");
-        assert!(
-            receiver_output.status.success(),
-            "receiver failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&receiver_output.stdout),
-            String::from_utf8_lossy(&receiver_output.stderr),
-        );
+        assert_dump(&dump_path, &receiver);
     }
 }

@@ -454,6 +454,7 @@ pub(crate) struct RtrParams {
     pub min_rnr_timer: u8,
     pub max_dest_rd_atomic: u8,
     pub hop_limit: u8,
+    pub traffic_class: u8,
 }
 
 impl Default for RtrParams {
@@ -462,6 +463,7 @@ impl Default for RtrParams {
             min_rnr_timer: 8,
             max_dest_rd_atomic: 1,
             hop_limit: 1,
+            traffic_class: 96,
         }
     }
 }
@@ -592,6 +594,7 @@ impl QueuePair {
                     dgid: ffi::ibv_gid {
                         raw: remote_info.gid,
                     },
+                    traffic_class: params.traffic_class,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -901,6 +904,11 @@ impl QpBuilder {
         self
     }
 
+    pub fn set_traffic_class(mut self, traffic_class: u8) -> Self {
+        self.rtr.traffic_class = traffic_class;
+        self
+    }
+
     pub fn build(self) -> Result<PreparedQueuePair, FeroceError> {
         let qp = QueuePair::create_qp(
             self.pd,
@@ -1085,29 +1093,25 @@ impl<S> Drop for MemoryRegion<S> {
 pub fn find_roce_device() -> Option<(String, Arc<Device>, LocalLink)> {
     let devices = DeviceList::new().ok()?;
     for i in 0..devices.len() {
-        let name = devices.device_name(i)?;
-        let device = Device::open(name).ok()?;
-        let entries = device.query_gid_table().ok()?;
+        // skip to the next device on failure
+        let Some(name) = devices.device_name(i) else {
+            continue;
+        };
+        let Ok(device) = Device::open(name) else {
+            continue;
+        };
+        let Ok(entries) = device.query_gid_table() else {
+            continue;
+        };
+
         for entry in &entries {
-            if entry.gid_type == ffi::ibv_gid_type::IBV_GID_TYPE_ROCE_V2 as u32
-                && entry.gid.raw.iter().any(|&b| b != 0)
-                && entry.gid.raw[10] == 0xff
-                && entry.gid.raw[11] == 0xff
-            {
-                let port = entry.port_num as u8;
-                let port_attr = device.query_port(port).ok()?;
-                if matches!(port_attr.state, ffi::ibv_port_state::IBV_PORT_ACTIVE) {
-                    info!(
-                        "Discovery: device={}, port={}, gid_index={}, mtu={:?}",
-                        name, port, entry.gid_index, port_attr.active_mtu as u32
-                    );
-                    let link = LocalLink {
-                        port_num: port,
-                        gid_index: entry.gid_index as u8,
-                        mtu: port_attr.active_mtu,
-                    };
-                    return Some((name.to_string(), Arc::new(device), link));
-                }
+            let (port, gid_index) = (entry.port_num as u8, entry.gid_index as u8);
+            if let Ok(Some(link)) = device.probe_link(port, gid_index) {
+                info!(
+                    "Discovery: device={}, port={}, gid_index={}, mtu={:?}",
+                    name, port, gid_index, link.mtu as u32
+                );
+                return Some((name.to_string(), Arc::new(device), link));
             }
         }
     }

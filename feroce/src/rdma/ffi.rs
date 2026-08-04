@@ -35,7 +35,7 @@ impl Default for ibv_wc {
     }
 }
 
-include!("ffi_generated.rs");
+include!(concat!(env!("OUT_DIR"), "/ffi_generated.rs"));
 
 pub unsafe fn ibv_query_port_compact(
     context: *mut ibv_context,

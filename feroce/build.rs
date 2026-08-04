@@ -1,12 +1,8 @@
 fn setup_ibverbs() {
     println!("cargo:rustc-link-lib=ibverbs");
+    println!("cargo:rerun-if-changed=build.rs");
 
-    let output = "src/rdma/ffi_generated.rs";
-
-    if std::path::Path::new(output).exists() {
-        println!("cargo:rerun-if-changed={}", output);
-        return;
-    }
+    let output = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("ffi_generated.rs");
 
     let bindings = bindgen::Builder::default()
         //.header("/usr/include/infiniband/verbs.h")
@@ -33,8 +29,13 @@ fn setup_ibverbs() {
         .expect("failed to generate bindings");
 
     bindings
-        .write_to_file(output)
+        .write_to_file(&output)
         .expect("failed to write bindings");
+
+    // path for reading the bindings, gitignored
+    let link = std::path::Path::new("src/rdma/ffi_generated.rs");
+    let _ = std::fs::remove_file(link);
+    let _ = std::os::unix::fs::symlink(&output, link);
 }
 
 #[cfg(feature = "gpu")]
