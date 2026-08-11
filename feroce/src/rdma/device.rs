@@ -554,6 +554,9 @@ impl QueuePair {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
             port_num,
+            qp_access_flags: (ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE)
+                .0,
             ..Default::default()
         };
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
@@ -1461,6 +1464,148 @@ mod test {
             recv_wc[0].status,
             ffi::ibv_wc_status::IBV_WC_WR_FLUSH_ERR
         ));
+    }
+
+    #[test]
+    fn loopback_rdma_write() {
+        let buf_size = 64;
+
+        let (_name, device, link) =
+            find_roce_device().expect("no active RoCE device found — skipping");
+
+        let mut pair = create_loopback_qp(&device, link, buf_size);
+
+        // RDMA WRITE is one-sided: no recv WR needed on the receiver.
+        let send_buf = pair.send.mr.storage_mut();
+        send_buf[0] = 0xde;
+        send_buf[1] = 0xad;
+        send_buf[2] = 0xbe;
+        send_buf[3] = 0xef;
+
+        let send_lkey = pair.send.mr.lkey();
+        let mut send_sg_list = make_sge_list(1, pair.send.mr.storage_mut(), send_lkey);
+
+        let mut send_wr = QueuePair::build_send_wr(
+            1,
+            &mut send_sg_list,
+            SendOp::Write {
+                remote_addr: pair.recv.mr.addr(),
+                rkey: pair.recv.mr.rkey(),
+            },
+            true,
+        );
+        pair.send
+            .qp
+            .post_send(&mut send_wr)
+            .expect("failed to post rdma write wr");
+
+        // poll the send CQ for completion
+        let mut send_wc = vec![ffi::ibv_wc {
+            ..Default::default()
+        }];
+        let n_wce_send = poll_cq_with_timeout(
+            &pair.send.qp.send_cq(),
+            &mut send_wc,
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(n_wce_send, 1);
+        assert!(
+            matches!(send_wc[0].status, ffi::ibv_wc_status::IBV_WC_SUCCESS),
+            "send WC status: {:?}",
+            send_wc[0].status
+        );
+
+        // verify the receiver's buffer was written directly
+        let recv_buf = pair.recv.mr.storage();
+        assert_eq!(&recv_buf[0..4], &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn loopback_rdma_write_with_imm() {
+        let buf_size = 64;
+        let imm_data: u32 = 0x12345678;
+
+        let (_name, device, link) =
+            find_roce_device().expect("no active RoCE device found — skipping");
+
+        let mut pair = create_loopback_qp(&device, link, buf_size);
+
+        // WRITE with immediate generates a receive completion on the receiver,
+        // so we must post a recv WR first.
+        let recv_lkey = pair.recv.mr.lkey();
+        let mut recv_sg_list = make_sge_list(1, pair.recv.mr.storage_mut(), recv_lkey);
+        let mut recv_wr = QueuePair::build_recv_wr(1, &mut recv_sg_list);
+        pair.recv
+            .qp
+            .post_recv(&mut recv_wr)
+            .expect("failed to post recv wr");
+
+        let send_buf = pair.send.mr.storage_mut();
+        send_buf[0] = 0xc0;
+        send_buf[1] = 0xff;
+        send_buf[2] = 0xee;
+        send_buf[3] = 0x00;
+
+        let send_lkey = pair.send.mr.lkey();
+        let mut send_sg_list = make_sge_list(1, pair.send.mr.storage_mut(), send_lkey);
+
+        let mut send_wr = QueuePair::build_send_wr(
+            1,
+            &mut send_sg_list,
+            SendOp::WriteWithImm {
+                remote_addr: pair.recv.mr.addr(),
+                rkey: pair.recv.mr.rkey(),
+                imm_data,
+            },
+            true,
+        );
+        pair.send
+            .qp
+            .post_send(&mut send_wr)
+            .expect("failed to post rdma write-with-imm wr");
+
+        // poll first the send CQ
+        let mut send_wc = vec![ffi::ibv_wc {
+            ..Default::default()
+        }];
+        let n_wce_send = poll_cq_with_timeout(
+            &pair.send.qp.send_cq(),
+            &mut send_wc,
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(n_wce_send, 1);
+        assert!(matches!(
+            send_wc[0].status,
+            ffi::ibv_wc_status::IBV_WC_SUCCESS
+        ));
+
+        // poll now the recv cq
+        let mut recv_wc = vec![ffi::ibv_wc {
+            ..Default::default()
+        }];
+        let n_wce_recv = poll_cq_with_timeout(
+            &pair.recv.qp.recv_cq(),
+            &mut recv_wc,
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(n_wce_recv, 1);
+        assert!(matches!(
+            recv_wc[0].status,
+            ffi::ibv_wc_status::IBV_WC_SUCCESS
+        ));
+
+        // the wc_flags must indicate immediate data is present
+        assert_ne!(
+            recv_wc[0].wc_flags & ffi::ibv_wc_flags::IBV_WC_WITH_IMM,
+            ffi::ibv_wc_flags(0)
+        );
+
+        // verify the immediate data value
+        assert_eq!(recv_wc[0].imm_data, imm_data);
+
+        // verify the receiver's buffer was written
+        let recv_buf = pair.recv.mr.storage();
+        assert_eq!(&recv_buf[0..4], &[0xc0, 0xff, 0xee, 0x00]);
     }
 
     #[test]
