@@ -48,7 +48,7 @@ Then the sender (active side, initiates the connection):
       --num-msgs 100000
 ```
 
-For GPUDirect, build with `--features gpu` and pass `--gpu` to the receiver (sender settings stay the same):
+For GPUDirect, build with `--features gpu` and pass `--gpu` to the receiver (sender settings stay the same). `--gpu` uses CUDA device 0; pass `--gpu <ID>` to select another:
 
 ```bash
 ./target/release/feroce-cli recv \

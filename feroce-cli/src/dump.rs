@@ -73,8 +73,8 @@ impl DumpSinkFactory for CpuDumpFactory {
 pub struct GpuDumpSink {
     file: BufWriter<File>,
     staging: Vec<u8>,
-    ctx: feroce::rdma::gpu::CudaCtxToken,
-    ctx_attached: bool,
+    device: i32,
+    ctx: Option<feroce::rdma::gpu::CudaContext>,
 }
 
 #[cfg(feature = "gpu")]
@@ -83,15 +83,15 @@ impl GpuDumpSink {
         base: &Path,
         stream_id: u32,
         buf_size: usize,
-        ctx: feroce::rdma::gpu::CudaCtxToken,
+        device: i32,
     ) -> Result<Self, FeroceError> {
         let path = derive_stream_path(base, stream_id);
         let file = File::create(&path)?;
         Ok(Self {
             file: BufWriter::with_capacity(DUMP_BUF_CAP, file),
             staging: vec![0u8; buf_size],
-            ctx,
-            ctx_attached: false,
+            device,
+            ctx: None,
         })
     }
 }
@@ -100,10 +100,9 @@ impl GpuDumpSink {
 impl DumpSink for GpuDumpSink {
     fn record(&mut self, addr: *mut u8, byte_len: usize) -> Result<(), FeroceError> {
         // CUDA contexts are thread-local. record() runs on the poller thread,
-        // which doesn't share the main thread's context stack — bind it once.
-        if !self.ctx_attached {
-            self.ctx.set_current()?;
-            self.ctx_attached = true;
+        // which doesn't share the main thread's context stack
+        if self.ctx.is_none() {
+            self.ctx = Some(feroce::rdma::gpu::CudaContext::new(self.device)?);
         }
         debug_assert!(byte_len <= self.staging.len());
         feroce::rdma::gpu::copy_device_to_host(&mut self.staging[..byte_len], addr as u64)?;
@@ -116,20 +115,17 @@ impl DumpSink for GpuDumpSink {
 pub struct GpuDumpFactory {
     base: PathBuf,
     buf_size: usize,
-    ctx: feroce::rdma::gpu::CudaCtxToken,
+    device: i32,
 }
 
 #[cfg(feature = "gpu")]
 impl GpuDumpFactory {
-    // Captures the CUDA context currently bound to the calling thread. Must be
-    // invoked after `GpuAllocator::new`, on the same thread. TODO: clean a bit
-    pub fn new(base: PathBuf, buf_size: usize) -> Result<Self, FeroceError> {
-        let ctx = feroce::rdma::gpu::CudaCtxToken::current()?;
-        Ok(Self {
+    pub fn new(base: PathBuf, buf_size: usize, device: i32) -> Self {
+        Self {
             base,
             buf_size,
-            ctx,
-        })
+            device,
+        }
     }
 }
 
@@ -137,7 +133,7 @@ impl GpuDumpFactory {
 impl DumpSinkFactory for GpuDumpFactory {
     type Sink = GpuDumpSink;
     fn make(&self, stream_id: u32) -> Result<GpuDumpSink, FeroceError> {
-        GpuDumpSink::open(&self.base, stream_id, self.buf_size, self.ctx)
+        GpuDumpSink::open(&self.base, stream_id, self.buf_size, self.device)
     }
 }
 

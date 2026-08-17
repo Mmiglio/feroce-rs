@@ -84,9 +84,9 @@ struct SenderOpts {
 
 #[derive(Args)]
 struct ReceiverOpts {
-    /// Receive on GPU memory
-    #[arg(long)]
-    gpu: bool,
+    /// Receive on GPU memory, on CUDA device <ID>
+    #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "0")]
+    gpu: Option<i32>,
     /// Enable TUI dashboard (requires building with --features tui)
     #[arg(long)]
     tui: bool,
@@ -256,22 +256,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let stats_out = receiver_opts.stats_out.as_deref();
 
             // pick the selected allocator
-            if receiver_opts.gpu {
+            if let Some(device) = receiver_opts.gpu {
                 #[cfg(feature = "gpu")]
                 {
                     use crate::dump::GpuDumpFactory;
                     use feroce::rdma::gpu::GpuAllocator;
 
-                    let allocator = GpuAllocator::new(0)?;
+                    let allocator = GpuAllocator::new(device)?;
                     let dump = receiver_opts
                         .dump_file
-                        .map(|path| GpuDumpFactory::new(path, rdma_opts.buf_size))
-                        .transpose()?;
+                        .map(|path| GpuDumpFactory::new(path, rdma_opts.buf_size, device));
                     recv::run(&cm_opts, &rdma_opts, allocator, dump, stats_out, log_buffer)?;
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
-                    return Err("--gpu requires building with --features gpu".into());
+                    return Err(
+                        format!("--gpu {device} requires building with --features gpu").into(),
+                    );
                 }
             } else {
                 use crate::dump::CpuDumpFactory;

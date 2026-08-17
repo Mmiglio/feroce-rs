@@ -21,13 +21,12 @@ const CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD: i32 = 0x1;
 
 unsafe extern "C" {
     fn cuInit(flags: u32) -> CUresult;
-    fn cuCtxGetCurrent(pctx: *mut CUcontext) -> CUresult;
     fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
     fn cuDeviceGet(device: *mut CUdevice, ordinal: i32) -> CUresult;
-    fn cuCtxCreate_v2(pctx: *mut CUcontext, flags: u32, device: CUdevice) -> CUresult;
+    fn cuDevicePrimaryCtxRetain(pctx: *mut CUcontext, dev: CUdevice) -> CUresult;
+    fn cuDevicePrimaryCtxRelease_v2(dev: CUdevice) -> CUresult;
     fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
-    fn cuCtxDestroy_v2(ctx: CUcontext) -> CUresult;
     fn cuMemGetHandleForAddressRange(
         handle: *mut std::ffi::c_void,
         dptr: CUdeviceptr,
@@ -50,50 +49,6 @@ fn check_cuda(result: CUresult, call: &'static str) -> Result<(), FeroceError> {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct CudaCtxToken {
-    ctx: CUcontext,
-}
-
-unsafe impl Send for CudaCtxToken {}
-unsafe impl Sync for CudaCtxToken {}
-
-impl CudaCtxToken {
-    // Capture whatever CUDA context is currently bound to the calling thread.
-    // Returns `Cuda { code: 201 }` if no context is current.
-    pub fn current() -> Result<Self, FeroceError> {
-        let mut ctx: CUcontext = std::ptr::null_mut();
-        check_cuda(unsafe { cuCtxGetCurrent(&mut ctx) }, "cuCtxGetCurrent")?;
-        if ctx.is_null() {
-            return Err(FeroceError::Cuda {
-                call: "cuCtxGetCurrent",
-                code: 201, // CUDA_ERROR_INVALID_CONTEXT
-            });
-        }
-        Ok(Self { ctx })
-    }
-
-    /// Make this context current on the calling thread.
-    pub fn set_current(&self) -> Result<(), FeroceError> {
-        check_cuda(unsafe { cuCtxSetCurrent(self.ctx) }, "cuCtxSetCurrent")
-    }
-}
-
-pub fn init_cuda_thread(device_ordinal: i32) -> Result<(), FeroceError> {
-    check_cuda(unsafe { cuInit(0) }, "cuInit")?;
-    let mut dev = 0;
-    check_cuda(
-        unsafe { cuDeviceGet(&mut dev, device_ordinal) },
-        "cuDeviceGet",
-    )?;
-    let mut ctx = std::ptr::null_mut();
-    check_cuda(
-        unsafe { cuCtxCreate_v2(&mut ctx, 0, dev) },
-        "cuCtxCreate_v2",
-    )?;
-    Ok(())
-}
-
 pub fn copy_device_to_host(dst: &mut [u8], device_addr: u64) -> Result<(), FeroceError> {
     check_cuda(
         unsafe {
@@ -108,33 +63,35 @@ pub fn copy_device_to_host(dst: &mut [u8], device_addr: u64) -> Result<(), Feroc
 }
 
 pub struct CudaContext {
-    ctx: CUcontext,
+    dev: CUdevice,
 }
-
-unsafe impl Send for CudaContext {}
 
 impl CudaContext {
     pub fn new(device_number: i32) -> Result<Self, FeroceError> {
-        let mut res = unsafe { cuInit(0) };
-        check_cuda(res, "cuInit")?;
+        check_cuda(unsafe { cuInit(0) }, "cuInit")?;
 
         let mut dev = 0;
-        res = unsafe { cuDeviceGet(&mut dev, device_number) };
-        check_cuda(res, "cuDeviceGet")?;
+        check_cuda(
+            unsafe { cuDeviceGet(&mut dev, device_number) },
+            "cuDeviceGet",
+        )?;
 
         let mut ctx = std::ptr::null_mut();
-        res = unsafe { cuCtxCreate_v2(&mut ctx, 0, dev) };
-        check_cuda(res, "cuCtxCreate_v2")?;
+        check_cuda(
+            unsafe { cuDevicePrimaryCtxRetain(&mut ctx, dev) },
+            "cuDevicePrimaryCtxRetain",
+        )?;
+        check_cuda(unsafe { cuCtxSetCurrent(ctx) }, "cuCtxSetCurrent")?;
 
-        Ok(CudaContext { ctx })
+        Ok(CudaContext { dev })
     }
 }
 
 impl Drop for CudaContext {
     fn drop(&mut self) {
-        let res = unsafe { cuCtxDestroy_v2(self.ctx) };
+        let res = unsafe { cuDevicePrimaryCtxRelease_v2(self.dev) };
         if res != CUDA_SUCCESS {
-            error!("cuCtxDestroy_v2 failed: code={}", res);
+            error!("cuDevicePrimaryCtxRelease_v2 failed: code={}", res);
         }
     }
 }
@@ -262,6 +219,23 @@ mod test {
         let _ctx = CudaContext::new(0).unwrap();
 
         let buff = GpuBuffer::alloc(1024).unwrap();
+
+        drop(buff);
+    }
+
+    #[test]
+    fn context_shared_across_threads() {
+        let _ctx = CudaContext::new(0).unwrap();
+        let buff = GpuBuffer::alloc(4096).unwrap();
+        let dptr = buff.dptr;
+
+        std::thread::spawn(move || {
+            let _ctx = CudaContext::new(0).unwrap();
+            let mut out = vec![0u8; 4096];
+            copy_device_to_host(&mut out, dptr).unwrap();
+        })
+        .join()
+        .unwrap();
 
         drop(buff);
     }
