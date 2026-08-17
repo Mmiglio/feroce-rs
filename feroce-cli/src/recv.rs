@@ -104,6 +104,10 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
     // request notification from completion channel for every event
     qp.recv_cq().req_notify_cq(false)?;
 
+    // reused per poll: buffers handed to the sink, and wr_ids to repost after
+    let mut batch_bufs: Vec<(*mut u8, usize)> = Vec::with_capacity(buffer_pool.num_buf());
+    let mut batch_wr_ids: Vec<usize> = Vec::with_capacity(buffer_pool.num_buf());
+
     let mut poller_done = false;
     while !poller_done {
         // wait for completion event, blocking with timeout of 10 ms
@@ -120,6 +124,8 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
         // finally, process completions
         total_bytes = 0;
         total_msgs = 0;
+        batch_bufs.clear();
+        batch_wr_ids.clear();
         for (ce_idx, wce) in wc_list.iter().enumerate().take(num_wce) {
             if wce.status != rdma::ibv_wc_status::IBV_WC_SUCCESS {
                 if wce.status == rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR {
@@ -135,14 +141,19 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
             total_bytes += wce.byte_len as u64;
             total_msgs += 1;
 
-            // optional payload dump
-            if let Some(dump) = dump.as_mut() {
-                let buf_handle = buffer_pool.get_handle(wce.wr_id as usize);
-                dump.record(buf_handle.addr, wce.byte_len as usize)?;
+            let wr_id = wce.wr_id as usize;
+            if dump.is_some() {
+                let buf_handle = buffer_pool.get_handle(wr_id);
+                batch_bufs.push((buf_handle.addr, wce.byte_len as usize));
             }
+            batch_wr_ids.push(wr_id);
+        }
 
-            // immediately repost buffer
-            qp.post_recv(&mut recv_wr_list[wce.wr_id as usize])?;
+        if let Some(dump) = dump.as_mut() {
+            dump.record_batch(&batch_bufs)?;
+        }
+        for &wr_id in &batch_wr_ids {
+            qp.post_recv(&mut recv_wr_list[wr_id])?;
         }
 
         stats

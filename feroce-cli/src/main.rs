@@ -94,6 +94,10 @@ struct ReceiverOpts {
     /// stream writes to <stem>.NNN.<ext>
     #[arg(long, value_name = "PATH")]
     dump_file: Option<PathBuf>,
+    /// Per completion, launch a GPU kernel that sums the payload bytes and asserts
+    /// the expected value. requires --gpu.
+    #[arg(long, conflicts_with = "dump_file")]
+    sum_check: bool,
     /// Write per-tick, per-stream throughput rows to <PATH> as CSV.
     #[arg(long, value_name = "PATH")]
     stats_out: Option<PathBuf>,
@@ -253,20 +257,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            if receiver_opts.sum_check && receiver_opts.gpu.is_none() {
+                return Err("--sum-check requires --gpu".into());
+            }
+
             let stats_out = receiver_opts.stats_out.as_deref();
 
             // pick the selected allocator
             if let Some(device) = receiver_opts.gpu {
                 #[cfg(feature = "gpu")]
                 {
-                    use crate::dump::GpuDumpFactory;
+                    use crate::dump::{GpuDumpFactory, SumFactory};
                     use feroce::rdma::gpu::GpuAllocator;
 
                     let allocator = GpuAllocator::new(device)?;
-                    let dump = receiver_opts
-                        .dump_file
-                        .map(|path| GpuDumpFactory::new(path, rdma_opts.buf_size, device));
-                    recv::run(&cm_opts, &rdma_opts, allocator, dump, stats_out, log_buffer)?;
+                    if receiver_opts.sum_check {
+                        let dump = Some(SumFactory::new(device));
+                        recv::run(&cm_opts, &rdma_opts, allocator, dump, stats_out, log_buffer)?;
+                    } else {
+                        let dump = receiver_opts
+                            .dump_file
+                            .map(|path| GpuDumpFactory::new(path, rdma_opts.buf_size, device));
+                        recv::run(&cm_opts, &rdma_opts, allocator, dump, stats_out, log_buffer)?;
+                    }
                 }
                 #[cfg(not(feature = "gpu"))]
                 {

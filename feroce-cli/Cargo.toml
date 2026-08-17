@@ -17,3 +17,6 @@ feroce = { path = "../feroce" }
 log = "0.4.29"
 signal-hook = "0.4.3"
 ratatui = { version = "0.30", optional = true }
+
+[build-dependencies]
+cc = "1.2"
