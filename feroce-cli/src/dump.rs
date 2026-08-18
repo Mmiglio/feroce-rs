@@ -178,7 +178,12 @@ impl DumpSink for SumSink {
             let mut out = vec![0u64; chunk.len()];
 
             let code = unsafe {
-                feroce_sum_batch(dptrs.as_ptr(), lens.as_ptr(), chunk.len() as u32, out.as_mut_ptr())
+                feroce_sum_batch(
+                    dptrs.as_ptr(),
+                    lens.as_ptr(),
+                    chunk.len() as u32,
+                    out.as_mut_ptr(),
+                )
             };
             if code != 0 {
                 return Err(FeroceError::Cuda {
