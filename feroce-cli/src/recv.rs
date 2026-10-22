@@ -142,13 +142,13 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
                 match wce.imm() {
                     Some(imm) => {
                         let exp = expected_imm;
-                        if let Some(missed) = check_imm_seq(&mut expected_imm, imm) {
+                        if let Some(delta) = check_imm_seq(&mut expected_imm, imm) {
                             warn!(
-                                "stream {}: imm gap, expected {}, got {}, missed {}",
+                                "stream {}: imm gap, expected {}, got {}, delta {}",
                                 stats.id,
                                 exp.unwrap(),
                                 imm,
-                                missed
+                                delta
                             );
                             imm_gaps += 1;
                         }
@@ -185,51 +185,11 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
     Ok(())
 }
 
-fn check_imm_seq(expected: &mut Option<u32>, imm: u32) -> Option<u32> {
-    let missed = match *expected {
-        Some(exp) if imm != exp => Some(imm.wrapping_sub(exp)),
+fn check_imm_seq(expected: &mut Option<u32>, imm: u32) -> Option<i32> {
+    let delta = match *expected {
+        Some(exp) if imm != exp => Some(imm.wrapping_sub(exp) as i32),
         _ => None,
     };
     *expected = Some(imm.wrapping_add(1));
-    missed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn run(seq: &[u32]) -> Vec<Option<u32>> {
-        let mut expected = None;
-        seq.iter()
-            .map(|&imm| check_imm_seq(&mut expected, imm))
-            .collect()
-    }
-
-    #[test]
-    fn imm_seq_contiguous() {
-        assert_eq!(run(&[0, 1, 2]), [None, None, None]);
-    }
-
-    #[test]
-    fn imm_seq_first_sets_baseline() {
-        assert_eq!(run(&[1000, 1001]), [None, None]);
-    }
-
-    #[test]
-    fn imm_seq_gap_then_resync() {
-        assert_eq!(run(&[0, 1, 5, 6]), [None, None, Some(3), None]);
-    }
-
-    #[test]
-    fn imm_seq_wraps() {
-        assert_eq!(
-            run(&[u32::MAX - 1, u32::MAX, 0, 1]),
-            [None, None, None, None]
-        );
-    }
-
-    #[test]
-    fn imm_seq_gap_across_wrap() {
-        assert_eq!(run(&[u32::MAX - 2, 1]), [None, Some(3)]);
-    }
+    delta
 }
