@@ -740,7 +740,7 @@ impl QueuePair {
             }
             SendOp::SendWithImm(imm) => {
                 wr.opcode = ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM;
-                wr.__bindgen_anon_1.imm_data = imm;
+                wr.__bindgen_anon_1.imm_data = imm.to_be();
             }
             SendOp::Write { remote_addr, rkey } => {
                 wr.opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE;
@@ -755,7 +755,7 @@ impl QueuePair {
                 wr.opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
                 wr.wr.rdma.remote_addr = remote_addr;
                 wr.wr.rdma.rkey = rkey;
-                wr.__bindgen_anon_1.imm_data = imm_data;
+                wr.__bindgen_anon_1.imm_data = imm_data.to_be();
             }
         }
 
@@ -1601,7 +1601,7 @@ mod test {
         );
 
         // verify the immediate data value
-        assert_eq!(recv_wc[0].imm_data, imm_data);
+        assert_eq!(recv_wc[0].imm_data.to_ne_bytes(), imm_data.to_be_bytes());
 
         // verify the receiver's buffer was written
         let recv_buf = pair.recv.mr.storage();
