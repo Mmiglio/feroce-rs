@@ -13,6 +13,7 @@ pub use ffi::ibv_recv_wr;
 pub use ffi::ibv_send_wr;
 pub use ffi::ibv_sge;
 pub use ffi::ibv_wc;
+pub use ffi::ibv_wc_flags;
 pub use ffi::ibv_wc_status;
 
 pub const IBV_SEND_SIGNALED: u32 = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;

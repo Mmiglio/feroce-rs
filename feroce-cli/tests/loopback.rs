@@ -125,19 +125,51 @@ mod rdma_tests {
 
     // The sender writes each message's index as a big-endian u64 in the first 8 bytes.
     fn assert_dump(path: &Path, receiver: &Output) {
+        const HDR_LEN: usize = 16;
+
         let num_msgs: usize = NUM_MSGS.parse().unwrap();
         let buf_size: usize = BUF_SIZE.parse().unwrap();
 
         let dump = std::fs::read(path).expect("dump file missing");
         assert_eq!(
             dump.len(),
-            num_msgs * buf_size,
-            "dump file size should equal num_msgs * buf_size; receiver stderr:\n{}",
+            num_msgs * (HDR_LEN + buf_size),
+            "dump file size should equal num_msgs * (HDR_LEN + buf_size); receiver stderr:\n{}",
             String::from_utf8_lossy(&receiver.stderr),
         );
+        let stride = HDR_LEN + buf_size;
         for i in 0..num_msgs {
-            let counter =
-                u64::from_be_bytes(dump[i * buf_size..i * buf_size + 8].try_into().unwrap());
+            let seq_number =
+                u64::from_le_bytes(dump[i * stride..(i * stride + 8)].try_into().unwrap());
+            assert_eq!(
+                seq_number, i as u64,
+                "dump message {} has wrong sequence counter",
+                i
+            );
+
+            let imm_data = u32::from_le_bytes(
+                dump[(i * stride + 8)..(i * stride + 12)]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(imm_data, i as u32, "dump message {} has wrong imm data", i);
+
+            let len = u32::from_le_bytes(
+                dump[(i * stride + 12)..(i * stride + 16)]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(
+                len, buf_size as u32,
+                "dump message {} has wrong len field",
+                i
+            );
+
+            let counter = u64::from_be_bytes(
+                dump[i * stride + HDR_LEN..(i * stride + HDR_LEN + 8)]
+                    .try_into()
+                    .unwrap(),
+            );
             assert_eq!(counter, i as u64, "dump message {} has wrong counter", i);
         }
 

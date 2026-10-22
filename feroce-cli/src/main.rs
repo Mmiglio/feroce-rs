@@ -97,6 +97,9 @@ struct ReceiverOpts {
     /// Write per-tick, per-stream throughput rows to <PATH> as CSV.
     #[arg(long, value_name = "PATH")]
     stats_out: Option<PathBuf>,
+    /// Check that each message's immediate data is the previous one + 1
+    #[arg(long)]
+    check_imm: bool,
 }
 
 #[derive(Args)]
@@ -266,7 +269,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let dump = receiver_opts
                         .dump_file
                         .map(|path| GpuDumpFactory::new(path, rdma_opts.buf_size, device));
-                    recv::run(&cm_opts, &rdma_opts, allocator, dump, stats_out, log_buffer)?;
+                    recv::run(
+                        &cm_opts,
+                        &rdma_opts,
+                        allocator,
+                        dump,
+                        receiver_opts.check_imm,
+                        stats_out,
+                        log_buffer,
+                    )?;
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
@@ -282,6 +293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &rdma_opts,
                     CpuAllocator,
                     dump,
+                    receiver_opts.check_imm,
                     stats_out,
                     log_buffer,
                 )?;

@@ -100,12 +100,7 @@ fn poller_thread<A: BufferAllocator>(
     }
 
     // create all work completions
-    let mut wc_list = vec![
-        rdma::ibv_wc {
-            ..Default::default()
-        };
-        buffer_pool.num_buf()
-    ];
+    let mut wc_list = vec![rdma::ibv_wc::default(); buffer_pool.num_buf()];
 
     // keep track of free buffs (simulate channel)
     let mut free_bufs: Vec<usize> = (0..buffer_pool.num_buf()).collect();
@@ -115,6 +110,12 @@ fn poller_thread<A: BufferAllocator>(
         let idx = free_bufs.pop().unwrap();
         let mut buf_handle = buffer_pool.get_handle(idx);
         fill_buffer(send_posted, &mut buf_handle);
+        send_wr_list[idx] = QueuePair::build_send_wr(
+            idx as u64,
+            &mut sge_list[idx],
+            rdma::device::SendOp::SendWithImm(send_posted as u32),
+            true,
+        );
         qp.post_send(&mut send_wr_list[idx])?;
         send_posted += 1;
     }
@@ -176,6 +177,12 @@ fn poller_thread<A: BufferAllocator>(
             let idx = free_bufs.pop().unwrap();
             let mut buf_handle = buffer_pool.get_handle(idx);
             fill_buffer(send_posted, &mut buf_handle);
+            send_wr_list[idx] = QueuePair::build_send_wr(
+                idx as u64,
+                &mut sge_list[idx],
+                rdma::device::SendOp::SendWithImm(send_posted as u32),
+                true,
+            );
             qp.post_send(&mut send_wr_list[idx])?;
             send_posted += 1;
         }
