@@ -19,7 +19,7 @@ pub struct ibv_wc {
     pub opcode: ibv_wc_opcode,
     pub vendor_err: u32,
     pub byte_len: u32,
-    pub imm_data: u32,
+    pub(crate) imm_data: u32,
     pub qp_num: u32,
     pub src_qp: u32,
     pub wc_flags: ibv_wc_flags,
@@ -35,6 +35,16 @@ impl Default for ibv_wc {
     }
 }
 
+impl ibv_wc {
+    pub fn imm(&self) -> Option<u32> {
+        if self.wc_flags & ibv_wc_flags::IBV_WC_WITH_IMM != ibv_wc_flags(0) {
+            Some(u32::from_be(self.imm_data))
+        } else {
+            None
+        }
+    }
+}
+
 include!(concat!(env!("OUT_DIR"), "/ffi_generated.rs"));
 
 pub unsafe fn ibv_query_port_compact(
@@ -43,4 +53,28 @@ pub unsafe fn ibv_query_port_compact(
     port_attr: *mut ibv_port_attr,
 ) -> i32 {
     unsafe { ibv_query_port(context, port_num, port_attr as *mut _compat_ibv_port_attr) }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn wc_imm_decodes_network_order() {
+        let wc = ibv_wc {
+            wc_flags: ibv_wc_flags::IBV_WC_WITH_IMM,
+            imm_data: 0x12345678u32.to_be(),
+            ..Default::default()
+        };
+        assert_eq!(wc.imm(), Some(0x12345678));
+    }
+
+    #[test]
+    fn wc_imm_none_without_flag() {
+        let wc = ibv_wc {
+            imm_data: 0x12345678,
+            ..Default::default()
+        };
+        assert_eq!(wc.imm(), None);
+    }
 }

@@ -1,7 +1,7 @@
 use feroce::rdma;
 use feroce::rdma::buffer_pool::BufferAllocator;
 use feroce::{BufferPool, CompletionChannel, ConnectedRdmaEndpoint, QueuePair};
-use log::{debug, error};
+use log::{debug, error, info, warn};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,6 +13,7 @@ pub fn run<A, S>(
     rdma_opts: &RdmaOpts,
     allocator: A,
     dump_factory: Option<S>,
+    check_imm: bool,
     stats_out: Option<&Path>,
     log_buffer: LogBuffer,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -44,6 +45,7 @@ where
                         rdma_endpoint.comp_channel,
                         stats,
                         dump,
+                        check_imm,
                     ) {
                         error!("poller thread error: {}", e);
                     }
@@ -69,10 +71,16 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
     channel: Arc<CompletionChannel>,
     stats: Arc<StreamStats>,
     mut dump: Option<D>,
+    check_imm: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // metrics
     let mut total_bytes;
     let mut total_msgs;
+
+    // immediate sequence check
+    let mut expected_imm = None;
+    let mut imm_gaps = 0u64;
+    let mut no_imm = 0u64;
 
     // start by pre-building and pre-posting recv request
     let mut sge_list = Vec::<Vec<rdma::ibv_sge>>::new();
@@ -94,12 +102,7 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
     }
 
     // create all work completions
-    let mut wc_list = vec![
-        rdma::ibv_wc {
-            ..Default::default()
-        };
-        buffer_pool.num_buf()
-    ];
+    let mut wc_list = vec![rdma::ibv_wc::default(); buffer_pool.num_buf()];
 
     // request notification from completion channel for every event
     qp.recv_cq().req_notify_cq(false)?;
@@ -135,10 +138,29 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
             total_bytes += wce.byte_len as u64;
             total_msgs += 1;
 
+            if check_imm {
+                match wce.imm() {
+                    Some(imm) => {
+                        let exp = expected_imm;
+                        if let Some(delta) = check_imm_seq(&mut expected_imm, imm) {
+                            warn!(
+                                "stream {}: imm gap, expected {}, got {}, delta {}",
+                                stats.id,
+                                exp.unwrap(),
+                                imm,
+                                delta
+                            );
+                            imm_gaps += 1;
+                        }
+                    }
+                    None => no_imm += 1,
+                }
+            }
+
             // optional payload dump
             if let Some(dump) = dump.as_mut() {
                 let buf_handle = buffer_pool.get_handle(wce.wr_id as usize);
-                dump.record(buf_handle.addr, wce.byte_len as usize)?;
+                dump.record(buf_handle.addr, wce.byte_len, wce.imm().unwrap_or(0))?;
             }
 
             // immediately repost buffer
@@ -153,5 +175,21 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
             .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
+    if check_imm {
+        info!(
+            "stream {}: {} imm gaps, {} messages without imm",
+            stats.id, imm_gaps, no_imm
+        );
+    }
+
     Ok(())
+}
+
+fn check_imm_seq(expected: &mut Option<u32>, imm: u32) -> Option<i32> {
+    let delta = match *expected {
+        Some(exp) if imm != exp => Some(imm.wrapping_sub(exp) as i32),
+        _ => None,
+    };
+    *expected = Some(imm.wrapping_add(1));
+    delta
 }

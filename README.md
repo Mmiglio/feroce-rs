@@ -56,7 +56,11 @@ For GPUDirect, build with `--features gpu` and pass `--gpu` to the receiver (sen
       --buf-size 16384 --num-buf 128 --gpu
 ```
 
-To dump received payloads for inspection, pass `--dump-file <PATH>` to the receiver. With multiple streams each stream writes to `<stem>.NNN.<ext>`. Works for both CPU and GPU receive paths; intended for debugging, not high-rate runs.
+To dump received payloads for inspection, pass `--dump-file <PATH>` to the receiver. With multiple streams each stream writes to `<stem>.NNN.<ext>`. Works for both CPU and GPU receive paths (intended for debugging, not high-rate runs).
+Each record in the dump starts with a 16-byte little-endian header followed by the payload: message index (`u64`, counted by the receiver per stream from 0), immediate data (`u32`, 0 if the message had none) and payload length (`u32`, number of bytes received).
+
+Pass `--check-imm` to the receiver to verify that each message's immediate data is the previous one + 1 (wrapping at `u32::MAX`). In this mode, a warning is logged for each gap.
+
 
 See all available options with:
 
