@@ -200,6 +200,48 @@ mod rdma_tests {
         assert_dump(&dump_path, &receiver);
     }
 
+    // Two streams, plus the counters --check-imm registers on the stream's metric
+    // group from the app side. They must reach the summary without the runtime
+    // knowing about them.
+    #[test]
+    fn loopback_multi_stream_with_imm_check() {
+        let streams = [
+            "--num-streams",
+            "2",
+            "--buf-size",
+            BUF_SIZE,
+            "--num-buf",
+            NUM_BUF,
+        ];
+
+        let receiver = run_loopback(
+            &[&streams[..], &["--check-imm"]].concat(),
+            &[&streams[..], &["--num-msgs", NUM_MSGS]].concat(),
+        );
+
+        // Per-tick rows look the same, so take the line from each summary block
+        // instead of grepping the whole output.
+        let stdout = String::from_utf8_lossy(&receiver.stdout);
+        let summaries: Vec<&str> = stdout
+            .split("[Done] Summary:")
+            .skip(1)
+            .filter_map(|block| block.lines().find(|l| l.starts_with("stream=")))
+            .collect();
+
+        assert_eq!(
+            summaries.len(),
+            2,
+            "expected one summary per stream:\n{stdout}"
+        );
+        for line in &summaries {
+            assert!(line.contains(&format!("messages {NUM_MSGS} (")), "{line}");
+            assert!(line.contains("imm_gaps 0"), "{line}");
+            assert!(line.contains("no_imm 0"), "{line}");
+        }
+        assert!(summaries.iter().any(|l| l.contains("stream=0")), "{stdout}");
+        assert!(summaries.iter().any(|l| l.contains("stream=1")), "{stdout}");
+    }
+
     #[test]
     #[cfg(feature = "gpu")]
     fn loopback_gpu_direct() {

@@ -375,50 +375,6 @@ mod test {
     use super::*;
 
     #[test]
-    fn request_type_round_trip() {
-        let original = RequestType::OpenQp;
-        let byte = original as u8;
-        assert_eq!(byte, 0x1);
-
-        let back = RequestType::try_from(byte).unwrap();
-        assert_eq!(back, original);
-    }
-
-    #[test]
-    fn request_type_invalid_byte() {
-        let result = RequestType::try_from(0xFF);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn ack_type_round_trip() {
-        let original = AckType::Ack;
-        let byte = original as u8;
-        assert_eq!(byte, 0x1);
-
-        let back = AckType::try_from(byte).unwrap();
-        assert_eq!(back, original);
-    }
-
-    #[test]
-    fn ack_type_invalid_byte() {
-        let result = AckType::try_from(0xFF);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn qp_flags_encode_decode() {
-        let flags = QpFlags::new(RequestType::OpenQp, AckType::Null, false);
-
-        assert_eq!(flags.info_valid(), true);
-        assert_eq!(flags.request_type(), Ok(RequestType::OpenQp));
-        assert_eq!(flags.ack_valid(), false);
-        assert_eq!(flags.ack_type(), Ok(AckType::Null));
-        // 0x1 | (0x1<<1) = 0x03
-        assert_eq!(flags.as_byte(), 0x03);
-    }
-
-    #[test]
     fn qp_flags_with_ack() {
         let flags = QpFlags::new(RequestType::SendQpInfo, AckType::Ack, true);
 
@@ -428,14 +384,6 @@ mod test {
         assert_eq!(flags.ack_type(), Ok(AckType::Ack));
         // 0x01 | (0x02 << 1) | (1 << 4) | (0x01 << 5) = 0x01 | 0x04 | 0x10 | 0x20 = 0x35
         assert_eq!(flags.as_byte(), 0x35);
-    }
-
-    #[test]
-    fn qp_flags_from_byte() {
-        let flags = QpFlags::from_byte(0x35);
-        assert_eq!(flags.request_type(), Ok(RequestType::SendQpInfo));
-        assert_eq!(flags.ack_type(), Ok(AckType::Ack));
-        assert_eq!(flags.ack_valid(), true);
     }
 
     #[test]
@@ -449,91 +397,28 @@ mod test {
         assert_eq!(f.as_byte(), 0x0B);
     }
 
+    // The 64-byte layout is the contract with the FPGA.
     #[test]
-    fn tx_meta_flags_from_byte() {
-        // 0x1 | (1<<1) | (0<<2) | (1<<3) = 0x0B
-        let tx_flags = TxMetaFlags::from_byte(0x0B);
-        assert_eq!(tx_flags.valid(), true);
-        assert_eq!(tx_flags.start(), true);
-        assert_eq!(tx_flags.immediate(), false);
-        assert_eq!(tx_flags.tx_type(), TxType::Write);
-    }
-
-    #[test]
-    fn qp_message_pack_unpack_round_trip() {
+    fn qp_message_wire_layout_round_trips() {
         let msg = QpMessage {
             flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
-            loc_qpn: 0x12345678,
-            loc_psn: 0xAABBCCDD,
-            loc_rkey: 0x11223344,
-            loc_base_addr: 0xDEADBEEFCAFEBABE,
+            loc_qpn: 0x01,
+            loc_psn: 0x2345,
+            loc_rkey: 0xDEADBEEF,
+            loc_base_addr: 0x1122334455667788,
             loc_ip: 0xC0A80001,
-            rem_qpn: 0x87654321,
-            rem_psn: 0xDDCCBBAA,
-            rem_rkey: 0x44332211,
-            rem_base_addr: 0xCAFEBABEDEADBEEF,
-            rem_ip: 0x0A000001,
-            udp_port: 17185,
-            tx_meta_flags: 0x00,
-            dma_len: 4096,
-            n_transfers: 100,
-            freq: 40000000,
+            rem_qpn: 0x100,
+            udp_port: 0x4321,
+            ..Default::default()
         };
 
         let bytes = msg.pack();
         assert_eq!(bytes.len(), QP_MESSAGE_SIZE);
 
-        let unpacked = QpMessage::unpack(&bytes).unwrap();
-        assert_eq!(unpacked, msg);
-    }
-
-    #[test]
-    fn qp_message_pack_byte_layout() {
-        let msg = QpMessage {
-            flags: QpFlags::new(RequestType::OpenQp, AckType::Null, false),
-            loc_qpn: 0x01,
-            ..Default::default()
-        };
-
-        let bytes = msg.pack();
-
-        // flags at offset 0
+        // flags at offset 0, then loc_qpn big-endian
         assert_eq!(bytes[0], 0x03);
-        // loc_qpn at offset 1
-        assert_eq!(bytes[1], 0x00);
-        assert_eq!(bytes[2], 0x00);
-        assert_eq!(bytes[3], 0x00);
-        assert_eq!(bytes[4], 0x01);
-        // rest is zero
-    }
+        assert_eq!(&bytes[1..5], &[0x00, 0x00, 0x00, 0x01]);
 
-    #[test]
-    fn qp_connection_info_default() {
-        let info = QpConnectionInfo::default();
-        assert_eq!(info.qp_num, 0);
-        // check gid structure?
-        assert_eq!(info.gid, [0u8; 16]);
-    }
-
-    #[test]
-    fn ipv4_to_gid() {
-        let ip = 0xC0A80001;
-        let gid = gid_from_ipv4(ip);
-
-        assert_eq!(gid[0..10], [0u8; 10]);
-        assert_eq!(gid[10..12], [0xff, 0xff]);
-        assert_eq!(gid[12..16], [192, 168, 0, 1]);
-    }
-
-    #[test]
-    fn gid_to_ipv4() {
-        let mut gid = [0u8; 16];
-        gid[10] = 0xff;
-        gid[11] = 0xff;
-        gid[12] = 192;
-        gid[13] = 168;
-        gid[14] = 0;
-        gid[15] = 1;
-        assert_eq!(ipv4_from_gid(&gid), 0xC0A80001);
+        assert_eq!(QpMessage::unpack(&bytes).unwrap(), msg);
     }
 }

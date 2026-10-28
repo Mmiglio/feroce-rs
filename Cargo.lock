@@ -498,9 +498,18 @@ dependencies = [
  "clap",
  "env_logger",
  "feroce",
+ "feroce-runtime",
  "log",
  "ratatui",
  "signal-hook 0.4.3",
+]
+
+[[package]]
+name = "feroce-runtime"
+version = "0.1.0"
+dependencies = [
+ "feroce",
+ "log",
 ]
 
 [[package]]

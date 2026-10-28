@@ -8,7 +8,9 @@ use feroce::rdma::buffer_pool::{BufferAllocator, CpuAllocator};
 use feroce::{BufferHandle, BufferPool, CompletionChannel, ConnectedRdmaEndpoint, QueuePair};
 use log::{debug, error};
 
-use crate::{CmOpts, LogBuffer, RdmaOpts, SenderOpts, common::run_session, stats::StreamStats};
+use feroce_runtime::StreamMetrics;
+
+use crate::{CmOpts, LogBuffer, RdmaOpts, SenderOpts, common::run_session};
 
 pub fn run(
     cm_opts: &CmOpts,
@@ -18,33 +20,25 @@ pub fn run(
     log_buffer: LogBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // spawn poller closure
-    let spawn_poller =
-        |rdma_endpoint: ConnectedRdmaEndpoint<CpuAllocator>, stream_id: u32, remote_qpn: u32| {
-            let stats = Arc::new(StreamStats::new(
-                stream_id,
-                rdma_endpoint.qp.qp_num(),
-                remote_qpn,
-            ));
-
-            let handle = std::thread::spawn({
-                let num_msgs = send_opts.num_msgs;
-                let qp = Arc::clone(&rdma_endpoint.qp);
-                let stats = Arc::clone(&stats);
-                move || {
-                    if let Err(e) = poller_thread(
-                        qp,
-                        rdma_endpoint.buffer_pool,
-                        rdma_endpoint.comp_channel,
-                        stats,
-                        num_msgs,
-                    ) {
-                        error!("poller thread error: {}", e);
-                    }
+    let spawn_poller = |rdma_endpoint: ConnectedRdmaEndpoint<CpuAllocator>,
+                        _stream_id: u32,
+                        metrics: StreamMetrics| {
+        std::thread::spawn({
+            let num_msgs = send_opts.num_msgs;
+            let qp = Arc::clone(&rdma_endpoint.qp);
+            move || {
+                if let Err(e) = poller_thread(
+                    qp,
+                    rdma_endpoint.buffer_pool,
+                    rdma_endpoint.comp_channel,
+                    metrics,
+                    num_msgs,
+                ) {
+                    error!("poller thread error: {}", e);
                 }
-            });
-
-            (handle, stats)
-        };
+            }
+        })
+    };
 
     run_session(
         cm_opts,
@@ -60,7 +54,7 @@ fn poller_thread<A: BufferAllocator>(
     qp: Arc<QueuePair>,
     buffer_pool: BufferPool<A>,
     channel: Arc<CompletionChannel>,
-    stats: Arc<StreamStats>,
+    metrics: StreamMetrics,
     num_msgs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // TODO: Remove this
@@ -165,12 +159,8 @@ fn poller_thread<A: BufferAllocator>(
             }
         }
 
-        stats
-            .messages
-            .fetch_add(total_msgs, std::sync::atomic::Ordering::Relaxed);
-        stats
-            .bytes
-            .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
+        metrics.messages.add(total_msgs);
+        metrics.bytes.add(total_bytes);
 
         // Repost the free buffers and check if the worker is still connected.
         while !free_bufs.is_empty() && send_posted < num_msgs {

@@ -2,8 +2,9 @@
 
 Rust library and CLI for the [FERoCE](https://github.com/Gabriele-bot/100G-verilog-RoCEv2-lite) (Front-End RoCE) FPGA network stack.
 
-This Cargo workspace contains two crates:
+This Cargo workspace contains three crates:
 - **feroce**: library implementing the connection manager (CM) protocol, RDMA data path, and GPU bindings.
+- **feroce-runtime**: session runtime on top of `feroce` — CM event loop, QP/stream lifecycle, and metrics. This is the layer an application builds on; it pulls in no CLI, TUI or signal-handling dependencies.
 - **feroce-cli**: sender/receiver application for testing and benchmarking.
 
 > **Note:** The primary use case is receiving data from the FERoCE FPGA (RX path).
@@ -11,7 +12,8 @@ This Cargo workspace contains two crates:
 
 ### Requirements
 
-- Rust 1.93+
+- Rust 1.97.1 (developed and tested). The crates use edition 2024, so cargo 1.85 is the hard
+  minimum; older toolchains fail with `this version of Cargo is older than the 2024 edition`.
 - `libibverbs-dev`, `rdma-core`, `clang` (for bindgen)
 - An RDMA-capable NIC (RoCE v2) for hardware tests
 - NVIDIA GPU + CUDA toolkit (optional, for GPUDirect support)
@@ -68,6 +70,30 @@ See all available options with:
 ./target/release/feroce-cli recv --help
 ./target/release/feroce-cli send --help
 ```
+
+## Monitoring
+
+Each stream owns a `MetricGroup` (`feroce-runtime`) labelled with its stream id
+and QP numbers. `--stats-out <PATH>` writes a CSV row per stream per second:
+
+```
+t_s,interval_s,stream,qpn,remote_qpn,messages,messages_rate,bytes,bytes_rate
+1.009245,1.005231,0,300,299,27174,26000.542228,222609408,212996441.932864
+```
+
+CSV columns are derived from the metrics each stream registered, so a new
+counter needs no change to the writer. The TUI deliberately shows only
+`messages` and `bytes`; anything worth attention while running, such as an
+immediate-data gap, is logged as a warning. An application registers its own
+counters on the group it is handed:
+
+```rust
+let dropped = metrics.group.register("dropped");
+dropped.inc();
+```
+
+Register before the stream starts running, since the first tick fixes the CSV
+columns. The link rate is `bytes_rate * 8 / 1e9` Gbit/s.
 
 ## TUI dashboard
 
