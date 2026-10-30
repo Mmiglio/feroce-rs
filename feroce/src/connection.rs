@@ -506,6 +506,7 @@ impl ConnectionManager {
         &mut self,
         remote_addr: SocketAddr,
         local_info: &QpConnectionInfo,
+        remote_qpn: u32,
         request_timeout: Duration,
         max_retries: u8,
     ) -> Result<QpConnectionInfo, FeroceError> {
@@ -516,13 +517,14 @@ impl ConnectionManager {
             loc_rkey: local_info.rkey,
             loc_base_addr: local_info.addr,
             loc_ip: ipv4_from_gid(&local_info.gid),
+            rem_qpn: remote_qpn,
             udp_port: self.cm_port()?,
             ..Default::default()
         };
 
         info!(
-            "Sending OpenQP to {}, local QPN={}",
-            remote_addr, local_info.qp_num
+            "Sending OpenQP to {}, local QPN={}, requested remote QPN={}",
+            remote_addr, local_info.qp_num, remote_qpn
         );
 
         let validate_ack = |reply: &QpMessage| -> bool {
@@ -531,6 +533,7 @@ impl ConnectionManager {
                 && (reply.flags.ack_valid())
                 && (reply.rem_qpn == local_info.qp_num)
                 && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
+                && (remote_qpn == 0 || reply.loc_qpn == remote_qpn)
         };
         let reply_qp_message = Self::send_and_wait_for_ack(
             &self.socket,
@@ -902,7 +905,7 @@ mod test {
         let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
         let dead_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), dead_port);
 
-        let res = cm.connect(dead_addr, &sender_info, Duration::from_millis(50), 1);
+        let res = cm.connect(dead_addr, &sender_info, 0, Duration::from_millis(50), 1);
 
         assert!(res.is_err(), "expected connect to fail, got {:?}", res);
         assert!(
@@ -910,6 +913,39 @@ mod test {
             "no QP should be registered after a failed connect, found {} entries",
             cm.qps.len()
         );
+    }
+
+    #[test]
+    fn connect_requests_specific_remote_qpn() {
+        let (sender_info, mut peer_info) = make_test_infos();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let peer_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            // first ACK carries the wrong QPN and must be ignored
+            for qpn in [257, 256] {
+                let (_, from) = peer.recv_from(&mut buf).unwrap();
+                let req = QpMessage::unpack(&buf).unwrap();
+                assert_eq!(req.rem_qpn, 256);
+                peer_info.qp_num = qpn;
+                let ack = build_qp_message(
+                    QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
+                    &peer_info,
+                    &sender_info,
+                    peer_addr.port(),
+                );
+                peer.send_to(&ack.pack(), from).unwrap();
+            }
+        });
+
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let remote_info = cm
+            .connect(peer_addr, &sender_info, 256, Duration::from_millis(500), 2)
+            .unwrap();
+        peer_handle.join().unwrap();
+
+        assert_eq!(remote_info.qp_num, 256);
     }
 
     #[test]
@@ -1297,6 +1333,7 @@ mod test {
                 .connect(
                     SocketAddr::new("127.0.0.1".parse().unwrap(), receiver_cm_port),
                     &sender_info,
+                    0,
                     Duration::from_millis(500),
                     2,
                 )

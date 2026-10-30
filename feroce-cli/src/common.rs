@@ -39,6 +39,7 @@ fn session_config(
         cm_port: cm_opts.cm_port,
         remote,
         num_streams: cm_opts.num_streams,
+        remote_qpns: cm_opts.remote_qpn.clone(),
         active: cm_opts.active,
         rdma_device: rdma_opts.rdma_device.clone(),
         port_num: rdma_opts.port_num,

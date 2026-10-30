@@ -45,6 +45,9 @@ struct CmOpts {
     /// Number of data streams (=QPs)
     #[arg(long, default_value = "1")]
     num_streams: u32,
+    /// Remote QPNs to request with --active, one per stream (e.g. 256,257,0), 0 = any
+    #[arg(long, value_delimiter = ',', value_parser = parse_hex_u32)]
+    remote_qpn: Vec<u32>,
     /// Role of the CM: active side initiates the connection process, passive waits
     #[arg(long)]
     active: bool,

@@ -24,6 +24,8 @@ pub struct SessionConfig {
     /// Required on the active side, ignored on the passive one.
     pub remote: Option<SocketAddr>,
     pub num_streams: u32,
+    /// Active side only: remote QPN to request per stream, 0 = any. Empty = any for all.
+    pub remote_qpns: Vec<u32>,
     pub active: bool,
 
     pub rdma_device: String,
@@ -60,6 +62,15 @@ where
     let active = cfg.active;
     let num_streams = cfg.num_streams;
     let remote = cfg.remote;
+
+    if !cfg.remote_qpns.is_empty() && cfg.remote_qpns.len() != num_streams as usize {
+        return Err(format!(
+            "{} remote QPNs given for {} streams",
+            cfg.remote_qpns.len(),
+            num_streams
+        )
+        .into());
+    }
 
     let mut runner = SessionRunner::new(
         cfg,
@@ -147,14 +158,19 @@ where
         remote_addr: SocketAddr,
         num_streams: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        for _ in 0..num_streams {
+        for i in 0..num_streams as usize {
             let prepared =
                 setup_endpoint(&self.device, self.link, &self.cfg.rdma, &self.allocator)?;
 
             // connection request to remote side (uses our local_info, no QP transition yet)
-            let remote_info =
-                self.cm
-                    .connect(remote_addr, &prepared.local_info, Duration::from_secs(2), 2)?;
+            let remote_qpn = self.cfg.remote_qpns.get(i).copied().unwrap_or(0);
+            let remote_info = self.cm.connect(
+                remote_addr,
+                &prepared.local_info,
+                remote_qpn,
+                Duration::from_secs(2),
+                2,
+            )?;
 
             // RTR + RTS with the remote info
             let connected = connect_endpoint(prepared, &remote_info)?;
