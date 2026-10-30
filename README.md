@@ -108,7 +108,7 @@ Configure and trigger the firmware data generator:
 ```bash
 ./target/release/feroce-cli ctrl \
       --remote-addr 22.1.212.10 --remote-port 0x4321 \
-      tx-meta --rem-qpn 0x100 --length 16384 --n-transfers 10000
+      tx-meta --remote-qpn 0x100 --length 16384 --n-transfers 10000
 ```
 
 ### Close a remote QP (`close-qp`)
@@ -116,7 +116,7 @@ Configure and trigger the firmware data generator:
 ```bash
 ./target/release/feroce-cli ctrl \
       --remote-addr 22.1.212.10 --remote-port 0x4321 \
-      close-qp --rem-qpn 256
+      close-qp --remote-qpn 256
 ```
 
 On success the log shows `CloseQP acknowledged`.

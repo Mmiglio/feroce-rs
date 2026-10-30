@@ -125,7 +125,7 @@ struct CtrlOpts {
 struct TxMetaOpts {
     /// remote QP number
     #[arg(long, default_value = "0x100", value_parser = parse_hex_u32)]
-    rem_qpn: u32,
+    remote_qpn: u32,
     /// message size in bytes
     #[arg(long, default_value = "4096")]
     length: u32,
@@ -150,7 +150,7 @@ struct TxMetaOpts {
 struct CloseQpOpts {
     /// remote QP number to close
     #[arg(long, value_parser = parse_hex_u32)]
-    rem_qpn: u32,
+    remote_qpn: u32,
     /// per-attempt reply timeout
     #[arg(long, default_value = "1000")]
     timeout_ms: u64,

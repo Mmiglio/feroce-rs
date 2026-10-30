@@ -21,10 +21,10 @@ use crate::metrics::{GroupSample, StreamMetrics};
 pub struct SessionConfig {
     pub bind_addr: IpAddr,
     pub cm_port: u16,
-    /// Required on the active side, ignored on the passive one.
+    // required on the active side, ignored on the passive one
     pub remote: Option<SocketAddr>,
     pub num_streams: u32,
-    /// Active side only: remote QPN to request per stream, 0 = any. Empty = any for all.
+    // active side only, one per stream; 0 = any, empty = any for all
     pub remote_qpns: Vec<u32>,
     pub active: bool,
 

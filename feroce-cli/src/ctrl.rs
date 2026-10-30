@@ -31,7 +31,7 @@ pub fn build_txmeta_message(opts: &TxMetaOpts) -> QpMessage {
         loc_rkey: 0,
         loc_base_addr: 0,
         loc_ip: 0,
-        rem_qpn: opts.rem_qpn,
+        rem_qpn: opts.remote_qpn,
         rem_psn: 0,
         rem_rkey: 0,
         rem_base_addr: 0,
@@ -68,7 +68,7 @@ pub fn run_txmeta(
 pub fn build_close_qp_message(opts: &CloseQpOpts, loc_ip: u32, reply_udp_port: u16) -> QpMessage {
     QpMessage {
         flags: QpFlags::new(RequestType::CloseQp, AckType::Null, false),
-        rem_qpn: opts.rem_qpn,
+        rem_qpn: opts.remote_qpn,
         loc_ip,
         udp_port: reply_udp_port,
         ..Default::default()
@@ -94,7 +94,7 @@ pub fn run_close_qp(
 
     while retries_left > 0 {
         socket.send_to(&msg.pack(), dest)?;
-        info!("Sent CloseQP to {dest}, rem_qpn={:#x}", opts.rem_qpn);
+        info!("Sent CloseQP to {dest}, rem_qpn={:#x}", opts.remote_qpn);
 
         match socket.recv_from(&mut buf) {
             Ok((_n, peer_addr)) => {
@@ -108,7 +108,7 @@ pub fn run_close_qp(
                 if reply.flags.ack_valid() {
                     match reply.flags.ack_type() {
                         Ok(AckType::NoQp) => {
-                            warn!("Peer has no matching QP (rem_qpn={:#x})", opts.rem_qpn);
+                            warn!("Peer has no matching QP (rem_qpn={:#x})", opts.remote_qpn);
                             return Err("Peer rejected: no matching QP".into());
                         }
                         Ok(AckType::AckError) => {

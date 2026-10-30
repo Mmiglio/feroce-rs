@@ -50,7 +50,6 @@ impl Metric {
     }
 }
 
-/// Metrics sharing a label set, one group per stream.
 #[derive(Debug)]
 pub struct MetricGroup {
     labels: Vec<(&'static str, String)>,
@@ -121,7 +120,7 @@ pub struct MetricSample {
     pub rate: f64,
 }
 
-/// Labels and metrics keep registration order.
+// labels and metrics keep registration order
 #[derive(Debug, Clone)]
 pub struct GroupSample {
     pub labels: Vec<(&'static str, String)>,
