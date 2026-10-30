@@ -486,8 +486,11 @@ impl ConnectionManager {
             } else {
                 retry_left -= 1;
                 warn!(
-                    "Received unexpected reply (flags={:#x}, loc_qpn={}, rem_qpn={}, rem_ip={:#x}), {} retries left",
+                    "Received unexpected reply (flags={:#x}: req={:?} ack={:?} ack_valid={}, loc_qpn={}, rem_qpn={}, rem_ip={:#x}), {} retries left",
                     reply_qp_message.flags.as_byte(),
+                    reply_qp_message.flags.request_type(),
+                    reply_qp_message.flags.ack_type(),
+                    reply_qp_message.flags.ack_valid(),
                     reply_qp_message.loc_qpn,
                     reply_qp_message.rem_qpn,
                     reply_qp_message.rem_ip,
@@ -533,7 +536,6 @@ impl ConnectionManager {
                 && (reply.flags.ack_valid())
                 && (reply.rem_qpn == local_info.qp_num)
                 && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
-                && (remote_qpn == 0 || reply.loc_qpn == remote_qpn)
         };
         let reply_qp_message = Self::send_and_wait_for_ack(
             &self.socket,
@@ -569,6 +571,20 @@ impl ConnectionManager {
             "Local QP {} connected to remote QP {}",
             local_info.qp_num, remote_info.qp_num
         );
+
+        // the peer already counts the QP as open, so close it before failing
+        if remote_qpn != 0 && remote_info.qp_num != remote_qpn {
+            if let Err(e) = self.close_qp(local_info.qp_num, request_timeout, max_retries) {
+                warn!(
+                    "Failed to close unrequested remote QP {}: {e}",
+                    remote_info.qp_num
+                );
+            }
+            return Err(FeroceError::Protocol(format!(
+                "requested remote QP {} but peer gave QP {}",
+                remote_qpn, remote_info.qp_num
+            )));
+        }
 
         Ok(remote_info)
     }
@@ -916,21 +932,22 @@ mod test {
     }
 
     #[test]
-    fn connect_requests_specific_remote_qpn() {
+    fn connect_closes_unrequested_remote_qpn() {
         let (sender_info, mut peer_info) = make_test_infos();
         let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
         let peer_addr = peer.local_addr().unwrap();
 
+        // peer ignores the requested QPN, then must receive a CloseQp for the one it gave
         let peer_handle = thread::spawn(move || {
             let mut buf = [0u8; 1024];
-            // first ACK carries the wrong QPN and must be ignored
-            for qpn in [257, 256] {
+            peer_info.qp_num = 1031;
+            for (req, rem_qpn) in [(RequestType::OpenQp, 256), (RequestType::CloseQp, 1031)] {
                 let (_, from) = peer.recv_from(&mut buf).unwrap();
-                let req = QpMessage::unpack(&buf).unwrap();
-                assert_eq!(req.rem_qpn, 256);
-                peer_info.qp_num = qpn;
+                let msg = QpMessage::unpack(&buf).unwrap();
+                assert_eq!(msg.flags.request_type(), Ok(req));
+                assert_eq!(msg.rem_qpn, rem_qpn);
                 let ack = build_qp_message(
-                    QpFlags::new(RequestType::OpenQp, AckType::Ack, true),
+                    QpFlags::new(req, AckType::Ack, true),
                     &peer_info,
                     &sender_info,
                     peer_addr.port(),
@@ -940,12 +957,15 @@ mod test {
         });
 
         let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
-        let remote_info = cm
-            .connect(peer_addr, &sender_info, 256, Duration::from_millis(500), 2)
-            .unwrap();
+        let res = cm.connect(peer_addr, &sender_info, 256, Duration::from_millis(500), 2);
         peer_handle.join().unwrap();
 
-        assert_eq!(remote_info.qp_num, 256);
+        assert!(
+            matches!(res, Err(FeroceError::Protocol(_))),
+            "got {:?}",
+            res
+        );
+        assert!(cm.qps.is_empty());
     }
 
     #[test]
