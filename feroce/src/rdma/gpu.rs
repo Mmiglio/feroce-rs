@@ -97,33 +97,40 @@ impl Drop for CudaContext {
 }
 
 pub struct GpuBuffer {
+    allocation: CUdeviceptr,
     dptr: CUdeviceptr,
     size: usize,
     dmabuf_fd: i32,
 }
 
+fn page_size() -> Result<usize, FeroceError> {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        return Err(FeroceError::Cuda {
+            call: "sysconf(_SC_PAGESIZE)",
+            code: -1,
+        });
+    }
+    Ok(page as usize)
+}
+
 impl GpuBuffer {
     pub fn alloc(size: usize) -> Result<Self, FeroceError> {
-        // allign to page size
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page_size <= 0 {
-            return Err(FeroceError::Cuda {
-                call: "sysconf(_SC_PAGESIZE)",
-                code: -1,
-            });
-        }
-        let page_size = page_size as usize;
-        let alligned_size = size.next_multiple_of(page_size);
+        let page = page_size()?;
+        let alligned_size = size.next_multiple_of(page);
         if size != alligned_size {
             warn!(
-                "Requested buffer size {} is not alligned with page size {}, allocating {} bytes",
-                size, page_size, alligned_size
+                "Requested buffer size {} is not a multiple of the {} byte page, allocating {} bytes",
+                size, page, alligned_size
             );
         }
 
-        let mut dptr = 0;
-        let mut res = unsafe { cuMemAlloc_v2(&mut dptr, alligned_size) };
+        // the dmabuf export needs a page aligned base and cuMemAlloc only promises 256
+        // bytes, so take one page more and align inside it (truncation in the data if not like this)
+        let mut allocation = 0;
+        let mut res = unsafe { cuMemAlloc_v2(&mut allocation, alligned_size + page) };
         check_cuda(res, "cuMemAlloc_v2")?;
+        let dptr = (allocation as usize).next_multiple_of(page) as CUdeviceptr;
 
         let mut dmabuf_fd = 0;
         res = unsafe {
@@ -138,6 +145,7 @@ impl GpuBuffer {
         check_cuda(res, "cuMemGetHandleForAddressRange")?;
 
         Ok(GpuBuffer {
+            allocation,
             dptr,
             size: alligned_size,
             dmabuf_fd,
@@ -147,7 +155,7 @@ impl GpuBuffer {
 
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
-        let res = unsafe { cuMemFree_v2(self.dptr) };
+        let res = unsafe { cuMemFree_v2(self.allocation) };
         if res != CUDA_SUCCESS {
             error!("cuMemFree_v2 failed: code={}", res);
         }
