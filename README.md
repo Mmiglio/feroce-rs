@@ -49,6 +49,8 @@ Then the sender (active side, initiates the connection):
       --num-msgs 100000
 ```
 
+The active side can request specific remote QP numbers with `--remote-qpn`, one per stream (`--remote-qpn 0x100,0x101`, 0 = any); without it the peer chooses.
+
 For GPUDirect, build with `--features gpu` and pass `--gpu` to the receiver (sender settings stay the same). `--gpu` uses CUDA device 0; pass `--gpu <ID>` to select another:
 
 ```bash
