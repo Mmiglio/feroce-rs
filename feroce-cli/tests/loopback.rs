@@ -225,7 +225,7 @@ mod rdma_tests {
         let summaries: Vec<&str> = stdout
             .split("[Done] Summary:")
             .skip(1)
-            .filter_map(|block| block.lines().find(|l| l.starts_with("stream=")))
+            .filter_map(|block| block.lines().find(|l| l.contains("stream=")))
             .collect();
 
         assert_eq!(
