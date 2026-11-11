@@ -8,7 +8,7 @@ use std::{
 
 use feroce::rdma::buffer_pool::BufferAllocator;
 use feroce::{ConnectedRdmaEndpoint, RdmaConfig};
-use feroce_runtime::{Monitor, OnStreamClosed, SessionConfig, StreamMetrics};
+use feroce_runtime::{Monitor, OnStreamClosed, Peers, SessionConfig, StreamMetrics, StreamSpec};
 use log::warn;
 
 #[cfg(feature = "tui")]
@@ -21,26 +21,44 @@ use crate::{
     stats::{StatsCsvWriter, print_sample, print_summary},
 };
 
+fn peers(cm_opts: &CmOpts) -> Result<Peers, Box<dyn std::error::Error>> {
+    if !cm_opts.active {
+        return Ok(Peers::Passive(cm_opts.num_streams));
+    }
+
+    let remote = SocketAddr::new(
+        cm_opts.remote_addr.ok_or("--remote-addr required")?,
+        cm_opts.remote_port.ok_or("--remote-port required")?,
+    );
+    let qpns = &cm_opts.remote_qpn;
+    if !qpns.is_empty() && qpns.len() != cm_opts.num_streams as usize {
+        return Err(format!(
+            "{} remote QPNs given for {} streams",
+            qpns.len(),
+            cm_opts.num_streams
+        )
+        .into());
+    }
+
+    Ok(Peers::Active(
+        (0..cm_opts.num_streams)
+            .map(|i| StreamSpec {
+                name: format!("stream-{i}"),
+                remote,
+                remote_qpn: qpns.get(i as usize).copied().unwrap_or(0),
+            })
+            .collect(),
+    ))
+}
+
 fn session_config(
     cm_opts: &CmOpts,
     rdma_opts: &RdmaOpts,
 ) -> Result<SessionConfig, Box<dyn std::error::Error>> {
-    let remote = if cm_opts.active {
-        Some(SocketAddr::new(
-            cm_opts.remote_addr.ok_or("--remote-addr required")?,
-            cm_opts.remote_port.ok_or("--remote-port required")?,
-        ))
-    } else {
-        None
-    };
-
     Ok(SessionConfig {
         bind_addr: cm_opts.bind_addr,
         cm_port: cm_opts.cm_port,
-        remote,
-        num_streams: cm_opts.num_streams,
-        remote_qpns: cm_opts.remote_qpn.clone(),
-        active: cm_opts.active,
+        peers: peers(cm_opts)?,
         rdma_device: rdma_opts.rdma_device.clone(),
         port_num: rdma_opts.port_num,
         gid_index: rdma_opts.gid_index as u8,

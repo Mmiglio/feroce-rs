@@ -141,8 +141,9 @@ pub struct StreamMetrics {
 }
 
 impl StreamMetrics {
-    pub fn new(stream_id: u32, qpn: u32, remote_qpn: u32) -> Self {
+    pub fn new(name: &str, stream_id: u32, qpn: u32, remote_qpn: u32) -> Self {
         let group = Arc::new(MetricGroup::new(vec![
+            ("name", name.to_string()),
             ("stream", stream_id.to_string()),
             ("qpn", qpn.to_string()),
             ("remote_qpn", remote_qpn.to_string()),
@@ -163,7 +164,7 @@ mod tests {
 
     #[test]
     fn sample_rates_over_the_interval_and_advances_the_baseline() {
-        let m = StreamMetrics::new(0, 0x100, 0x200);
+        let m = StreamMetrics::new("s", 0, 0x100, 0x200);
 
         m.messages.add(100);
         let a = m.group.sample(Duration::from_secs(1));
@@ -180,7 +181,7 @@ mod tests {
 
     #[test]
     fn sample_total_averages_over_the_run_and_keeps_the_tick_baseline() {
-        let m = StreamMetrics::new(0, 0x100, 0x200);
+        let m = StreamMetrics::new("s", 0, 0x100, 0x200);
 
         m.messages.add(100);
         m.messages.sample(Duration::from_secs(1));

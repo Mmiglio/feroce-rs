@@ -80,6 +80,9 @@ struct SenderOpts {
     /// Enable TUI dashboard (requires building with --features tui)
     #[arg(long)]
     tui: bool,
+    /// TUI log file, default feroce.log in the working directory
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
     /// Write per-tick, per-stream throughput rows to <PATH> as CSV.
     #[arg(long, value_name = "PATH")]
     stats_out: Option<PathBuf>,
@@ -93,6 +96,9 @@ struct ReceiverOpts {
     /// Enable TUI dashboard (requires building with --features tui)
     #[arg(long)]
     tui: bool,
+    /// TUI log file, default feroce.log in the working directory
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
     /// Dump received payloads to <PATH> for debugging. With --num-streams > 1 each
     /// stream writes to <stem>.NNN.<ext>
     #[arg(long, value_name = "PATH")]
@@ -209,16 +215,16 @@ fn parse_hex_u32(s: &str) -> Result<u32, String> {
     }
 }
 
-fn init_logging(tui: bool) -> Result<LogBuffer, Box<dyn std::error::Error>> {
+fn init_logging(
+    tui: bool,
+    #[cfg_attr(not(feature = "tui"), allow(unused_variables))] log_file: Option<&std::path::Path>,
+) -> Result<LogBuffer, Box<dyn std::error::Error>> {
     #[cfg(feature = "tui")]
     if tui {
-        use std::env;
+        let default = PathBuf::from("feroce.log");
+        let path = log_file.unwrap_or(&default);
 
-        let home = env::var("HOME").expect("Could not find HOME directory");
-        let mut log_path = PathBuf::from(home);
-        log_path.push("feroce.log");
-
-        let buff = tui_logger::init(std::path::Path::new(&log_path), log::LevelFilter::Info, 100)?;
+        let buff = tui_logger::init(path, log::LevelFilter::Info, 100)?;
         return Ok(Some(buff));
     }
 
@@ -240,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rdma_opts,
             receiver_opts,
         } => {
-            let log_buffer = init_logging(receiver_opts.tui)?;
+            let log_buffer = init_logging(receiver_opts.tui, receiver_opts.log_file.as_deref())?;
 
             // validate dump dir
             if let Some(ref path) = receiver_opts.dump_file {
@@ -308,7 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rdma_opts,
             sender_opts,
         } => {
-            let log_buffer = init_logging(sender_opts.tui)?;
+            let log_buffer = init_logging(sender_opts.tui, sender_opts.log_file.as_deref())?;
             send::run(
                 &cm_opts,
                 &rdma_opts,
@@ -319,7 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Commands::Ctrl { ctrl_opts, command } => {
-            init_logging(false)?;
+            init_logging(false, None)?;
             match command {
                 CtrlCommand::TxMeta(opts) => Ok(run_txmeta(&ctrl_opts, &opts)?),
                 CtrlCommand::CloseQp(opts) => Ok(run_close_qp(&ctrl_opts, &opts)?),

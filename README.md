@@ -74,12 +74,12 @@ See all available options with:
 
 ## Monitoring
 
-Each stream owns a `MetricGroup` (`feroce-runtime`) labelled with its stream id
-and QP numbers. `--stats-out <PATH>` writes a CSV row per stream per second:
+Each stream owns a `MetricGroup` (`feroce-runtime`) labelled with its name,
+stream id and QP numbers. `--stats-out <PATH>` writes a CSV row per stream per second:
 
 ```
-t_s,interval_s,stream,qpn,remote_qpn,messages,messages_rate,bytes,bytes_rate
-1.009245,1.005231,0,300,299,27174,26000.542228,222609408,212996441.932864
+t_s,interval_s,name,stream,qpn,remote_qpn,messages,messages_rate,bytes,bytes_rate
+1.009245,1.005231,stream-0,0,300,299,27174,26000.542228,222609408,212996441.932864
 ```
 
 CSV columns are derived from the metrics each stream registered, so a new
@@ -95,7 +95,9 @@ Build with the `tui` feature and pass `--tui` to the `recv` or `send` subcommand
 ./target/release/feroce-cli recv --tui ...
 ```
 
-Press `Ctrl+C` to quit. When `--tui` is enabled, logs are written by default to `$HOME/feroce.log`.
+Press `q` or `Ctrl+C` to quit; raw mode clears `ISIG`, so the TUI reads `Ctrl+C` as a
+keypress rather than a signal. Logs go to `feroce.log` in the working directory, or to
+`--log-file <PATH>`.
 
 ![](imgs/tui_example.png)
 

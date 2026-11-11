@@ -5,4 +5,6 @@ pub mod session;
 pub use feroce;
 
 pub use metrics::{GroupSample, Metric, MetricGroup, MetricSample, StreamMetrics};
-pub use session::{Monitor, OnStreamClosed, SessionConfig, SessionRunner, run_session};
+pub use session::{
+    Monitor, OnStreamClosed, Peers, SessionConfig, SessionRunner, StreamSpec, run_session,
+};

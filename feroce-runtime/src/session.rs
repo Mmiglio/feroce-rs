@@ -18,15 +18,32 @@ use log::{error, info, warn};
 
 use crate::metrics::{GroupSample, StreamMetrics};
 
+#[derive(Clone)]
+pub struct StreamSpec {
+    pub name: String,
+    pub remote: SocketAddr,
+    // 0 = any
+    pub remote_qpn: u32,
+}
+
+pub enum Peers {
+    Active(Vec<StreamSpec>),
+    Passive(u32),
+}
+
+impl Peers {
+    pub fn num_streams(&self) -> u32 {
+        match self {
+            Peers::Active(streams) => streams.len() as u32,
+            Peers::Passive(n) => *n,
+        }
+    }
+}
+
 pub struct SessionConfig {
     pub bind_addr: IpAddr,
     pub cm_port: u16,
-    // required on the active side, ignored on the passive one
-    pub remote: Option<SocketAddr>,
-    pub num_streams: u32,
-    // active side only, one per stream; 0 = any, empty = any for all
-    pub remote_qpns: Vec<u32>,
-    pub active: bool,
+    pub peers: Peers,
 
     pub rdma_device: String,
     pub port_num: u8,
@@ -59,18 +76,10 @@ where
     A: BufferAllocator,
     F: FnMut(ConnectedRdmaEndpoint<A>, u32, StreamMetrics) -> JoinHandle<()>,
 {
-    let active = cfg.active;
-    let num_streams = cfg.num_streams;
-    let remote = cfg.remote;
-
-    if !cfg.remote_qpns.is_empty() && cfg.remote_qpns.len() != num_streams as usize {
-        return Err(format!(
-            "{} remote QPNs given for {} streams",
-            cfg.remote_qpns.len(),
-            num_streams
-        )
-        .into());
-    }
+    let streams = match &cfg.peers {
+        Peers::Active(streams) => Some(streams.clone()),
+        Peers::Passive(_) => None,
+    };
 
     let mut runner = SessionRunner::new(
         cfg,
@@ -81,11 +90,9 @@ where
         shutdown,
     )?;
 
-    if active {
-        let remote_addr = remote.ok_or("active side requires a remote CM address")?;
-        runner.connect_and_run(remote_addr, num_streams)?;
-    } else {
-        runner.listen_and_run()?;
+    match streams {
+        Some(streams) => runner.connect_and_run(&streams)?,
+        None => runner.listen_and_run()?,
     }
 
     Ok(())
@@ -155,19 +162,17 @@ where
     // active side, connection setup
     pub fn connect_and_run(
         &mut self,
-        remote_addr: SocketAddr,
-        num_streams: u32,
+        streams: &[StreamSpec],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        for i in 0..num_streams as usize {
+        for spec in streams {
             let prepared =
                 setup_endpoint(&self.device, self.link, &self.cfg.rdma, &self.allocator)?;
 
             // connection request to remote side (uses our local_info, no QP transition yet)
-            let remote_qpn = self.cfg.remote_qpns.get(i).copied().unwrap_or(0);
             let remote_info = self.cm.connect(
-                remote_addr,
+                spec.remote,
                 &prepared.local_info,
-                remote_qpn,
+                spec.remote_qpn,
                 Duration::from_secs(2),
                 2,
             )?;
@@ -178,7 +183,12 @@ where
             let qp = Arc::clone(&connected.qp);
 
             // spawn the poller thread using the closure
-            let metrics = StreamMetrics::new(self.next_stream_id, qp.qp_num(), remote_info.qp_num);
+            let metrics = StreamMetrics::new(
+                &spec.name,
+                self.next_stream_id,
+                qp.qp_num(),
+                remote_info.qp_num,
+            );
             let poller_handle =
                 (self.spawn_poller)(connected, self.next_stream_id, metrics.clone());
             self.next_stream_id += 1;
@@ -279,7 +289,9 @@ where
                 let qp = Arc::clone(&connected.qp);
 
                 // spawn the poller thread
-                let metrics = StreamMetrics::new(self.next_stream_id, qp.qp_num(), remote_qpn);
+                let name = format!("stream-{}", self.next_stream_id);
+                let metrics =
+                    StreamMetrics::new(&name, self.next_stream_id, qp.qp_num(), remote_qpn);
                 let poller_handle =
                     (self.spawn_poller)(connected, self.next_stream_id, metrics.clone());
                 // TODO: maybe get stream id from somewhere? e.g. from the active side.
