@@ -467,12 +467,12 @@ impl ConnectionManager {
             if reply_qp_message.flags.ack_valid() {
                 match reply_qp_message.flags.ack_type() {
                     Ok(AckType::NoQp) => {
-                        warn!("Peer has no QP resources available");
+                        warn!("Peer has no QP resources available, reply: {reply_qp_message}");
                         socket.set_read_timeout(original_socket_timeout)?;
                         return Err(FeroceError::PeerNoResources);
                     }
                     Ok(AckType::AckError) => {
-                        warn!("Peer replied with error ack");
+                        warn!("Peer replied with error ack, reply: {reply_qp_message}");
                         socket.set_read_timeout(original_socket_timeout)?;
                         return Err(FeroceError::PeerAckError);
                     }
@@ -485,17 +485,7 @@ impl ConnectionManager {
                 return Ok(reply_qp_message);
             } else {
                 retry_left -= 1;
-                warn!(
-                    "Received unexpected reply (flags={:#x}: req={:?} ack={:?} ack_valid={}, loc_qpn={}, rem_qpn={}, rem_ip={:#x}), {} retries left",
-                    reply_qp_message.flags.as_byte(),
-                    reply_qp_message.flags.request_type(),
-                    reply_qp_message.flags.ack_type(),
-                    reply_qp_message.flags.ack_valid(),
-                    reply_qp_message.loc_qpn,
-                    reply_qp_message.rem_qpn,
-                    reply_qp_message.rem_ip,
-                    retry_left
-                );
+                warn!("Received unexpected reply: {reply_qp_message}, {retry_left} retries left");
                 continue;
             }
         }

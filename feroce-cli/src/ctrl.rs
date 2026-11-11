@@ -108,11 +108,14 @@ pub fn run_close_qp(
                 if reply.flags.ack_valid() {
                     match reply.flags.ack_type() {
                         Ok(AckType::NoQp) => {
-                            warn!("Peer has no matching QP (rem_qpn={:#x})", opts.remote_qpn);
+                            warn!(
+                                "Peer has no matching QP (rem_qpn={:#x}), reply: {reply}",
+                                opts.remote_qpn
+                            );
                             return Err("Peer rejected: no matching QP".into());
                         }
                         Ok(AckType::AckError) => {
-                            warn!("Peer replied with error ack");
+                            warn!("Peer replied with error ack, reply: {reply}");
                             return Err("Peer replied with error ack".into());
                         }
                         _ => {}
@@ -126,7 +129,7 @@ pub fn run_close_qp(
                     info!("CloseQP acknowledged");
                     return Ok(());
                 }
-                warn!("Unexpected reply, retrying");
+                warn!("Unexpected reply: {reply}, retrying");
                 retries_left -= 1;
             }
             Err(e)

@@ -321,6 +321,28 @@ impl QpMessage {
     }
 }
 
+impl std::fmt::Display for QpMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ip = |v: u32| {
+            let b = v.to_be_bytes();
+            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        };
+        write!(
+            f,
+            "flags={:#04x} req={:?} ack={:?} ack_valid={} loc_qpn={} rem_qpn={} loc_ip={} rem_ip={} port={}",
+            self.flags.as_byte(),
+            self.flags.request_type(),
+            self.flags.ack_type(),
+            self.flags.ack_valid(),
+            self.loc_qpn,
+            self.rem_qpn,
+            ip(self.loc_ip),
+            ip(self.rem_ip),
+            self.udp_port
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QpConnectionInfo {
     pub qp_num: u32,
@@ -420,5 +442,20 @@ mod test {
         assert_eq!(&bytes[1..5], &[0x00, 0x00, 0x00, 0x01]);
 
         assert_eq!(QpMessage::unpack(&bytes).unwrap(), msg);
+    }
+
+    // the peer's QPN is what a rejection has to carry
+    #[test]
+    fn a_rendered_message_carries_both_qpns_and_the_ack() {
+        let msg = QpMessage {
+            flags: QpFlags::new(RequestType::OpenQp, AckType::AckError, true),
+            loc_qpn: 262,
+            rem_qpn: 1000,
+            ..Default::default()
+        };
+        let text = msg.to_string();
+        assert!(text.contains("loc_qpn=262"), "{text}");
+        assert!(text.contains("rem_qpn=1000"), "{text}");
+        assert!(text.contains("AckError"), "{text}");
     }
 }
