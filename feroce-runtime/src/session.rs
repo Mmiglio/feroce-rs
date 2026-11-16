@@ -188,6 +188,7 @@ where
                 self.next_stream_id,
                 qp.qp_num(),
                 remote_info.qp_num,
+                spec.remote.ip(),
             );
             let poller_handle =
                 (self.spawn_poller)(connected, self.next_stream_id, metrics.clone());
@@ -290,8 +291,13 @@ where
 
                 // spawn the poller thread
                 let name = format!("stream-{}", self.next_stream_id);
-                let metrics =
-                    StreamMetrics::new(&name, self.next_stream_id, qp.qp_num(), remote_qpn);
+                let metrics = StreamMetrics::new(
+                    &name,
+                    self.next_stream_id,
+                    qp.qp_num(),
+                    remote_qpn,
+                    peer_ip,
+                );
                 let poller_handle =
                     (self.spawn_poller)(connected, self.next_stream_id, metrics.clone());
                 // TODO: maybe get stream id from somewhere? e.g. from the active side.

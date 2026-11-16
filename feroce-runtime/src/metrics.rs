@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -141,12 +142,13 @@ pub struct StreamMetrics {
 }
 
 impl StreamMetrics {
-    pub fn new(name: &str, stream_id: u32, qpn: u32, remote_qpn: u32) -> Self {
+    pub fn new(name: &str, stream_id: u32, qpn: u32, remote_qpn: u32, peer: IpAddr) -> Self {
         let group = Arc::new(MetricGroup::new(vec![
             ("name", name.to_string()),
             ("stream", stream_id.to_string()),
             ("qpn", qpn.to_string()),
             ("remote_qpn", remote_qpn.to_string()),
+            ("peer", peer.to_string()),
         ]));
         let messages = group.register("messages");
         let bytes = group.register("bytes");
@@ -164,7 +166,7 @@ mod tests {
 
     #[test]
     fn sample_rates_over_the_interval_and_advances_the_baseline() {
-        let m = StreamMetrics::new("s", 0, 0x100, 0x200);
+        let m = StreamMetrics::new("s", 0, 0x100, 0x200, [10, 0, 0, 1].into());
 
         m.messages.add(100);
         let a = m.group.sample(Duration::from_secs(1));
@@ -181,7 +183,7 @@ mod tests {
 
     #[test]
     fn sample_total_averages_over_the_run_and_keeps_the_tick_baseline() {
-        let m = StreamMetrics::new("s", 0, 0x100, 0x200);
+        let m = StreamMetrics::new("s", 0, 0x100, 0x200, [10, 0, 0, 1].into());
 
         m.messages.add(100);
         m.messages.sample(Duration::from_secs(1));

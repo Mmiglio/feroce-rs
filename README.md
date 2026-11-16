@@ -78,8 +78,8 @@ Each stream owns a `MetricGroup` (`feroce-runtime`) labelled with its name,
 stream id and QP numbers. `--stats-out <PATH>` writes a CSV row per stream per second:
 
 ```
-t_s,interval_s,name,stream,qpn,remote_qpn,messages,messages_rate,bytes,bytes_rate
-1.009245,1.005231,stream-0,0,300,299,27174,26000.542228,222609408,212996441.932864
+t_s,interval_s,name,stream,qpn,remote_qpn,peer,messages,messages_rate,bytes,bytes_rate
+1.009245,1.005231,stream-0,0,300,299,22.1.212.40,27174,26000.542228,222609408,212996441.932864
 ```
 
 CSV columns are derived from the metrics each stream registered, so a new
