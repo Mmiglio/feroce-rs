@@ -10,11 +10,8 @@ use std::{
 use log::LevelFilter;
 
 pub struct TuiLogger {
-    /// Hold the last N log messages
     buffer: Arc<Mutex<VecDeque<String>>>,
-    /// Dump logs to file for persistence
     file: Mutex<BufWriter<File>>,
-    /// Number of log messages to display in the TUI
     max_lines: usize,
 }
 
@@ -56,7 +53,6 @@ impl log::Log for TuiLogger {
     }
 }
 
-/// Create the shared log buffer which we will then pass to the TUI renderer
 pub fn init(
     log_file: &Path,
     max_level: LevelFilter,

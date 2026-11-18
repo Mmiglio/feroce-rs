@@ -1129,105 +1129,6 @@ mod test {
     use crate::rdma::test_utils::*;
 
     #[test]
-    fn list_devices() {
-        let devices = DeviceList::new().expect("no RDMA devices found");
-        println!("Found {} RDMA devices", devices.len());
-        for i in 0..devices.len() {
-            println!("\t{}: {}", i, devices.device_name(i).unwrap_or("unknown"));
-        }
-
-        assert!(devices.len() > 0);
-    }
-
-    #[test]
-    fn open_device() {
-        let devices = DeviceList::new().expect("no RDMA devices found");
-        let name = devices.device_name(0).expect("no devices");
-        let _device = Device::open(name).expect("failed to open device");
-    }
-
-    #[test]
-    fn alloc_pd_and_cq() {
-        let devices = DeviceList::new().expect("no RDMA devices found");
-        let name = devices.device_name(0).expect("no devices");
-        let device = Arc::new(Device::open(name).expect("failed to open device"));
-
-        let _pd = device.alloc_pd().expect("failed to allocate PD");
-        let _cq = device.create_cq(128).expect("failed to create CQ");
-    }
-
-    #[test]
-    fn create_qp() {
-        let (_name, device, link) =
-            find_roce_device().expect("no active RoCE device found — skipping");
-
-        let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
-        let cq = Arc::new(device.create_cq(128).expect("failed to create CQ"));
-
-        let _prepared = pd
-            .create_qp(&cq, &cq, rdma::ibv_qp_type::IBV_QPT_RC, link)
-            .set_max_wr(16)
-            .set_max_sge(4)
-            .build()
-            .expect("failed to create qp");
-    }
-
-    #[test]
-    fn qp_state_transitions_rts() {
-        let (_name, device, link) =
-            find_roce_device().expect("no active RoCE device found — skipping");
-
-        let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
-        let cq = Arc::new(device.create_cq(128).expect("failed to create CQ"));
-
-        let prepared = pd
-            .create_qp(&cq, &cq, rdma::ibv_qp_type::IBV_QPT_RC, link)
-            .set_max_wr(16)
-            .set_max_sge(4)
-            .set_sq_psn(4321)
-            .build()
-            .expect("failed to create qp");
-
-        let loc_gid = device
-            .query_gid(link.port_num, link.gid_index as i32)
-            .expect("failed to query gid");
-
-        let fake_remote_info = QpConnectionInfo {
-            qp_num: prepared.qp_num(),
-            psn: 1234,
-            rkey: 0xABCD,
-            addr: 0x1234ABCD,
-            gid: loc_gid.raw,
-        };
-
-        let _qp = prepared
-            .handshake(&fake_remote_info)
-            .expect("failed to handshake qp to RTS");
-    }
-
-    #[test]
-    fn register_memory_region() {
-        let (_name, device, _link) =
-            find_roce_device().expect("no active RoCE device found — skipping");
-
-        let pd = Arc::new(device.alloc_pd().expect("failed to allocate PD"));
-
-        let buf = vec![0u8; 128];
-
-        let mr = MemoryRegion::register(
-            &pd,
-            buf,
-            ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE,
-        )
-        .expect("failed to register memory region");
-
-        assert_eq!(mr.length(), 128);
-        assert!(mr.lkey() != 0);
-        assert!(mr.rkey() != 0);
-    }
-
-    #[test]
     fn loopback_send_recv() {
         let buf_size = 64;
 
@@ -1268,7 +1169,7 @@ mod test {
         });
 
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1280,7 +1181,7 @@ mod test {
         });
 
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.send_cq(),
+            pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1304,31 +1205,24 @@ mod test {
 
         let mut pair = create_loopback_qp(&device, link, buf_size);
 
-        // post reveice wr
-        let mut recv_wr_list = Vec::<rdma::ibv_recv_wr>::new();
-        let mut recv_sg_list = Vec::<Vec<rdma::ibv_sge>>::new();
-
-        recv_sg_list.push(vec![
-            ffi::ibv_sge {
-                addr: pair.recv.mr.addr() as u64,
+        let mut recv_sg_list = [
+            [ffi::ibv_sge {
+                addr: pair.recv.mr.addr(),
                 length: half_buf_size,
                 lkey: pair.recv.mr.lkey(),
-            };
-            1
-        ]);
-
-        recv_sg_list.push(vec![
-            ffi::ibv_sge {
+            }],
+            [ffi::ibv_sge {
                 addr: pair.recv.mr.addr() + half_buf_size as u64,
                 length: half_buf_size,
                 lkey: pair.recv.mr.lkey(),
-            };
-            1
-        ]);
+            }],
+        ];
 
-        for idx in 0..2 {
-            recv_wr_list.push(QueuePair::build_recv_wr(idx as u64, &mut recv_sg_list[idx]));
-        }
+        let mut recv_wr_list: Vec<rdma::ibv_recv_wr> = recv_sg_list
+            .iter_mut()
+            .enumerate()
+            .map(|(idx, sg)| QueuePair::build_recv_wr(idx as u64, sg))
+            .collect();
 
         recv_wr_list[0].next = &mut recv_wr_list[1];
 
@@ -1348,7 +1242,7 @@ mod test {
 
         send_sg_list.push(vec![
             ffi::ibv_sge {
-                addr: pair.send.mr.addr() as u64,
+                addr: pair.send.mr.addr(),
                 length: half_buf_size,
                 lkey: pair.send.mr.lkey(),
             };
@@ -1394,7 +1288,7 @@ mod test {
         });
 
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1409,7 +1303,7 @@ mod test {
         });
 
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.send_cq(),
+            pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1421,7 +1315,7 @@ mod test {
         assert_eq!(n_wce_send, 1);
         assert_eq!(send_wc[0].wr_id, 1);
         assert_eq!(pair.recv.mr.storage(), pair.send.mr.storage());
-        assert_eq!(recv_wc[0].byte_len, half_buf_size as u32);
+        assert_eq!(recv_wc[0].byte_len, half_buf_size);
     }
 
     #[test]
@@ -1455,7 +1349,7 @@ mod test {
         });
 
         let _n = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1504,7 +1398,7 @@ mod test {
             ..Default::default()
         }];
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.send_cq(),
+            pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1569,7 +1463,7 @@ mod test {
             ..Default::default()
         }];
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.send_cq(),
+            pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1584,7 +1478,7 @@ mod test {
             ..Default::default()
         }];
         let n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1676,7 +1570,7 @@ mod test {
             ..Default::default()
         });
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );

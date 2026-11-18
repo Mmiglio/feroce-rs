@@ -2,8 +2,9 @@
 
 Rust library and CLI for the [FERoCE](https://github.com/Gabriele-bot/100G-verilog-RoCEv2-lite) (Front-End RoCE) FPGA network stack.
 
-This Cargo workspace contains two crates:
+This Cargo workspace contains three crates:
 - **feroce**: library implementing the connection manager (CM) protocol, RDMA data path, and GPU bindings.
+- **feroce-runtime**: session runtime on top of `feroce`: CM event loop, QP/stream lifecycle, and metrics.
 - **feroce-cli**: sender/receiver application for testing and benchmarking.
 
 > **Note:** The primary use case is receiving data from the FERoCE FPGA (RX path).
@@ -11,7 +12,7 @@ This Cargo workspace contains two crates:
 
 ### Requirements
 
-- Rust 1.93+
+- Rust 1.97+
 - `libibverbs-dev`, `rdma-core`, `clang` (for bindgen)
 - An RDMA-capable NIC (RoCE v2) for hardware tests
 - NVIDIA GPU + CUDA toolkit (optional, for GPUDirect support)
@@ -48,6 +49,8 @@ Then the sender (active side, initiates the connection):
       --num-msgs 100000
 ```
 
+The active side can request specific remote QP numbers with `--remote-qpn`, one per stream (`--remote-qpn 0x100,0x101`, 0 = any); without it the peer chooses.
+
 For GPUDirect, build with `--features gpu` and pass `--gpu` to the receiver (sender settings stay the same). `--gpu` uses CUDA device 0; pass `--gpu <ID>` to select another:
 
 ```bash
@@ -69,6 +72,21 @@ See all available options with:
 ./target/release/feroce-cli send --help
 ```
 
+## Monitoring
+
+Each stream owns a `MetricGroup` (`feroce-runtime`) labelled with its name,
+stream id and QP numbers. `--stats-out <PATH>` writes a CSV row per stream per second:
+
+```
+t_s,interval_s,name,stream,qpn,remote_qpn,peer,messages,messages_rate,bytes,bytes_rate
+1.009245,1.005231,stream-0,0,300,299,22.1.212.40,27174,26000.542228,222609408,212996441.932864
+```
+
+CSV columns are derived from the metrics each stream registered, so a new
+counter needs no change to the writer. The TUI deliberately shows only
+`messages` and `bytes`. An application registers its own
+counters on the group it is handed.
+
 ## TUI dashboard
 
 Build with the `tui` feature and pass `--tui` to the `recv` or `send` subcommand to enable a live dashboard:
@@ -77,7 +95,9 @@ Build with the `tui` feature and pass `--tui` to the `recv` or `send` subcommand
 ./target/release/feroce-cli recv --tui ...
 ```
 
-Press `Ctrl+C` to quit. When `--tui` is enabled, logs are written by default to `$HOME/feroce.log`.
+Press `q` or `Ctrl+C` to quit; raw mode clears `ISIG`, so the TUI reads `Ctrl+C` as a
+keypress rather than a signal. Logs go to `feroce.log` in the working directory, or to
+`--log-file <PATH>`.
 
 ![](imgs/tui_example.png)
 
@@ -92,7 +112,7 @@ Configure and trigger the firmware data generator:
 ```bash
 ./target/release/feroce-cli ctrl \
       --remote-addr 22.1.212.10 --remote-port 0x4321 \
-      tx-meta --rem-qpn 0x100 --length 16384 --n-transfers 10000
+      tx-meta --remote-qpn 0x100 --length 16384 --n-transfers 10000
 ```
 
 ### Close a remote QP (`close-qp`)
@@ -100,7 +120,7 @@ Configure and trigger the firmware data generator:
 ```bash
 ./target/release/feroce-cli ctrl \
       --remote-addr 22.1.212.10 --remote-port 0x4321 \
-      close-qp --rem-qpn 256
+      close-qp --remote-qpn 256
 ```
 
 On success the log shows `CloseQP acknowledged`.

@@ -5,8 +5,10 @@ use log::{debug, error, info, warn};
 use std::path::Path;
 use std::sync::Arc;
 
+use feroce_runtime::{Metric, StreamMetrics};
+
 use crate::dump::{DumpSink, DumpSinkFactory};
-use crate::{CmOpts, LogBuffer, RdmaOpts, common::run_session, stats::StreamStats};
+use crate::{CmOpts, LogBuffer, RdmaOpts, common::run_session};
 
 pub fn run<A, S>(
     cm_opts: &CmOpts,
@@ -23,36 +25,34 @@ where
 {
     // spawn poller closure
     let spawn_poller =
-        |rdma_endpoint: ConnectedRdmaEndpoint<A>, stream_id: u32, remote_qpn: u32| {
-            let stats = Arc::new(StreamStats::new(
-                stream_id,
-                rdma_endpoint.qp.qp_num(),
-                remote_qpn,
-            ));
-
+        |rdma_endpoint: ConnectedRdmaEndpoint<A>, stream_id: u32, metrics: StreamMetrics| {
             let dump = dump_factory.as_ref().map(|f| {
                 f.make(stream_id)
                     .expect("failed to open dump sink for stream")
             });
 
-            let handle = std::thread::spawn({
+            // in the thread this would race the first tick, which fixes the CSV columns
+            let imm = check_imm.then(|| ImmCounters {
+                gaps: metrics.group.register("imm_gaps"),
+                missing: metrics.group.register("no_imm"),
+            });
+
+            std::thread::spawn({
                 let qp = Arc::clone(&rdma_endpoint.qp);
-                let stats = Arc::clone(&stats);
                 move || {
                     if let Err(e) = poller_thread(
                         qp,
                         rdma_endpoint.buffer_pool,
                         rdma_endpoint.comp_channel,
-                        stats,
+                        stream_id,
+                        metrics,
                         dump,
-                        check_imm,
+                        imm,
                     ) {
                         error!("poller thread error: {}", e);
                     }
                 }
-            });
-
-            (handle, stats)
+            })
         };
 
     run_session(
@@ -65,13 +65,19 @@ where
     )
 }
 
+struct ImmCounters {
+    gaps: Arc<Metric>,
+    missing: Arc<Metric>,
+}
+
 fn poller_thread<A: BufferAllocator, D: DumpSink>(
     qp: Arc<QueuePair>,
     buffer_pool: BufferPool<A>,
     channel: Arc<CompletionChannel>,
-    stats: Arc<StreamStats>,
+    stream_id: u32,
+    metrics: StreamMetrics,
     mut dump: Option<D>,
-    check_imm: bool,
+    imm: Option<ImmCounters>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // metrics
     let mut total_bytes;
@@ -79,8 +85,6 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
 
     // immediate sequence check
     let mut expected_imm = None;
-    let mut imm_gaps = 0u64;
-    let mut no_imm = 0u64;
 
     // start by pre-building and pre-posting recv request
     let mut sge_list = Vec::<Vec<rdma::ibv_sge>>::new();
@@ -138,22 +142,22 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
             total_bytes += wce.byte_len as u64;
             total_msgs += 1;
 
-            if check_imm {
+            if let Some(counters) = &imm {
                 match wce.imm() {
                     Some(imm) => {
                         let exp = expected_imm;
                         if let Some(delta) = check_imm_seq(&mut expected_imm, imm) {
                             warn!(
                                 "stream {}: imm gap, expected {}, got {}, delta {}",
-                                stats.id,
+                                stream_id,
                                 exp.unwrap(),
                                 imm,
                                 delta
                             );
-                            imm_gaps += 1;
+                            counters.gaps.inc();
                         }
                     }
-                    None => no_imm += 1,
+                    None => counters.missing.inc(),
                 }
             }
 
@@ -167,18 +171,16 @@ fn poller_thread<A: BufferAllocator, D: DumpSink>(
             qp.post_recv(&mut recv_wr_list[wce.wr_id as usize])?;
         }
 
-        stats
-            .messages
-            .fetch_add(total_msgs, std::sync::atomic::Ordering::Relaxed);
-        stats
-            .bytes
-            .fetch_add(total_bytes, std::sync::atomic::Ordering::Relaxed);
+        metrics.messages.add(total_msgs);
+        metrics.bytes.add(total_bytes);
     }
 
-    if check_imm {
+    if let Some(imm) = &imm {
         info!(
             "stream {}: {} imm gaps, {} messages without imm",
-            stats.id, imm_gaps, no_imm
+            stream_id,
+            imm.gaps.value(),
+            imm.missing.value()
         );
     }
 

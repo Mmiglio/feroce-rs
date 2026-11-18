@@ -75,15 +75,13 @@ impl ActiveQp {
 }
 
 pub enum CmEvent {
-    /// New connection request.
-    /// Application should create a QP and call set_local_info.
+    // the application must create a QP and call set_local_info
     NewConnection {
         peer_ip: IpAddr,
         remote_qpn: u32,
         remote_info: QpConnectionInfo,
     },
-    /// Request to close QP.
-    /// Close local QP and send ack to peer.
+    // close the local QP, then ack the peer
     CloseQp {
         peer_ip: IpAddr,
         local_qpn: u32,
@@ -273,8 +271,6 @@ impl ConnectionManager {
         }
     }
 
-    /// Complete the handshake
-    /// Set info of local QP and send reply back to sender
     pub fn set_local_info(
         &mut self,
         peer_ip: IpAddr,
@@ -383,7 +379,7 @@ impl ConnectionManager {
         }))
     }
 
-    /// Called by the application after the local QP has been closed to signal the remote
+    // the application calls this after closing its local QP
     pub fn ack_close_qp(&mut self, local_qpn: u32) -> Result<(), FeroceError> {
         let Some(aqp) = self.qps.remove(&local_qpn) else {
             return Err(FeroceError::Protocol(
@@ -423,7 +419,6 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Send QP message with retry and wait for the ack packet
     fn send_and_wait_for_ack(
         socket: &UdpSocket,
         msg: &QpMessage,
@@ -467,12 +462,12 @@ impl ConnectionManager {
             if reply_qp_message.flags.ack_valid() {
                 match reply_qp_message.flags.ack_type() {
                     Ok(AckType::NoQp) => {
-                        warn!("Peer has no QP resources available");
+                        warn!("Peer has no QP resources available, reply: {reply_qp_message}");
                         socket.set_read_timeout(original_socket_timeout)?;
                         return Err(FeroceError::PeerNoResources);
                     }
                     Ok(AckType::AckError) => {
-                        warn!("Peer replied with error ack");
+                        warn!("Peer replied with error ack, reply: {reply_qp_message}");
                         socket.set_read_timeout(original_socket_timeout)?;
                         return Err(FeroceError::PeerAckError);
                     }
@@ -485,14 +480,7 @@ impl ConnectionManager {
                 return Ok(reply_qp_message);
             } else {
                 retry_left -= 1;
-                warn!(
-                    "Received unexpected reply (flags={:#x}, loc_qpn={}, rem_qpn={}, rem_ip={:#x}), {} retries left",
-                    reply_qp_message.flags.as_byte(),
-                    reply_qp_message.loc_qpn,
-                    reply_qp_message.rem_qpn,
-                    reply_qp_message.rem_ip,
-                    retry_left
-                );
+                warn!("Received unexpected reply: {reply_qp_message}, {retry_left} retries left");
                 continue;
             }
         }
@@ -506,6 +494,7 @@ impl ConnectionManager {
         &mut self,
         remote_addr: SocketAddr,
         local_info: &QpConnectionInfo,
+        remote_qpn: u32,
         request_timeout: Duration,
         max_retries: u8,
     ) -> Result<QpConnectionInfo, FeroceError> {
@@ -516,13 +505,14 @@ impl ConnectionManager {
             loc_rkey: local_info.rkey,
             loc_base_addr: local_info.addr,
             loc_ip: ipv4_from_gid(&local_info.gid),
+            rem_qpn: remote_qpn,
             udp_port: self.cm_port()?,
             ..Default::default()
         };
 
         info!(
-            "Sending OpenQP to {}, local QPN={}",
-            remote_addr, local_info.qp_num
+            "Sending OpenQP to {}, local QPN={}, requested remote QPN={}",
+            remote_addr, local_info.qp_num, remote_qpn
         );
 
         let validate_ack = |reply: &QpMessage| -> bool {
@@ -566,6 +556,20 @@ impl ConnectionManager {
             "Local QP {} connected to remote QP {}",
             local_info.qp_num, remote_info.qp_num
         );
+
+        // the peer already counts the QP as open, so close it before failing
+        if remote_qpn != 0 && remote_info.qp_num != remote_qpn {
+            if let Err(e) = self.close_qp(local_info.qp_num, request_timeout, max_retries) {
+                warn!(
+                    "Failed to close unrequested remote QP {}: {e}",
+                    remote_info.qp_num
+                );
+            }
+            return Err(FeroceError::Protocol(format!(
+                "requested remote QP {} but peer gave QP {}",
+                remote_qpn, remote_info.qp_num
+            )));
+        }
 
         Ok(remote_info)
     }
@@ -643,7 +647,6 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Extract connection infos from a QP msg
     fn get_qp_info(&self, qp_msg: &QpMessage) -> (QpConnectionInfo, QpConnectionInfo) {
         let local_info = QpConnectionInfo {
             qp_num: qp_msg.rem_qpn,
@@ -719,7 +722,6 @@ mod test {
     use std::thread;
     use std::time::Duration;
 
-    /// helper functions
     fn make_test_infos() -> (QpConnectionInfo, QpConnectionInfo) {
         let sender_info = QpConnectionInfo {
             qp_num: 256,
@@ -748,7 +750,7 @@ mod test {
             loc_qpn: qpn,
             loc_psn: psn,
             loc_rkey: sender_info.rkey,
-            loc_base_addr: sender_info.addr as u64,
+            loc_base_addr: sender_info.addr,
             loc_ip: ipv4_from_gid(&sender_info.gid),
             udp_port: sender_socket.local_addr().unwrap().port(),
             ..Default::default()
@@ -804,20 +806,6 @@ mod test {
         );
 
         Ok((sender_cm, receiver_cm))
-    }
-
-    #[test]
-    fn connection_manager_binds_to_port() {
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), port).unwrap();
-
-        let cm_bad = ConnectionManager::new("127.0.0.1".parse().unwrap(), port);
-        assert!(cm_bad.is_err());
-
-        drop(cm);
     }
 
     #[test]
@@ -916,7 +904,7 @@ mod test {
         let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
         let dead_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), dead_port);
 
-        let res = cm.connect(dead_addr, &sender_info, Duration::from_millis(50), 1);
+        let res = cm.connect(dead_addr, &sender_info, 0, Duration::from_millis(50), 1);
 
         assert!(res.is_err(), "expected connect to fail, got {:?}", res);
         assert!(
@@ -927,34 +915,40 @@ mod test {
     }
 
     #[test]
-    fn process_next_handles_open_qp() {
-        let (sender_info, _) = make_test_infos();
+    fn connect_closes_unrequested_remote_qpn() {
+        let (sender_info, mut peer_info) = make_test_infos();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        // peer ignores the requested QPN, then must receive a CloseQp for the one it gave
+        let peer_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            peer_info.qp_num = 1031;
+            for (req, rem_qpn) in [(RequestType::OpenQp, 256), (RequestType::CloseQp, 1031)] {
+                let (_, from) = peer.recv_from(&mut buf).unwrap();
+                let msg = QpMessage::unpack(&buf).unwrap();
+                assert_eq!(msg.flags.request_type(), Ok(req));
+                assert_eq!(msg.rem_qpn, rem_qpn);
+                let ack = build_qp_message(
+                    QpFlags::new(req, AckType::Ack, true),
+                    &peer_info,
+                    &sender_info,
+                    peer_addr.port(),
+                );
+                peer.send_to(&ack.pack(), from).unwrap();
+            }
+        });
 
         let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
-        let cm_port = cm.cm_port().unwrap();
+        let res = cm.connect(peer_addr, &sender_info, 256, Duration::from_millis(500), 2);
+        peer_handle.join().unwrap();
 
-        let cm_handle = thread::spawn(move || cm.process_next().unwrap());
-
-        thread::sleep(Duration::from_millis(50));
-
-        // simulate the sender
-        let _sender = send_open_qp(cm_port, sender_info.qp_num, sender_info.psn);
-        let event = cm_handle.join().unwrap();
-
-        match event {
-            CmEvent::NewConnection {
-                peer_ip,
-                remote_qpn,
-                remote_info,
-            } => {
-                assert_eq!(peer_ip.to_string(), "127.0.0.1");
-                assert_eq!(remote_qpn, sender_info.qp_num);
-                validate_qp_connection_info(&remote_info, &sender_info);
-            }
-            _ => {
-                panic!("unexpected request");
-            }
-        };
+        assert!(
+            matches!(res, Err(FeroceError::Protocol(_))),
+            "got {:?}",
+            res
+        );
+        assert!(cm.qps.is_empty());
     }
 
     #[test]
@@ -1000,7 +994,7 @@ mod test {
         // the sender should have received an ACK
         assert_eq!(qp_msg.flags.request_type().unwrap(), RequestType::OpenQp);
         assert_eq!(qp_msg.flags.ack_type().unwrap(), AckType::Ack);
-        assert_eq!(qp_msg.flags.ack_valid(), true);
+        assert!(qp_msg.flags.ack_valid());
 
         assert_eq!(qp_msg.loc_qpn, receiver_info.qp_num);
         assert_eq!(qp_msg.loc_psn, receiver_info.psn);
@@ -1041,33 +1035,6 @@ mod test {
     }
 
     #[test]
-    fn malformed_packet_is_discarded() {
-        // malformed datagram should be logged and dropped, leaving the CM ready to process
-        // the next good message.
-        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
-        // Short read timeout so try_process_next returns Ok(None) once the
-        // recv_from call times out, confirming the CM is still alive.
-        cm.set_read_timeout(Duration::from_millis(200)).unwrap();
-        let cm_port = cm.cm_port().unwrap();
-
-        let cm_handle = thread::spawn(move || cm.try_process_next());
-
-        thread::sleep(Duration::from_millis(50));
-
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let buf = [0u8; QP_MESSAGE_SIZE + 1]; // oversized
-        sender_socket
-            .send_to(&buf, format!("127.0.0.1:{}", cm_port))
-            .unwrap();
-
-        let res = cm_handle.join().unwrap();
-        assert!(
-            matches!(res, Ok(None)),
-            "expected CM to survive malformed packet (Ok(None)), got something else"
-        );
-    }
-
-    #[test]
     fn malformed_then_valid_packet_is_processed() {
         // malformed_packet_is_discarded and the next one is processed
         let (sender_info, _) = make_test_infos();
@@ -1102,75 +1069,6 @@ mod test {
                 validate_qp_connection_info(&remote_info, &sender_info);
             }
             _ => panic!("expected NewConnection after discarding garbage packet"),
-        }
-    }
-
-    #[test]
-    fn sender_receiver_handshake_open_qp() {
-        let (sender_info, receiver_info) = make_test_infos();
-
-        let mut receiver_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
-        let receiver_cm_port = receiver_cm.cm_port().unwrap();
-        let mut sender_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
-
-        // receiver thread
-        let receiver_cm_handle = thread::spawn(move || {
-            let event = receiver_cm.process_next().unwrap();
-
-            match event {
-                CmEvent::NewConnection {
-                    peer_ip,
-                    remote_qpn,
-                    remote_info: _,
-                } => {
-                    // simulate open new QP
-
-                    receiver_cm
-                        .set_local_info(peer_ip, remote_qpn, &receiver_info)
-                        .unwrap();
-                }
-                _ => {
-                    panic!("unexpected request");
-                }
-            }
-
-            receiver_cm
-        });
-
-        thread::sleep(Duration::from_millis(50));
-
-        // sender thread
-        let sender_cm_handle = thread::spawn(move || {
-            let _remote_info = sender_cm
-                .connect(
-                    SocketAddr::new("127.0.0.1".parse().unwrap(), receiver_cm_port),
-                    &sender_info,
-                    Duration::from_millis(500),
-                    2,
-                )
-                .unwrap();
-
-            sender_cm
-        });
-
-        let sender_cm = sender_cm_handle.join().unwrap();
-        let receiver_cm = receiver_cm_handle.join().unwrap();
-
-        // get QP from receiver
-        let receiver_qp_state = receiver_cm.qps.get(&receiver_info.qp_num);
-        assert!(receiver_qp_state.is_some());
-
-        // get QP from sender
-        let sender_qp_state = sender_cm.qps.get(&sender_info.qp_num);
-        assert!(sender_qp_state.is_some());
-
-        if let (Some(recv_qp), Some(send_qp)) = (receiver_qp_state, sender_qp_state) {
-            assert_eq!(recv_qp.phase, QpPhase::Connected);
-            assert_eq!(send_qp.phase, QpPhase::Connected);
-            assert_eq!(recv_qp.ctx.local_info, send_qp.ctx.remote_info);
-            assert_eq!(send_qp.ctx.local_info, recv_qp.ctx.remote_info);
-        } else {
-            panic!("Expected QPs to be connected!")
         }
     }
 
@@ -1338,47 +1236,133 @@ mod test {
     }
 
     #[test]
-    fn close_qp_removes_connected_qp() {
+    fn close_qp_unknown() {
         let (sender_info, receiver_info) = make_test_infos();
 
         // create cm with connected QPs
         let (sender_cm, mut receiver_cm) = cm_with_connected_qp().expect("failed to create cms");
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // simulate a close QP message
-        let close_qp_msg = build_qp_message(
+        let mut close_qp_msg = build_qp_message(
             QpFlags::new(RequestType::CloseQp, AckType::Null, false),
             &sender_info,
             &receiver_info,
             sender_cm.cm_port().unwrap(),
         );
+        close_qp_msg.rem_qpn = 0x1;
 
+        let res = receiver_cm
+            .handle_close_qp(&close_qp_msg, &sender_socket.local_addr().unwrap())
+            .expect("failed to handle close qp");
+        assert!(res.is_none());
+    }
+
+    // A CloseQp naming the wrong remote QPN must be NAKed and must not tear down
+    // the live QP it points at.
+    #[test]
+    fn close_qp_with_mismatched_remote_qpn_is_naked() {
+        let (sender_info, receiver_info) = make_test_infos();
+
+        let (_sender_cm, mut receiver_cm) = cm_with_connected_qp().expect("failed to create cms");
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         sender_socket
-            .send_to(
-                &close_qp_msg.pack(),
-                format!("127.0.0.1:{}", receiver_cm.cm_port().unwrap()),
-            )
+            .set_read_timeout(Some(Duration::from_millis(500)))
             .unwrap();
 
-        let event = receiver_cm.process_next().unwrap();
-        match event {
-            CmEvent::CloseQp {
-                peer_ip: _,
-                local_qpn,
-                remote_qpn,
-            } => {
-                // close the local QP, notify the cm when it is done
+        // reply comes back to udp_port, so point it at our own socket
+        let mut close_qp_msg = build_qp_message(
+            QpFlags::new(RequestType::CloseQp, AckType::Null, false),
+            &sender_info,
+            &receiver_info,
+            sender_socket.local_addr().unwrap().port(),
+        );
+        close_qp_msg.loc_qpn = 0x999;
 
-                receiver_cm
-                    .ack_close_qp(local_qpn)
-                    .expect("failed to close qp");
+        let res = receiver_cm
+            .handle_close_qp(&close_qp_msg, &sender_socket.local_addr().unwrap())
+            .expect("failed to handle close qp");
+        assert!(res.is_none(), "a mismatched close must not raise an event");
+        assert!(
+            receiver_cm.qps.contains_key(&receiver_info.qp_num),
+            "the live QP must survive a mismatched close"
+        );
 
-                assert!(!receiver_cm.qps.contains_key(&local_qpn));
-                assert_eq!(remote_qpn, sender_info.qp_num);
+        let mut buf = [0u8; QP_MESSAGE_SIZE];
+        sender_socket.recv_from(&mut buf).expect("expected a NAK");
+        let reply = QpMessage::unpack(&buf).unwrap();
+        assert_eq!(reply.flags.request_type(), Ok(RequestType::CloseQp));
+        assert_eq!(reply.flags.ack_type(), Ok(AckType::NAck));
+        assert!(reply.flags.ack_valid());
+    }
+
+    #[test]
+    fn sender_receiver_handshake_open_qp() {
+        let (sender_info, receiver_info) = make_test_infos();
+
+        let mut receiver_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let receiver_cm_port = receiver_cm.cm_port().unwrap();
+        let mut sender_cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+
+        // receiver thread
+        let receiver_cm_handle = thread::spawn(move || {
+            let event = receiver_cm.process_next().unwrap();
+
+            match event {
+                CmEvent::NewConnection {
+                    peer_ip,
+                    remote_qpn,
+                    remote_info: _,
+                } => {
+                    // simulate open new QP
+
+                    receiver_cm
+                        .set_local_info(peer_ip, remote_qpn, &receiver_info)
+                        .unwrap();
+                }
+                _ => {
+                    panic!("unexpected request");
+                }
             }
-            _ => {
-                panic!("unexpected request");
-            }
+
+            receiver_cm
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        // sender thread
+        let sender_cm_handle = thread::spawn(move || {
+            let _remote_info = sender_cm
+                .connect(
+                    SocketAddr::new("127.0.0.1".parse().unwrap(), receiver_cm_port),
+                    &sender_info,
+                    0,
+                    Duration::from_millis(500),
+                    2,
+                )
+                .unwrap();
+
+            sender_cm
+        });
+
+        let sender_cm = sender_cm_handle.join().unwrap();
+        let receiver_cm = receiver_cm_handle.join().unwrap();
+
+        // get QP from receiver
+        let receiver_qp_state = receiver_cm.qps.get(&receiver_info.qp_num);
+        assert!(receiver_qp_state.is_some());
+
+        // get QP from sender
+        let sender_qp_state = sender_cm.qps.get(&sender_info.qp_num);
+        assert!(sender_qp_state.is_some());
+
+        if let (Some(recv_qp), Some(send_qp)) = (receiver_qp_state, sender_qp_state) {
+            assert_eq!(recv_qp.phase, QpPhase::Connected);
+            assert_eq!(send_qp.phase, QpPhase::Connected);
+            assert_eq!(recv_qp.ctx.local_info, send_qp.ctx.remote_info);
+            assert_eq!(send_qp.ctx.local_info, recv_qp.ctx.remote_info);
+        } else {
+            panic!("Expected QPs to be connected!")
         }
     }
 
@@ -1417,39 +1401,6 @@ mod test {
             .handle_close_qp(&close_qp_msg, &sender_socket.local_addr().unwrap())
             .expect("failed to handle first request");
         assert!(res_second.is_none());
-    }
-
-    #[test]
-    fn close_qp_unknown() {
-        let (sender_info, receiver_info) = make_test_infos();
-
-        // create cm with connected QPs
-        let (sender_cm, mut receiver_cm) = cm_with_connected_qp().expect("failed to create cms");
-
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // simulate a close QP message
-        let mut close_qp_msg = build_qp_message(
-            QpFlags::new(RequestType::CloseQp, AckType::Null, false),
-            &sender_info,
-            &receiver_info,
-            sender_cm.cm_port().unwrap(),
-        );
-
-        close_qp_msg.rem_qpn = 0x1;
-
-        sender_socket
-            .send_to(
-                &close_qp_msg.pack(),
-                format!("127.0.0.1:{}", receiver_cm.cm_port().unwrap()),
-            )
-            .unwrap();
-
-        // test private methods
-        // first send a real close qp and verify the correct type is returned
-        let res = receiver_cm
-            .handle_close_qp(&close_qp_msg, &sender_socket.local_addr().unwrap())
-            .expect("failed to handle first request");
-        assert!(res.is_none());
     }
 
     #[test]

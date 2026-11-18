@@ -7,10 +7,9 @@ use crate::FeroceError;
 use crate::rdma::{self, device::MemoryRegion, device::ProtectionDomain};
 
 pub trait BufferAllocator: Send + 'static {
-    /// Backing storage type: Vec<u8> for CPU, device buffer for GPU
+    // Vec<u8> for CPU, a device buffer for GPU
     type Storage: Send + 'static;
 
-    /// allocate and register RDMA memory region
     fn alloc_and_register(
         &self,
         pd: &Arc<ProtectionDomain>,
@@ -110,7 +109,6 @@ impl<A: BufferAllocator> BufferPool<A> {
     }
 
     pub fn addr(&self) -> u64 {
-        //self.mr.addr()
         self.base_addr
     }
 
