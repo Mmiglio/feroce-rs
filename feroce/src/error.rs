@@ -2,23 +2,21 @@ use std::io;
 
 #[derive(Debug)]
 pub enum FeroceError {
-    /// OS / socket errors
     Io(io::Error),
-    /// CM protocol violations
     Protocol(String),
-    /// CM timeout
     Timeout,
-    /// Peer rejected the connection (no QP resources available)
     PeerNoResources,
-    /// Peer signaled an error in its ack
     PeerAckError,
-    /// Invalid argument
     InvalidArg(String),
-    /// RDMA verbs failures
-    Rdma { call: &'static str, errno: i32 },
-    /// CUDA failures
+    Rdma {
+        call: &'static str,
+        errno: i32,
+    },
     #[cfg(feature = "gpu")]
-    Cuda { call: &'static str, code: i32 },
+    Cuda {
+        call: &'static str,
+        code: i32,
+    },
 }
 
 impl std::error::Error for FeroceError {}

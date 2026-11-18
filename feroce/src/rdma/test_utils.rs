@@ -1,3 +1,6 @@
+// each test module uses a different subset of these
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use crate::{

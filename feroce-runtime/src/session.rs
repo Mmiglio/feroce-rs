@@ -300,7 +300,6 @@ where
                 );
                 let poller_handle =
                     (self.spawn_poller)(connected, self.next_stream_id, metrics.clone());
-                // TODO: maybe get stream id from somewhere? e.g. from the active side.
                 self.next_stream_id += 1;
 
                 self.qps.insert(

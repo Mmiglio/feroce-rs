@@ -1169,7 +1169,7 @@ mod test {
         });
 
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1181,7 +1181,7 @@ mod test {
         });
 
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.send_cq(),
+            pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1205,31 +1205,24 @@ mod test {
 
         let mut pair = create_loopback_qp(&device, link, buf_size);
 
-        // post reveice wr
-        let mut recv_wr_list = Vec::<rdma::ibv_recv_wr>::new();
-        let mut recv_sg_list = Vec::<Vec<rdma::ibv_sge>>::new();
-
-        recv_sg_list.push(vec![
-            ffi::ibv_sge {
-                addr: pair.recv.mr.addr() as u64,
+        let mut recv_sg_list = [
+            [ffi::ibv_sge {
+                addr: pair.recv.mr.addr(),
                 length: half_buf_size,
                 lkey: pair.recv.mr.lkey(),
-            };
-            1
-        ]);
-
-        recv_sg_list.push(vec![
-            ffi::ibv_sge {
+            }],
+            [ffi::ibv_sge {
                 addr: pair.recv.mr.addr() + half_buf_size as u64,
                 length: half_buf_size,
                 lkey: pair.recv.mr.lkey(),
-            };
-            1
-        ]);
+            }],
+        ];
 
-        for idx in 0..2 {
-            recv_wr_list.push(QueuePair::build_recv_wr(idx as u64, &mut recv_sg_list[idx]));
-        }
+        let mut recv_wr_list: Vec<rdma::ibv_recv_wr> = recv_sg_list
+            .iter_mut()
+            .enumerate()
+            .map(|(idx, sg)| QueuePair::build_recv_wr(idx as u64, sg))
+            .collect();
 
         recv_wr_list[0].next = &mut recv_wr_list[1];
 
@@ -1249,7 +1242,7 @@ mod test {
 
         send_sg_list.push(vec![
             ffi::ibv_sge {
-                addr: pair.send.mr.addr() as u64,
+                addr: pair.send.mr.addr(),
                 length: half_buf_size,
                 lkey: pair.send.mr.lkey(),
             };
@@ -1295,7 +1288,7 @@ mod test {
         });
 
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1310,7 +1303,7 @@ mod test {
         });
 
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.send_cq(),
+            pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1322,7 +1315,7 @@ mod test {
         assert_eq!(n_wce_send, 1);
         assert_eq!(send_wc[0].wr_id, 1);
         assert_eq!(pair.recv.mr.storage(), pair.send.mr.storage());
-        assert_eq!(recv_wc[0].byte_len, half_buf_size as u32);
+        assert_eq!(recv_wc[0].byte_len, half_buf_size);
     }
 
     #[test]
@@ -1356,7 +1349,7 @@ mod test {
         });
 
         let _n = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1405,7 +1398,7 @@ mod test {
             ..Default::default()
         }];
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.send_cq(),
+            pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1470,7 +1463,7 @@ mod test {
             ..Default::default()
         }];
         let n_wce_send = poll_cq_with_timeout(
-            &pair.send.qp.send_cq(),
+            pair.send.qp.send_cq(),
             &mut send_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1485,7 +1478,7 @@ mod test {
             ..Default::default()
         }];
         let n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );
@@ -1577,7 +1570,7 @@ mod test {
             ..Default::default()
         });
         let _n_wce_recv = poll_cq_with_timeout(
-            &pair.recv.qp.recv_cq(),
+            pair.recv.qp.recv_cq(),
             &mut recv_wc,
             std::time::Duration::from_secs(2),
         );

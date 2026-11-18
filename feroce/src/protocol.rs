@@ -400,9 +400,9 @@ mod test {
     fn qp_flags_with_ack() {
         let flags = QpFlags::new(RequestType::SendQpInfo, AckType::Ack, true);
 
-        assert_eq!(flags.info_valid(), true);
+        assert!(flags.info_valid());
         assert_eq!(flags.request_type(), Ok(RequestType::SendQpInfo));
-        assert_eq!(flags.ack_valid(), true);
+        assert!(flags.ack_valid());
         assert_eq!(flags.ack_type(), Ok(AckType::Ack));
         // 0x01 | (0x02 << 1) | (1 << 4) | (0x01 << 5) = 0x01 | 0x04 | 0x10 | 0x20 = 0x35
         assert_eq!(flags.as_byte(), 0x35);
@@ -411,9 +411,9 @@ mod test {
     #[test]
     fn tx_meta_flags_encode_decode() {
         let f = TxMetaFlags::new(true, false, TxType::Write);
-        assert_eq!(f.valid(), true);
-        assert_eq!(f.start(), true);
-        assert_eq!(f.immediate(), false);
+        assert!(f.valid());
+        assert!(f.start());
+        assert!(!f.immediate());
         assert_eq!(f.tx_type(), TxType::Write);
         // 0x1 | (1<<1) | (0<<2) | (1<<3) = 0x0B
         assert_eq!(f.as_byte(), 0x0B);

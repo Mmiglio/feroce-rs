@@ -57,14 +57,12 @@ impl Tui {
 
         // check for Ctrl+C or 'q' keypress
         use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
-        if event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-                    || key.code == KeyCode::Char('q')
-                {
-                    return Ok(true);
-                }
-            }
+        if event::poll(Duration::from_millis(0))?
+            && let Event::Key(key) = event::read()?
+            && ((key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+                || key.code == KeyCode::Char('q'))
+        {
+            return Ok(true);
         }
 
         Ok(false)

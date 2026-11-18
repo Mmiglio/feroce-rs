@@ -57,10 +57,7 @@ fn poller_thread<A: BufferAllocator>(
     metrics: StreamMetrics,
     num_msgs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // TODO: Remove this
-    // Needed to give time to the receiver (in passive mode) post WR and be ready to receive.
-    // This would require to split session runner in receiver and sender, which is currently
-    // not needed as the sender is for testing purposes only.
+    // the passive receiver needs time to post its first WRs
     sleep(Duration::from_secs(1));
 
     // metrics
@@ -145,11 +142,9 @@ fn poller_thread<A: BufferAllocator>(
             }
 
             send_completed += 1;
-            // update metrics
             total_bytes += sge_list[wce.wr_id as usize][0].length as u64;
             total_msgs += 1;
 
-            // return free buff idx to the pool
             free_bufs.push(wce.wr_id as usize);
 
             if send_completed == num_msgs {

@@ -75,15 +75,13 @@ impl ActiveQp {
 }
 
 pub enum CmEvent {
-    /// New connection request.
-    /// Application should create a QP and call set_local_info.
+    // the application must create a QP and call set_local_info
     NewConnection {
         peer_ip: IpAddr,
         remote_qpn: u32,
         remote_info: QpConnectionInfo,
     },
-    /// Request to close QP.
-    /// Close local QP and send ack to peer.
+    // close the local QP, then ack the peer
     CloseQp {
         peer_ip: IpAddr,
         local_qpn: u32,
@@ -273,8 +271,6 @@ impl ConnectionManager {
         }
     }
 
-    /// Complete the handshake
-    /// Set info of local QP and send reply back to sender
     pub fn set_local_info(
         &mut self,
         peer_ip: IpAddr,
@@ -383,7 +379,7 @@ impl ConnectionManager {
         }))
     }
 
-    /// Called by the application after the local QP has been closed to signal the remote
+    // the application calls this after closing its local QP
     pub fn ack_close_qp(&mut self, local_qpn: u32) -> Result<(), FeroceError> {
         let Some(aqp) = self.qps.remove(&local_qpn) else {
             return Err(FeroceError::Protocol(
@@ -423,7 +419,6 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Send QP message with retry and wait for the ack packet
     fn send_and_wait_for_ack(
         socket: &UdpSocket,
         msg: &QpMessage,
@@ -652,7 +647,6 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Extract connection infos from a QP msg
     fn get_qp_info(&self, qp_msg: &QpMessage) -> (QpConnectionInfo, QpConnectionInfo) {
         let local_info = QpConnectionInfo {
             qp_num: qp_msg.rem_qpn,
@@ -728,7 +722,6 @@ mod test {
     use std::thread;
     use std::time::Duration;
 
-    /// helper functions
     fn make_test_infos() -> (QpConnectionInfo, QpConnectionInfo) {
         let sender_info = QpConnectionInfo {
             qp_num: 256,
@@ -757,7 +750,7 @@ mod test {
             loc_qpn: qpn,
             loc_psn: psn,
             loc_rkey: sender_info.rkey,
-            loc_base_addr: sender_info.addr as u64,
+            loc_base_addr: sender_info.addr,
             loc_ip: ipv4_from_gid(&sender_info.gid),
             udp_port: sender_socket.local_addr().unwrap().port(),
             ..Default::default()
@@ -1001,7 +994,7 @@ mod test {
         // the sender should have received an ACK
         assert_eq!(qp_msg.flags.request_type().unwrap(), RequestType::OpenQp);
         assert_eq!(qp_msg.flags.ack_type().unwrap(), AckType::Ack);
-        assert_eq!(qp_msg.flags.ack_valid(), true);
+        assert!(qp_msg.flags.ack_valid());
 
         assert_eq!(qp_msg.loc_qpn, receiver_info.qp_num);
         assert_eq!(qp_msg.loc_psn, receiver_info.psn);
