@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -14,6 +14,9 @@ use crate::FeroceError;
 
 // throttle re-ACKs for duplicate OpenQP requests. Helps to avoid req storms.
 const REACK_INTERVAL: Duration = Duration::from_millis(100);
+
+// max size of deferred request  queue
+const MAX_DEFERRED: usize = 256;
 
 // Pending connection request, consumed when handshake finishes
 struct PendingQp {
@@ -93,6 +96,8 @@ pub struct ConnectionManager {
     socket: UdpSocket,
     pending: HashMap<(IpAddr, u32), PendingQp>,
     qps: HashMap<u32, ActiveQp>,
+    // requests that arrived while another QP held the socket waiting for its ack
+    deferred: VecDeque<(QpMessage, SocketAddr)>,
 }
 
 impl ConnectionManager {
@@ -103,6 +108,7 @@ impl ConnectionManager {
             socket,
             pending: HashMap::new(),
             qps: HashMap::new(),
+            deferred: VecDeque::new(),
         })
     }
 
@@ -141,14 +147,23 @@ impl ConnectionManager {
 
     pub fn process_next(&mut self) -> Result<CmEvent, FeroceError> {
         loop {
-            let (qp_msg, peer_addr) = match Self::recv_message(&self.socket) {
-                Ok(v) => v,
-                Err(FeroceError::Protocol(msg)) => {
-                    warn!("Discarding malformed CM packet: {}", msg);
-                    continue;
-                }
-                Err(e) => return Err(e),
+            let (qp_msg, peer_addr) = match self.deferred.pop_front() {
+                Some(set_aside) => set_aside,
+                None => match Self::recv_message(&self.socket) {
+                    Ok(v) => v,
+                    Err(FeroceError::Protocol(msg)) => {
+                        warn!("Discarding malformed CM packet: {}", msg);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                },
             };
+
+            // a reply nobody is waiting for any more
+            if qp_msg.flags.ack_valid() {
+                debug!("Discarding a stale reply from {}: {}", peer_addr, qp_msg);
+                continue;
+            }
 
             let request_type = match qp_msg.flags.request_type() {
                 Ok(rt) => rt,
@@ -343,6 +358,24 @@ impl ConnectionManager {
             return Ok(None);
         };
 
+        // a request now reaches here from any source, so check it is the QP's own peer
+        if active_qp.ctx.peer_addr.ip() != peer_addr.ip() {
+            warn!(
+                "CloseQp for local QPN={} came from {}, not from its peer {}. Sending NAK.",
+                local_qpn,
+                peer_addr.ip(),
+                active_qp.ctx.peer_addr.ip()
+            );
+            Self::send_reply(
+                &self.socket,
+                &active_qp.ctx.local_info,
+                &active_qp.ctx.remote_info,
+                QpFlags::new(RequestType::CloseQp, AckType::NAck, true),
+                SocketAddr::new(peer_addr.ip(), qp_msg.udp_port),
+            )?;
+            return Ok(None);
+        }
+
         // validate QPN mapping (remote and expected remote)
         if active_qp.ctx.remote_info.qp_num != remote_qpn {
             warn!(
@@ -419,73 +452,104 @@ impl ConnectionManager {
         Ok(())
     }
 
+    // the peer answers a request by echoing our QPN and IP in the remote fields
+    fn addressed_to(reply: &QpMessage, local_info: &QpConnectionInfo) -> bool {
+        reply.rem_qpn == local_info.qp_num && reply.rem_ip == ipv4_from_gid(&local_info.gid)
+    }
+
     fn send_and_wait_for_ack(
-        socket: &UdpSocket,
+        &mut self,
         msg: &QpMessage,
         dest: SocketAddr,
-        validate: impl Fn(&QpMessage) -> bool,
+        request: RequestType,
+        local_info: &QpConnectionInfo,
         timeout: Duration,
         max_retries: u8,
     ) -> Result<QpMessage, FeroceError> {
-        let original_socket_timeout = socket.read_timeout()?;
-        socket.set_read_timeout(Some(timeout))?;
+        let original_socket_timeout = self.socket.read_timeout()?;
+        self.socket.set_read_timeout(Some(timeout))?;
+        let reply = self.wait_for_ack(msg, dest, request, local_info, timeout, max_retries);
+        self.socket.set_read_timeout(original_socket_timeout)?;
+        reply
+    }
 
+    fn wait_for_ack(
+        &mut self,
+        msg: &QpMessage,
+        dest: SocketAddr,
+        request: RequestType,
+        local_info: &QpConnectionInfo,
+        timeout: Duration,
+        max_retries: u8,
+    ) -> Result<QpMessage, FeroceError> {
+        // one socket serves every QP, so this wait sees the others' traffic.
+        let deadline = Instant::now() + timeout * u32::from(max_retries.max(1));
         let mut retry_left = max_retries;
-        while retry_left > 0 {
-            socket.send_to(&msg.pack(), dest)?;
 
-            let (reply_qp_message, peer_addr) = match Self::recv_message(socket) {
-                Ok((qp_msg, addr)) => (qp_msg, addr),
-                Err(err) => match err {
-                    FeroceError::Timeout => {
-                        retry_left -= 1;
-                        warn!("Timeout while waiting for ACK, {} retries left", retry_left);
-                        continue;
-                    }
-                    _ => {
-                        return Err(err);
-                    }
-                },
-            };
-
-            // drop packets from unexpected sources
-            if peer_addr.ip() != dest.ip() {
-                warn!(
-                    "Discarding reply from unexpected source {} (expected {})",
-                    peer_addr.ip(),
-                    dest.ip()
-                );
+        while retry_left > 0 && Instant::now() < deadline {
+            if let Err(e) = self.socket.send_to(&msg.pack(), dest) {
+                warn!("Sending {request:?} to {dest} failed: {e}");
+                retry_left -= 1;
                 continue;
             }
 
-            // peer signaled a rejet (No available qps, other errors), exit
-            if reply_qp_message.flags.ack_valid() {
-                match reply_qp_message.flags.ack_type() {
+            while Instant::now() < deadline {
+                let (reply, peer_addr) = match Self::recv_message(&self.socket) {
+                    Ok(v) => v,
+                    Err(FeroceError::Timeout) => break,
+                    Err(FeroceError::Protocol(e)) => {
+                        warn!("Discarding malformed CM packet while waiting for an ack: {e}");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                if !reply.flags.ack_valid() {
+                    // both ends closing the same QP at once
+                    if request == RequestType::CloseQp
+                        && reply.flags.request_type() == Ok(RequestType::CloseQp)
+                        && peer_addr.ip() == dest.ip()
+                        && Self::addressed_to(&reply, local_info)
+                    {
+                        info!("Peer is closing QP {} too, close agreed", local_info.qp_num);
+                        return Ok(reply);
+                    }
+                    // any other request is some other QP's work, whichever peer sent it
+                    if self.deferred.len() < MAX_DEFERRED {
+                        self.deferred.push_back((reply, peer_addr));
+                    } else {
+                        warn!("Set-aside requests are full, dropping one from {peer_addr}");
+                    }
+                    continue;
+                }
+
+                if peer_addr.ip() != dest.ip() || !Self::addressed_to(&reply, local_info) {
+                    debug!("Discarding a reply for another request from {peer_addr}: {reply}");
+                    continue;
+                }
+
+                match reply.flags.ack_type() {
                     Ok(AckType::NoQp) => {
-                        warn!("Peer has no QP resources available, reply: {reply_qp_message}");
-                        socket.set_read_timeout(original_socket_timeout)?;
+                        warn!("Peer has no QP resources available, reply: {reply}");
                         return Err(FeroceError::PeerNoResources);
                     }
                     Ok(AckType::AckError) => {
-                        warn!("Peer replied with error ack, reply: {reply_qp_message}");
-                        socket.set_read_timeout(original_socket_timeout)?;
+                        warn!("Peer replied with error ack, reply: {reply}");
                         return Err(FeroceError::PeerAckError);
                     }
-                    _ => {}
+                    Ok(AckType::Ack) if reply.flags.request_type() == Ok(request) => {
+                        return Ok(reply);
+                    }
+                    _ => warn!("Peer refused {request:?}, reply: {reply}"),
                 }
             }
 
-            if validate(&reply_qp_message) {
-                socket.set_read_timeout(original_socket_timeout)?;
-                return Ok(reply_qp_message);
-            } else {
-                retry_left -= 1;
-                warn!("Received unexpected reply: {reply_qp_message}, {retry_left} retries left");
-                continue;
+            retry_left -= 1;
+            if retry_left > 0 {
+                warn!("No ack for {request:?}, {retry_left} retries left");
             }
         }
 
-        socket.set_read_timeout(original_socket_timeout)?;
         Err(FeroceError::Timeout)
     }
 
@@ -515,18 +579,11 @@ impl ConnectionManager {
             remote_addr, local_info.qp_num, remote_qpn
         );
 
-        let validate_ack = |reply: &QpMessage| -> bool {
-            (reply.flags.request_type() == Ok(RequestType::OpenQp))
-                && (reply.flags.ack_type() == Ok(AckType::Ack))
-                && (reply.flags.ack_valid())
-                && (reply.rem_qpn == local_info.qp_num)
-                && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
-        };
-        let reply_qp_message = Self::send_and_wait_for_ack(
-            &self.socket,
+        let reply_qp_message = self.send_and_wait_for_ack(
             &open_qp_message,
             remote_addr,
-            validate_ack,
+            RequestType::OpenQp,
+            local_info,
             request_timeout,
             max_retries,
         )?;
@@ -613,24 +670,22 @@ impl ConnectionManager {
             peer_addr, local_info.qp_num, remote_info.qp_num
         );
 
-        let validate_ack = |reply: &QpMessage| -> bool {
-            (reply.flags.request_type() == Ok(RequestType::CloseQp))
-                && (reply.flags.ack_type() == Ok(AckType::Ack))
-                && (reply.flags.ack_valid())
-                && (reply.rem_qpn == local_info.qp_num)
-                && (reply.rem_ip == ipv4_from_gid(&local_info.gid))
-        };
-
         // A NoQp reply to a CloseQp means the peer has already removed its entry
         // or doesn't have it anymore
-        match Self::send_and_wait_for_ack(
-            &self.socket,
+        let outcome = self.send_and_wait_for_ack(
             &close_qp_msg,
             peer_addr,
-            validate_ack,
+            RequestType::CloseQp,
+            &local_info,
             request_timeout,
             max_retries,
-        ) {
+        );
+
+        // the caller is destroying this QP either way, and an entry kept past that only
+        // NAKs the peer later
+        self.qps.remove(&local_qpn);
+
+        match outcome {
             Ok(_) => {}
             Err(FeroceError::PeerNoResources) => {
                 info!(
@@ -641,7 +696,6 @@ impl ConnectionManager {
             Err(e) => return Err(e),
         }
 
-        self.qps.remove(&local_qpn);
         info!("Closed remote QPN={}", remote_info.qp_num);
 
         Ok(())
@@ -759,6 +813,53 @@ mod test {
             .send_to(&msg.pack(), format!("127.0.0.1:{}", cm_port))
             .unwrap();
         sender_socket
+    }
+
+    fn cm_pair_with_qps(n: u32) -> (ConnectionManager, ConnectionManager) {
+        let mut a = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let mut b = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let a_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), a.cm_port().unwrap());
+        let b_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), b.cm_port().unwrap());
+
+        for i in 0..n {
+            let (mut a_info, mut b_info) = make_test_infos();
+            a_info.qp_num += i;
+            b_info.qp_num += i;
+            a.qps.insert(
+                a_info.qp_num,
+                ActiveQp::new(
+                    QpPhase::Running,
+                    QpContext {
+                        peer_addr: b_addr,
+                        local_info: a_info,
+                        remote_info: b_info,
+                    },
+                ),
+            );
+            b.qps.insert(
+                b_info.qp_num,
+                ActiveQp::new(
+                    QpPhase::Running,
+                    QpContext {
+                        peer_addr: a_addr,
+                        local_info: b_info,
+                        remote_info: a_info,
+                    },
+                ),
+            );
+        }
+        (a, b)
+    }
+
+    fn close_request(cm: &ConnectionManager, local_qpn: u32) -> (QpMessage, SocketAddr) {
+        let aqp = cm.qps.get(&local_qpn).expect("no such qp");
+        let msg = build_qp_message(
+            QpFlags::new(RequestType::CloseQp, AckType::Null, false),
+            &aqp.ctx.local_info,
+            &aqp.ctx.remote_info,
+            cm.cm_port().unwrap(),
+        );
+        (msg, aqp.ctx.peer_addr)
     }
 
     fn validate_qp_connection_info(a: &QpConnectionInfo, b: &QpConnectionInfo) {
@@ -1401,6 +1502,233 @@ mod test {
             .handle_close_qp(&close_qp_msg, &sender_socket.local_addr().unwrap())
             .expect("failed to handle first request");
         assert!(res_second.is_none());
+    }
+
+    #[test]
+    fn sibling_close() {
+        let (mut cm, peer) = cm_pair_with_qps(2);
+        cm.set_read_timeout(Duration::from_millis(50)).unwrap();
+
+        // the peer asks for the second pair, then goes silent: no ack for the first
+        let (msg, dest) = close_request(&peer, 43);
+        peer.socket.send_to(&msg.pack(), dest).unwrap();
+        thread::sleep(Duration::from_millis(20));
+
+        let started = Instant::now();
+        let res = cm.close_qp(256, Duration::from_millis(150), 1);
+        assert!(
+            matches!(res, Err(FeroceError::Timeout)),
+            "a silent peer must time out, got {res:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "the sibling's request was charged as a lost ack: gave up after {:?}",
+            started.elapsed()
+        );
+
+        match cm.try_process_next().unwrap() {
+            Some(CmEvent::CloseQp { local_qpn, .. }) => assert_eq!(local_qpn, 257),
+            other => panic!("the sibling's request was lost: {}", other.is_none()),
+        }
+    }
+
+    // both ends closing the same pair at once used to leave both holding it forever
+    #[test]
+    fn simultaneous_close() {
+        let (mut a, mut b) = cm_pair_with_qps(1);
+
+        let peer = thread::spawn(move || {
+            let res = b.close_qp(42, Duration::from_millis(500), 2);
+            (res, b.qps.len())
+        });
+        let mine = a.close_qp(256, Duration::from_millis(500), 2);
+        let (theirs, b_left) = peer.join().unwrap();
+
+        assert!(mine.is_ok(), "our close failed: {mine:?}");
+        assert!(theirs.is_ok(), "the peer's close failed: {theirs:?}");
+        assert!(a.qps.is_empty(), "we kept the QP");
+        assert_eq!(b_left, 0, "the peer kept the QP");
+    }
+
+    // one side of a teardown: answer the peer while closing our own, as a session does
+    fn teardown(mut cm: ConnectionManager, mut mine: Vec<u32>) -> (usize, Vec<FeroceError>) {
+        let mut errors = Vec::new();
+        cm.set_read_timeout(Duration::from_millis(20)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+
+        while Instant::now() < deadline {
+            while let Ok(Some(CmEvent::CloseQp { local_qpn, .. })) = cm.try_process_next() {
+                let _ = cm.ack_close_qp(local_qpn);
+            }
+            match mine.pop() {
+                Some(qpn) if cm.qps.contains_key(&qpn) => {
+                    if let Err(e) = cm.close_qp(qpn, Duration::from_millis(200), 2) {
+                        errors.push(e);
+                    }
+                }
+                Some(_) => {}
+                None if cm.qps.is_empty() => break,
+                None => {}
+            }
+        }
+        (cm.qps.len(), errors)
+    }
+
+    #[test]
+    fn crossfire() {
+        for n in [1u32, 2, 4, 8] {
+            for stagger in [0u64, 7, 31] {
+                let (a, b) = cm_pair_with_qps(n);
+                // opposite orders, so each side's first close is the other's last pair:
+                // the two ends pick from a HashMap and never agree on an order
+                let (a_qps, b_qps) = (
+                    (0..n).map(|i| 256 + i).collect::<Vec<_>>(),
+                    (0..n).map(|i| 42 + i).rev().collect::<Vec<_>>(),
+                );
+
+                let peer = thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(stagger));
+                    teardown(b, b_qps)
+                });
+                let (a_left, a_err) = teardown(a, a_qps);
+                let (b_left, b_err) = peer.join().unwrap();
+
+                let shape = format!("{n} pairs, {stagger}ms stagger");
+                assert_eq!(a_left, 0, "{shape}: A holds {a_left}, errors {a_err:?}");
+                assert_eq!(b_left, 0, "{shape}: B holds {b_left}, errors {b_err:?}");
+                for e in a_err.iter().chain(b_err.iter()) {
+                    assert!(
+                        matches!(e, FeroceError::Timeout),
+                        "{shape}: a close failed with more than a missing ack: {e:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // the kernel refusing a send is a lost datagram, not a reason to abandon a teardown
+    #[test]
+    fn refused_send() {
+        let (sender_info, receiver_info) = make_test_infos();
+        let mut cm = ConnectionManager::new("127.0.0.1".parse().unwrap(), 0).unwrap();
+        // a broadcast address with no SO_BROADCAST: every send is refused
+        cm.qps.insert(
+            sender_info.qp_num,
+            ActiveQp::new(
+                QpPhase::Running,
+                QpContext {
+                    peer_addr: "255.255.255.255:9999".parse().unwrap(),
+                    local_info: sender_info,
+                    remote_info: receiver_info,
+                },
+            ),
+        );
+
+        let res = cm.close_qp(sender_info.qp_num, Duration::from_millis(50), 2);
+        assert!(
+            matches!(res, Err(FeroceError::Timeout)),
+            "a refused send must read as a missing ack, got {res:?}"
+        );
+        assert!(cm.qps.is_empty(), "the entry outlived the close");
+    }
+
+    // a peer must not be able to grow the set-aside queue without bound
+    #[test]
+    fn deferred_cap() {
+        let (mut cm, peer) = cm_pair_with_qps(2);
+        // requests for a QP we do not have: never answered, only set aside
+        let (mut msg, dest) = close_request(&peer, 43);
+        msg.rem_qpn = 0xBAD;
+
+        let flood = thread::spawn(move || {
+            for _ in 0..(MAX_DEFERRED * 2) {
+                if peer.socket.send_to(&msg.pack(), dest).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let _ = cm.close_qp(256, Duration::from_millis(300), 2);
+        flood.join().unwrap();
+        assert!(
+            cm.deferred.len() <= MAX_DEFERRED,
+            "the queue grew to {}",
+            cm.deferred.len()
+        );
+    }
+
+    // a reply read as a request would tear down a live QP
+    #[test]
+    fn stale_ack() {
+        let (mut cm, peer) = cm_pair_with_qps(1);
+        cm.set_read_timeout(Duration::from_millis(100)).unwrap();
+
+        let (mut msg, dest) = close_request(&peer, 42);
+        msg.flags = QpFlags::new(RequestType::CloseQp, AckType::Ack, true);
+        peer.socket.send_to(&msg.pack(), dest).unwrap();
+
+        assert!(
+            cm.try_process_next().unwrap().is_none(),
+            "a reply raised an event"
+        );
+        assert!(cm.qps.contains_key(&256), "a stale ack closed a live QP");
+    }
+
+    // only the peer that owns a QP may ask for it to be closed
+    #[test]
+    fn foreign_close() {
+        let (mut cm, peer) = cm_pair_with_qps(1);
+        cm.set_read_timeout(Duration::from_millis(100)).unwrap();
+
+        let (mut msg, dest) = close_request(&peer, 42);
+        let impostor = UdpSocket::bind("127.0.0.2:0").unwrap();
+        impostor
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        // the reply goes to the port the message carries
+        msg.udp_port = impostor.local_addr().unwrap().port();
+        impostor.send_to(&msg.pack(), dest).unwrap();
+
+        assert!(
+            cm.try_process_next().unwrap().is_none(),
+            "a stranger raised an event"
+        );
+        assert!(cm.qps.contains_key(&256), "a stranger closed our QP");
+
+        let mut buf = [0u8; QP_MESSAGE_SIZE];
+        impostor.recv_from(&mut buf).expect("expected a NAK");
+        let reply = QpMessage::unpack(&buf).unwrap();
+        assert_eq!(reply.flags.ack_type(), Ok(AckType::NAck));
+    }
+
+    // a garbage datagram arriving mid-wait must not fail the close
+    #[test]
+    fn malformed_wait() {
+        let (mut cm, peer) = cm_pair_with_qps(1);
+        let dest = SocketAddr::new("127.0.0.1".parse().unwrap(), cm.cm_port().unwrap());
+        let peer_socket = peer.socket.try_clone().unwrap();
+
+        let responder = thread::spawn(move || {
+            let mut buf = [0u8; QP_MESSAGE_SIZE];
+            peer_socket.send_to(b"not a qp message", dest).unwrap();
+            let (_n, src) = peer_socket.recv_from(&mut buf).unwrap();
+            let req = QpMessage::unpack(&buf).unwrap();
+            let ack = QpMessage {
+                flags: QpFlags::new(RequestType::CloseQp, AckType::Ack, true),
+                rem_qpn: req.loc_qpn,
+                rem_ip: req.loc_ip,
+                ..Default::default()
+            };
+            peer_socket.send_to(&ack.pack(), src).unwrap();
+        });
+
+        let res = cm.close_qp(256, Duration::from_millis(500), 2);
+        responder.join().unwrap();
+        assert!(
+            res.is_ok(),
+            "garbage on the socket failed the close: {res:?}"
+        );
+        assert!(cm.qps.is_empty());
     }
 
     #[test]

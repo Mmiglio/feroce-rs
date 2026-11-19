@@ -57,6 +57,8 @@ struct QpContext {
     metrics: StreamMetrics,
 }
 
+const CLOSE_ACK_WAIT: Duration = Duration::from_millis(500);
+
 // Called once per monitoring tick with every live stream already sampled.
 // Returning `true` asks the event loop to shut down (e.g. 'q' or ctrl+c).
 pub type Monitor = Box<dyn FnMut(&[GroupSample], Duration) -> bool>;
@@ -363,8 +365,8 @@ where
         }
         let _ = ctx.poller_handle.join();
         (self.on_stream_closed)(&ctx.metrics);
-        if let Err(e) = self.cm.close_qp(qpn, Duration::from_secs(2), 2) {
-            warn!("Failed to close QP {qpn}: {e}");
+        if let Err(e) = self.cm.close_qp(qpn, CLOSE_ACK_WAIT, 2) {
+            info!("QP {qpn} closed without the peer's ack: {e}");
         }
     }
 }
@@ -384,8 +386,8 @@ where
                 warn!("Failed to transition QP {qpn} to error: {e}");
             }
             let _ = qp_ctx.poller_handle.join();
-            if let Err(e) = self.cm.close_qp(qpn, Duration::from_millis(500), 1) {
-                warn!("Failed to close QP {qpn}: {e}");
+            if let Err(e) = self.cm.close_qp(qpn, CLOSE_ACK_WAIT, 1) {
+                info!("QP {qpn} closed without the peer's ack: {e}");
             }
         }
     }
