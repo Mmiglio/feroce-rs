@@ -109,6 +109,23 @@ impl MetricGroup {
         }
     }
 
+    pub fn values(&self) -> GroupSample {
+        GroupSample {
+            labels: self.labels.clone(),
+            metrics: self
+                .metrics
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|m| MetricSample {
+                    name: m.name,
+                    value: m.value(),
+                    rate: 0.0,
+                })
+                .collect(),
+        }
+    }
+
     pub fn uptime(&self) -> Duration {
         self.started_at.elapsed()
     }
@@ -179,6 +196,17 @@ mod tests {
         assert!((b.get("messages").unwrap().rate - 50.0).abs() < 1e-9);
 
         assert_eq!(m.messages.sample(Duration::ZERO).rate, 0.0);
+    }
+
+    #[test]
+    fn values_only() {
+        let m = StreamMetrics::new("s", 0, 0x100, 0x200, [10, 0, 0, 1].into());
+        m.messages.add(100);
+
+        assert_eq!(m.group.values().get("messages").unwrap().value, 100);
+        // a reader must not eat the tick's rate
+        let tick = m.group.sample(Duration::from_secs(1));
+        assert!((tick.get("messages").unwrap().rate - 100.0).abs() < 1e-9);
     }
 
     #[test]
